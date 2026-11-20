@@ -300,36 +300,30 @@ pub fn downsample_48k_to_8k(samples_48k: &[i16]) -> Vec<i16> {
     out
 }
 
-/// Applies a smooth noise gate (`gate_threshold`) and fixed-point microphone gain (`gain_q8 / 256`)
-/// with soft-knee limiting to `[-32000, 32000]` to eliminate low-level quantization crackle.
+/// Applies a frame-level soft noise gate (`gate_threshold`) and fixed-point microphone gain
+/// (`gain_q8 / 256`) with rational soft-knee peak limiting to `[-32000, 32000]`.
 pub fn condition_mic_frame(samples: &mut [i16], gate_threshold: i16, gain_q8: u16) {
     let gate = i32::from(gate_threshold.max(0));
-    let double_gate = gate.saturating_mul(2);
+    if gate > 0 {
+        let frame_peak = samples
+            .iter()
+            .map(|&s| i32::from(s).abs())
+            .max()
+            .unwrap_or(0);
+        if frame_peak <= gate {
+            samples.fill(0);
+            return;
+        }
+    }
+
     let gain = i64::from(gain_q8);
     const SOFT_KNEE: i64 = 24_000;
     const SOFT_HEADROOM: i64 = 8_000;
 
     for sample in samples.iter_mut() {
         let raw = i32::from(*sample);
-        let ax = raw.abs();
-        let gated = if gate > 0 {
-            if ax <= gate {
-                0
-            } else if ax < double_gate {
-                (ax - gate) * 2
-            } else {
-                ax
-            }
-        } else {
-            ax
-        };
-
-        if gated == 0 {
-            *sample = 0;
-            continue;
-        }
-
-        let scaled = (i64::from(gated) * gain) >> 8;
+        let ax = i64::from(raw.abs());
+        let scaled = (ax * gain) >> 8;
         let limited = if scaled <= SOFT_KNEE {
             scaled
         } else {
@@ -532,11 +526,13 @@ mod tests {
         condition_mic_frame(&mut quiet, 12, 1024);
         assert_eq!(quiet, vec![0, 0, 0, 0, 0, 0]);
 
-        let mut speech = vec![100, -100, 30_000, -30_000];
+        let mut speech = vec![4, -6, 100, -100, 30_000, -30_000];
         condition_mic_frame(&mut speech, 12, 1024);
-        assert_eq!(speech[0], 400);
-        assert_eq!(speech[1], -400);
-        assert!(speech[2] <= 32_000 && speech[2] > 28_000);
-        assert!(speech[3] >= -32_000 && speech[3] < -28_000);
+        assert_eq!(speech[0], 16);
+        assert_eq!(speech[1], -24);
+        assert_eq!(speech[2], 400);
+        assert_eq!(speech[3], -400);
+        assert!(speech[4] <= 32_000 && speech[4] > 28_000);
+        assert!(speech[5] >= -32_000 && speech[5] < -28_000);
     }
 }

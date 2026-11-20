@@ -1,5 +1,5 @@
 //! MODULE_CONTRACT: Linux live microphone/speaker `AudioPort` adapter at 48 kHz using PipeWire/PulseAudio (`pacat`) or ALSA (`arecord`/`aplay`).
-//! INVARIANTS: `#![forbid(unsafe_code)]`; non-blocking 20 ms `AudioPort` queues (`960` samples @ 48 kHz) with pre-roll buffering, soft noise gating, and decayed underrun concealment; terminates child processes cleanly on `Drop`.
+//! INVARIANTS: `#![forbid(unsafe_code)]`; non-blocking 20 ms `AudioPort` queues (`960` samples @ 48 kHz) with pre-roll buffering, frame-level noise gating, and smooth ramp-to-zero underrun concealment; terminates child processes cleanly on `Drop`.
 //! RFC_REFS: RFC 3551, RFC 6716 (20 ms @ 48 kHz fullband mono PCM16).
 
 use std::collections::VecDeque;
@@ -17,8 +17,9 @@ use bmsip_engine::{AudioPort, PCM_FRAME_SAMPLES_48KHZ_20MS, PCM_FRAME_SAMPLES_8K
 const LIVE_SAMPLE_RATE_HZ: u32 = 48_000;
 const MAX_QUEUED_FRAMES: usize = 16;
 const TX_PREROLL_FRAMES: usize = 2;
-const RX_PREROLL_FRAMES: usize = 3;
-const MIC_GATE_THRESHOLD: i16 = 12;
+const RX_PREROLL_FRAMES: usize = 2;
+const MIC_GATE_THRESHOLD: i16 = 4;
+const UNDERRUN_RAMP_SAMPLES: usize = 64;
 const FRAME_BYTES_48K: usize = PCM_FRAME_SAMPLES_48KHZ_20MS * 2;
 
 /// Thread-safe handle for inspecting playout audio captured during live sessions.
@@ -40,7 +41,7 @@ pub struct LiveLinuxAudioPort {
     stop: Arc<AtomicBool>,
     tx_queue: Arc<Mutex<VecDeque<[i16; PCM_FRAME_SAMPLES_48KHZ_20MS]>>>,
     tx_primed: bool,
-    last_tx_frame: [i16; PCM_FRAME_SAMPLES_48KHZ_20MS],
+    last_tx_sample: i16,
     rx_queue: Arc<(
         Mutex<VecDeque<[i16; PCM_FRAME_SAMPLES_48KHZ_20MS]>>,
         Condvar,
@@ -123,14 +124,10 @@ impl LiveLinuxAudioPort {
                             if stop_flag.load(Ordering::Relaxed) {
                                 break;
                             }
-                            if guard.len() >= RX_PREROLL_FRAMES {
+                            if !rx_primed && guard.len() >= RX_PREROLL_FRAMES {
                                 rx_primed = true;
                             }
-                            let popped = guard.pop_front();
-                            if guard.is_empty() {
-                                rx_primed = false;
-                            }
-                            popped
+                            guard.pop_front()
                         };
                         let Some(frame) = next_frame else {
                             continue;
@@ -152,7 +149,7 @@ impl LiveLinuxAudioPort {
             stop,
             tx_queue,
             tx_primed: false,
-            last_tx_frame: [0; PCM_FRAME_SAMPLES_48KHZ_20MS],
+            last_tx_sample: 0,
             rx_queue,
             recorded,
             rec_child,
@@ -184,6 +181,9 @@ impl AudioPort for LiveLinuxAudioPort {
                 if guard.len() < TX_PREROLL_FRAMES {
                     return None;
                 }
+                while guard.len() > TX_PREROLL_FRAMES {
+                    guard.pop_front();
+                }
                 self.tx_primed = true;
             }
             guard.pop_front()
@@ -191,19 +191,22 @@ impl AudioPort for LiveLinuxAudioPort {
 
         match popped {
             Some(frame) => {
-                self.last_tx_frame = frame;
+                self.last_tx_sample = *frame.last().unwrap_or(&0);
                 frame.to_vec()
             }
             None => {
-                if self.tx_primed {
-                    // Decayed PLC concealment instead of injecting a hard zero step into RTP.
-                    for sample in &mut self.last_tx_frame {
-                        *sample = ((*sample as i32 * 3) / 4) as i16;
+                let mut out = vec![0i16; PCM_FRAME_SAMPLES_48KHZ_20MS];
+                if self.tx_primed && self.last_tx_sample != 0 {
+                    // Ramp down smoothly from the last real sample to avoid underrun buzz.
+                    let start = i32::from(self.last_tx_sample);
+                    let len = UNDERRUN_RAMP_SAMPLES as i32;
+                    for (idx, sample) in out.iter_mut().take(UNDERRUN_RAMP_SAMPLES).enumerate() {
+                        let remain = (UNDERRUN_RAMP_SAMPLES - idx) as i32;
+                        *sample = ((start * remain) / len) as i16;
                     }
-                    self.last_tx_frame.to_vec()
-                } else {
-                    vec![0; PCM_FRAME_SAMPLES_48KHZ_20MS]
+                    self.last_tx_sample = 0;
                 }
+                out
             }
         }
     }
@@ -263,7 +266,7 @@ fn spawn_recorder() -> Option<Child> {
             "--format=s16le",
             "--rate=48000",
             "--channels=1",
-            "--latency-msec=40",
+            "--latency-msec=20",
             "--client-name=bmsip-cli",
         ])
         .stdin(Stdio::null())
@@ -291,7 +294,7 @@ fn spawn_player() -> Option<Child> {
             "--format=s16le",
             "--rate=48000",
             "--channels=1",
-            "--latency-msec=40",
+            "--latency-msec=20",
             "--client-name=bmsip-cli",
         ])
         .stdin(Stdio::piped())

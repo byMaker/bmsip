@@ -633,7 +633,7 @@ impl WorkerCtx {
         self.flush_sip_outbound(now);
     }
 
-    fn pump_media_tick(&mut self, now: Instant) {
+    fn pump_rtp_rx(&mut self, now: Instant) {
         if self.suspended || self.active_media.is_empty() {
             return;
         }
@@ -642,7 +642,7 @@ impl WorkerCtx {
         let mut dtmf_events: Vec<(String, bmsip_media::DtmfDigit)> = Vec::new();
         let mut stats_updates: Vec<(String, u32, u32, i32, u32)> = Vec::new();
 
-        for (idx, call_id) in call_ids.iter().enumerate() {
+        for call_id in &call_ids {
             let Some(media) = self.active_media.get_mut(call_id) else {
                 continue;
             };
@@ -677,18 +677,6 @@ impl WorkerCtx {
                 }
             }
 
-            // Capture and play out audio frames on the primary active call.
-            if idx == 0 {
-                let tx_pcm = self.audio_port.capture_frame_20ms();
-                if let Ok(pkt) = media.session.encode_pcm_frame(&tx_pcm) {
-                    if media.rtp_socket.send_to(&pkt, media.remote_rtp).is_ok() {
-                        media.rtp_packets_sent = media.rtp_packets_sent.saturating_add(1);
-                    }
-                }
-                let playout = media.session.pop_playout_frame();
-                self.audio_port.playout_20ms(playout.samples());
-            }
-
             let st = media.session.stats();
             stats_updates.push((
                 call_id.clone(),
@@ -711,6 +699,51 @@ impl WorkerCtx {
                 call_id: cid,
                 digit,
             });
+        }
+
+        for (cid, sent, rx, lost, jitter) in stats_updates {
+            self.recorder.update_rtp_stats(&cid, sent, rx, lost, jitter);
+        }
+    }
+
+    fn pump_media_tick(&mut self, now: Instant) {
+        if self.suspended || self.active_media.is_empty() {
+            return;
+        }
+
+        self.pump_rtp_rx(now);
+
+        let call_ids: Vec<String> = self.active_media.keys().cloned().collect();
+        let mut stats_updates: Vec<(String, u32, u32, i32, u32)> = Vec::new();
+
+        for (idx, call_id) in call_ids.iter().enumerate() {
+            let Some(media) = self.active_media.get_mut(call_id) else {
+                continue;
+            };
+            if self.ua.call_state(call_id) != Some(CallState::Established) {
+                continue;
+            }
+
+            // Capture and play out audio frames on the primary active call.
+            if idx == 0 {
+                let tx_pcm = self.audio_port.capture_frame_20ms();
+                if let Ok(pkt) = media.session.encode_pcm_frame(&tx_pcm) {
+                    if media.rtp_socket.send_to(&pkt, media.remote_rtp).is_ok() {
+                        media.rtp_packets_sent = media.rtp_packets_sent.saturating_add(1);
+                    }
+                }
+                let playout = media.session.pop_playout_frame();
+                self.audio_port.playout_20ms(playout.samples());
+            }
+
+            let st = media.session.stats();
+            stats_updates.push((
+                call_id.clone(),
+                media.rtp_packets_sent,
+                st.received_count(),
+                st.cumulative_lost(),
+                st.jitter(),
+            ));
         }
 
         for (cid, sent, rx, lost, jitter) in stats_updates {
@@ -765,6 +798,7 @@ fn run_worker(
 
         let now = Instant::now();
         ctx.pump_sip_rx(now);
+        ctx.pump_rtp_rx(now);
 
         if let Some(dl) = ctx.ua.poll_timeout() {
             if now >= dl {
