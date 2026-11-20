@@ -150,20 +150,25 @@ pub fn analyze_wav(wav: &WavPcm16, target_tone_hz: Option<u32>) -> AudioQualityR
 
     let frames: Vec<&[i16]> = wav.samples.chunks(frame_samples).collect();
     let total_frames = frames.len();
-    let active_flags: Vec<bool> = frames.iter().map(|f| is_active_frame(f)).collect();
+    let frame_stats: Vec<(f64, i32)> = frames.iter().map(|f| frame_power_and_peak(f)).collect();
+    let active_flags: Vec<bool> = frame_stats
+        .iter()
+        .map(|&(mean_sq, peak)| mean_sq > 225.0 || peak > 40)
+        .collect();
     let active_frames = active_flags.iter().filter(|&&a| a).count();
 
     let first_active = active_flags.iter().position(|&a| a);
     let last_active = active_flags.iter().rposition(|&a| a);
     let initial_latency_ms = first_active.map_or(duration_ms, |idx| (idx as u64) * 20);
 
-    let mid_stream_dropouts = match (first_active, last_active) {
-        (Some(first), Some(last)) if last > first + 1 => active_flags[(first + 1)..last]
-            .iter()
-            .filter(|&&a| !a)
-            .count(),
-        _ => 0,
-    };
+    let mid_stream_dropouts = count_mid_stream_dropouts(
+        &frames,
+        &frame_stats,
+        &active_flags,
+        first_active,
+        last_active,
+        target_tone_hz.is_some(),
+    );
 
     let (boundary_clicks, max_boundary_jump) = count_boundary_clicks(&frames, &active_flags);
 
@@ -175,17 +180,16 @@ pub fn analyze_wav(wav: &WavPcm16, target_tone_hz: Option<u32>) -> AudioQualityR
 
     let detected_freq_hz =
         estimate_frequency_hz(sample_rate_hz, &frames, &active_flags, eval_range.clone());
-    let eval_freq = target_tone_hz
-        .map(f64::from)
-        .filter(|&f| f > 0.0)
-        .unwrap_or(detected_freq_hz);
-    let snr_db = compute_quadrature_snr_db(
-        sample_rate_hz,
-        &frames,
-        &active_flags,
-        eval_range,
-        eval_freq,
-    );
+    let snr_db = match target_tone_hz.filter(|&f| f > 0) {
+        Some(freq) => compute_quadrature_snr_db(
+            sample_rate_hz,
+            &frames,
+            &active_flags,
+            eval_range,
+            f64::from(freq),
+        ),
+        None => compute_speech_snr_db(&frame_stats, &active_flags),
+    };
 
     AudioQualityReport {
         sample_rate_hz,
@@ -218,9 +222,9 @@ fn to_dbfs(amp: f64) -> f64 {
     }
 }
 
-fn is_active_frame(frame: &[i16]) -> bool {
+fn frame_power_and_peak(frame: &[i16]) -> (f64, i32) {
     if frame.is_empty() {
-        return false;
+        return (0.0, 0);
     }
     let mut sum_sq: u64 = 0;
     let mut peak: i32 = 0;
@@ -229,8 +233,69 @@ fn is_active_frame(frame: &[i16]) -> bool {
         sum_sq += (abs as u64) * (abs as u64);
         peak = peak.max(abs);
     }
-    let rms = ((sum_sq as f64) / (frame.len() as f64)).sqrt();
-    rms > 15.0 || peak > 40
+    ((sum_sq as f64) / (frame.len() as f64), peak)
+}
+
+fn count_mid_stream_dropouts(
+    frames: &[&[i16]],
+    frame_stats: &[(f64, i32)],
+    active_flags: &[bool],
+    first_active: Option<usize>,
+    last_active: Option<usize>,
+    continuous_tone_mode: bool,
+) -> usize {
+    let (Some(first), Some(last)) = (first_active, last_active) else {
+        return 0;
+    };
+    if last <= first + 1 {
+        return 0;
+    }
+
+    if continuous_tone_mode {
+        return active_flags[(first + 1)..last]
+            .iter()
+            .filter(|&&a| !a)
+            .count();
+    }
+
+    // In live speech mode, pauses between words are expected; count only isolated exact-zero
+    // frames abruptly flanked by active speech (`RMS > 35`).
+    ((first + 1)..last)
+        .filter(|&i| {
+            frames[i].iter().all(|&s| s == 0)
+                && frame_stats[i - 1].0.sqrt() > 35.0
+                && frame_stats[i + 1].0.sqrt() > 35.0
+        })
+        .count()
+}
+
+fn compute_speech_snr_db(frame_stats: &[(f64, i32)], active_flags: &[bool]) -> Option<f64> {
+    let mut active_power_sum = 0.0f64;
+    let mut active_count = 0usize;
+    let mut noise_power_sum = 0.0f64;
+    let mut noise_count = 0usize;
+
+    for (idx, (&(mean_sq, _), &active)) in frame_stats.iter().zip(active_flags).enumerate() {
+        if active {
+            active_power_sum += mean_sq;
+            active_count += 1;
+        } else if idx >= 2 {
+            // Skip the initial 2 jitter-buffer priming frames before measuring silence floor.
+            noise_power_sum += mean_sq;
+            noise_count += 1;
+        }
+    }
+
+    if active_count == 0 {
+        return None;
+    }
+    let speech_power = active_power_sum / (active_count as f64);
+    let noise_power = if noise_count > 0 {
+        (noise_power_sum / (noise_count as f64)).max(1.0)
+    } else {
+        1.0
+    };
+    Some(10.0 * (speech_power / noise_power).log10())
 }
 
 fn max_internal_step(frame: &[i16]) -> i32 {
@@ -407,5 +472,26 @@ mod tests {
         wav.samples[1600..1760].fill(0);
         let report = analyze_wav(&wav, Some(440));
         assert_eq!(report.mid_stream_dropouts, 1);
+
+        let speech_report = analyze_wav(&wav, None);
+        assert_eq!(speech_report.mid_stream_dropouts, 1);
+    }
+
+    #[test]
+    fn speech_mode_ignores_word_pauses_and_computes_positive_speech_snr() {
+        // Construct 48 kHz voice bursts (frames 0..10 and 20..30) separated by a 200 ms pause.
+        let mut samples = vec![0i16; 48_000];
+        let burst = WavPcm16::generate_sine_wave(48_000, 300, 200, 6_000);
+        samples[0..burst.samples.len()].copy_from_slice(&burst.samples);
+        samples[19_200..(19_200 + burst.samples.len())].copy_from_slice(&burst.samples);
+
+        let wav = WavPcm16::new(48_000, samples);
+        let report = analyze_wav(&wav, None);
+        assert_eq!(report.mid_stream_dropouts, 0);
+        assert!(
+            report.snr_db.expect("speech SNR present") > 30.0,
+            "expected positive speech SNR > 30 dB, got {:?}",
+            report.snr_db
+        );
     }
 }
