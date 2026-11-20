@@ -145,17 +145,25 @@ impl MediaSession {
         self.dtmf_sender.queue_digit(digit, ts);
     }
 
+    /// Pops the next queued RFC 4733 DTMF RTP datagram for paced 20 ms transmission.
+    pub fn pop_dtmf_packet(&mut self) -> Option<Vec<u8>> {
+        self.dtmf_sender.pop_packet().map(|spec| {
+            self.packetizer
+                .build_custom_packet(
+                    self.dtmf_payload_type,
+                    spec.timestamp,
+                    spec.marker,
+                    spec.payload.to_bytes(),
+                )
+                .to_bytes()
+        })
+    }
+
     /// Drains queued outbound RFC 4733 DTMF RTP datagrams.
     pub fn poll_dtmf_packets(&mut self) -> Vec<Vec<u8>> {
         let mut out = Vec::new();
-        while let Some(spec) = self.dtmf_sender.pop_packet() {
-            let pkt = self.packetizer.build_custom_packet(
-                self.dtmf_payload_type,
-                spec.timestamp,
-                spec.marker,
-                spec.payload.to_bytes(),
-            );
-            out.push(pkt.to_bytes());
+        while let Some(pkt) = self.pop_dtmf_packet() {
+            out.push(pkt);
         }
         out
     }

@@ -326,9 +326,18 @@ impl WorkerCtx {
                 }
             })
             .unwrap_or((SessionCodec::G711(G711Kind::Pcmu), "PCMU".to_string()));
+        let target_clock = session_codec.clock_rate_hz();
         let dtmf_pt = negotiated_codecs
             .iter()
-            .find(|c| c.encoding_name.eq_ignore_ascii_case("telephone-event"))
+            .find(|c| {
+                c.encoding_name.eq_ignore_ascii_case("telephone-event")
+                    && c.clock_rate == target_clock
+            })
+            .or_else(|| {
+                negotiated_codecs
+                    .iter()
+                    .find(|c| c.encoding_name.eq_ignore_ascii_case("telephone-event"))
+            })
             .map(|c| c.payload_type)
             .unwrap_or(101);
 
@@ -488,15 +497,11 @@ impl WorkerCtx {
             EngineCommand::SendDtmf { call_id, digit } => {
                 if let Some(media) = self.active_media.get_mut(&call_id) {
                     media.session.queue_dtmf(digit);
-                    for dtmf_pkt in media.session.poll_dtmf_packets() {
-                        let _ = media.rtp_socket.send_to(&dtmf_pkt, media.remote_rtp);
-                        media.rtp_packets_sent = media.rtp_packets_sent.saturating_add(1);
-                    }
                     self.recorder.record(
                         now,
                         TelemetryCategory::RtpStats,
                         Some(&call_id),
-                        format!("sent DTMF '{}'", digit.to_char()),
+                        format!("queued DTMF '{}'", digit.to_char()),
                     );
                 } else {
                     self.push_event(EngineEvent::Warning(format!(
@@ -730,6 +735,17 @@ impl WorkerCtx {
                 if let Ok(pkt) = media.session.encode_pcm_frame(&tx_pcm) {
                     if media.rtp_socket.send_to(&pkt, media.remote_rtp).is_ok() {
                         media.rtp_packets_sent = media.rtp_packets_sent.saturating_add(1);
+                    }
+                }
+                if media.rtp_packets_sent >= 2 {
+                    if let Some(dtmf_pkt) = media.session.pop_dtmf_packet() {
+                        if media
+                            .rtp_socket
+                            .send_to(&dtmf_pkt, media.remote_rtp)
+                            .is_ok()
+                        {
+                            media.rtp_packets_sent = media.rtp_packets_sent.saturating_add(1);
+                        }
                     }
                 }
                 let playout = media.session.pop_playout_frame();

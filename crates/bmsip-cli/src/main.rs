@@ -46,6 +46,7 @@ impl CodecChoice {
                 RtpCodec::opus(),
                 RtpCodec::pcmu(),
                 RtpCodec::pcma(),
+                RtpCodec::telephone_event_48k(102),
                 RtpCodec::telephone_event(101),
             ],
             Self::Pcmu => vec![
@@ -106,6 +107,14 @@ struct SelftestCliArgs {
     duration_ms: u64,
 }
 
+#[derive(Debug, PartialEq, Eq)]
+struct InteropCliArgs {
+    asterisk: String,
+    freeswitch: String,
+    kamailio: String,
+    duration_ms: u64,
+}
+
 enum AudioInspector {
     Wav(WavAudioHandle),
     Live(LiveAudioHandle),
@@ -129,9 +138,10 @@ fn print_usage() {
            bmsip-cli call --server <host:port> --user <user> --password <pass> --target <sip_uri> [OPTIONS]\n  \
            bmsip-cli listen --server <host:port> --user <user> --password <pass> [OPTIONS]\n  \
            bmsip-cli analyze --wav <path> [--tone-hz <hz>]\n  \
-           bmsip-cli selftest --server <host:port> --user <user> --password <pass> [--duration-ms <ms>]\n\n\
+           bmsip-cli selftest --server <host:port> --user <user> --password <pass> [--duration-ms <ms>]\n  \
+           bmsip-cli interop [--asterisk <host:port>] [--freeswitch <host:port>] [--kamailio <host:port>] [--duration-ms <ms>]\n\n\
          OPTIONS:\n  \
-           --duration-ms <ms>     Active call duration in milliseconds (default: 1000 / 10000 for listen / 800 for selftest)\n  \
+           --duration-ms <ms>     Active call duration in milliseconds (default: 1000 / 10000 listen / 800 selftest / 500 interop)\n  \
            --tone-hz <hz>         Generated sine tone frequency or expected tone for analyze/call (default: 440)\n  \
            --codec <name>         Preferred audio codec: opus (default, 48 kHz), pcmu, or pcma\n  \
            --mic-gain <mult>      Live microphone gain multiplier (default: 4.0)\n  \
@@ -330,6 +340,37 @@ fn parse_selftest_args(args: &[String]) -> Result<SelftestCliArgs, String> {
         server: server.ok_or_else(|| "missing --server".to_string())?,
         user: user.ok_or_else(|| "missing --user".to_string())?,
         password: password.ok_or_else(|| "missing --password".to_string())?,
+        duration_ms,
+    })
+}
+
+fn parse_interop_args(args: &[String]) -> Result<InteropCliArgs, String> {
+    let mut asterisk = "asterisk:5060".to_string();
+    let mut freeswitch = "freeswitch:5060".to_string();
+    let mut kamailio = "kamailio:5060".to_string();
+    let mut duration_ms: u64 = 500;
+    let mut i = 0;
+
+    while i < args.len() {
+        match args[i].as_str() {
+            "--asterisk" => asterisk = next_arg_value(args, &mut i, "--asterisk")?,
+            "--freeswitch" => freeswitch = next_arg_value(args, &mut i, "--freeswitch")?,
+            "--kamailio" => kamailio = next_arg_value(args, &mut i, "--kamailio")?,
+            "--duration-ms" => {
+                let raw = next_arg_value(args, &mut i, "--duration-ms")?;
+                duration_ms = raw
+                    .parse::<u64>()
+                    .map_err(|_| format!("invalid --duration-ms '{raw}'"))?;
+            }
+            other => return Err(format!("unknown argument '{other}'")),
+        }
+        i += 1;
+    }
+
+    Ok(InteropCliArgs {
+        asterisk,
+        freeswitch,
+        kamailio,
         duration_ms,
     })
 }
@@ -811,6 +852,385 @@ fn run_selftest(cli: SelftestCliArgs) -> Result<(), String> {
     Ok(())
 }
 
+fn execute_two_party_session(
+    server: &str,
+    codec: CodecChoice,
+    duration_ms: u64,
+    tone_hz: u32,
+) -> Result<(String, Option<DtmfDigit>, WavPcm16), String> {
+    let registrar_addr = resolve_server_addr(server)?;
+    let server_host = server.split(':').next().unwrap_or(server);
+    let registrar_uri = SipUri::parse(&format!("sip:{server}")).map_err(|e| e.to_string())?;
+    let rate = if codec == CodecChoice::Opus {
+        48_000
+    } else {
+        8_000
+    };
+    let frame_len = if rate == 48_000 { 960 } else { 160 };
+
+    let mut cfg_1001 = UaConfig::new(
+        "1001",
+        "secret1001",
+        server_host,
+        registrar_uri.clone(),
+        "0.0.0.0",
+        0,
+    );
+    cfg_1001.supported_codecs = codec.supported_codecs();
+    let tone = WavPcm16::generate_sine_wave(rate, tone_hz, (duration_ms + 800) as u32, 12_000);
+    let (port_1001, _) = WavAudioPort::new(tone, true);
+    let eng_1001 = SipEngine::spawn(
+        EngineConfig::new(
+            cfg_1001,
+            registrar_addr,
+            IpAddr::V4(Ipv4Addr::UNSPECIFIED),
+            0,
+        ),
+        Box::new(port_1001),
+    )
+    .map_err(|e| e.to_string())?;
+
+    let mut cfg_1002 = UaConfig::new(
+        "1002",
+        "secret1002",
+        server_host,
+        registrar_uri,
+        "0.0.0.0",
+        0,
+    );
+    cfg_1002.supported_codecs = codec.supported_codecs();
+    let (port_1002, handle_1002) = WavAudioPort::new(WavPcm16::new(rate, vec![0; frame_len]), true);
+    let eng_1002 = SipEngine::spawn(
+        EngineConfig::new(
+            cfg_1002,
+            registrar_addr,
+            IpAddr::V4(Ipv4Addr::UNSPECIFIED),
+            0,
+        ),
+        Box::new(port_1002),
+    )
+    .map_err(|e| e.to_string())?;
+
+    register_and_wait(&eng_1001)?;
+    register_and_wait(&eng_1002)?;
+
+    let target_uri = SipUri::parse(&format!("sip:1002@{server}")).map_err(|e| e.to_string())?;
+    eng_1001
+        .send_command(EngineCommand::Dial { target_uri })
+        .map_err(|e| e.to_string())?;
+
+    let mut cid_1001: Option<String> = None;
+    let mut cid_1002: Option<String> = None;
+    let mut neg_codec: Option<String> = None;
+    let mut est_1002 = false;
+    let deadline = Instant::now() + Duration::from_secs(12);
+
+    while Instant::now() < deadline && (neg_codec.is_none() || !est_1002) {
+        if let Some(ev) = eng_1001.recv_event_timeout(Duration::from_millis(20)) {
+            match ev {
+                EngineEvent::OutboundCallStarted { call_id } => cid_1001 = Some(call_id),
+                EngineEvent::CallEstablished { codec, .. } => neg_codec = Some(codec),
+                EngineEvent::CallTerminated { reason, .. } => {
+                    return Err(format!("1001 call failed early: {reason}"));
+                }
+                _ => {}
+            }
+        }
+        if let Some(ev) = eng_1002.recv_event_timeout(Duration::from_millis(20)) {
+            match ev {
+                EngineEvent::IncomingCall { call_id, .. } if cid_1002.is_none() => {
+                    cid_1002 = Some(call_id.clone());
+                    let _ = eng_1002.send_command(EngineCommand::Ring {
+                        call_id: call_id.clone(),
+                    });
+                    let _ = eng_1002.send_command(EngineCommand::Answer { call_id });
+                }
+                EngineEvent::CallEstablished { .. } => est_1002 = true,
+                _ => {}
+            }
+        }
+    }
+
+    let established_codec =
+        neg_codec.ok_or_else(|| "two-party call setup timed out on caller".to_string())?;
+    if !est_1002 {
+        return Err("two-party call setup timed out on callee".to_string());
+    }
+    let call_1001 = cid_1001.ok_or_else(|| "missing caller call_id".to_string())?;
+
+    let mut received_dtmf: Option<DtmfDigit> = None;
+    let warmup_until = Instant::now() + Duration::from_millis(100);
+    while Instant::now() < warmup_until {
+        if let Some(EngineEvent::DtmfReceived { digit, .. }) =
+            eng_1002.recv_event_timeout(Duration::from_millis(20))
+        {
+            received_dtmf = Some(digit);
+        }
+    }
+
+    let _ = eng_1001.send_command(EngineCommand::SendDtmf {
+        call_id: call_1001.clone(),
+        digit: DtmfDigit::D5,
+    });
+
+    let talk_until = Instant::now() + Duration::from_millis(duration_ms);
+    while Instant::now() < talk_until {
+        if let Some(EngineEvent::DtmfReceived { digit, .. }) =
+            eng_1002.recv_event_timeout(Duration::from_millis(25))
+        {
+            received_dtmf = Some(digit);
+        }
+    }
+
+    let _ = eng_1001.send_command(EngineCommand::Hangup { call_id: call_1001 });
+    let mut term_1 = false;
+    let mut term_2 = false;
+    let bye_dl = Instant::now() + Duration::from_secs(6);
+    while Instant::now() < bye_dl && !(term_1 && term_2) {
+        if let Some(ev) = eng_1001.recv_event_timeout(Duration::from_millis(25)) {
+            if matches!(ev, EngineEvent::CallTerminated { .. }) {
+                term_1 = true;
+            }
+        }
+        if let Some(ev) = eng_1002.recv_event_timeout(Duration::from_millis(25)) {
+            match ev {
+                EngineEvent::DtmfReceived { digit, .. } => received_dtmf = Some(digit),
+                EngineEvent::CallTerminated { .. } => term_2 = true,
+                _ => {}
+            }
+        }
+    }
+
+    for eng in [&eng_1001, &eng_1002] {
+        let _ = eng.send_command(EngineCommand::Unregister);
+        let unreg_dl = Instant::now() + Duration::from_secs(3);
+        while Instant::now() < unreg_dl {
+            if let Some(EngineEvent::RegistrationChanged(RegistrationState::Unregistered)) =
+                eng.recv_event_timeout(Duration::from_millis(50))
+            {
+                break;
+            }
+        }
+    }
+    let _ = eng_1001.shutdown();
+    let _ = eng_1002.shutdown();
+
+    Ok((established_codec, received_dtmf, handle_1002.recorded_wav()))
+}
+
+enum InteropKind {
+    Echo {
+        codec: CodecChoice,
+        rate: u32,
+        tone_hz: u32,
+    },
+    TwoParty {
+        codec: CodecChoice,
+        tone_hz: u32,
+    },
+}
+
+struct InteropSpec<'a> {
+    server_label: &'a str,
+    engine_label: &'a str,
+    scenario: &'a str,
+    server_addr: &'a str,
+    kind: InteropKind,
+}
+
+fn evaluate_interop_pass(
+    report: &analyzer::AudioQualityReport,
+    target_hz: u32,
+    dtmf: Option<DtmfDigit>,
+    expect_dtmf: bool,
+) -> bool {
+    let freq_ok =
+        (report.detected_freq_hz - f64::from(target_hz)).abs() <= f64::from(target_hz) * 0.12;
+    let min_snr = if target_hz >= 4_000 { 9.5 } else { 12.0 };
+    let snr_ok = report.snr_db.unwrap_or(0.0) >= min_snr;
+    let audio_ok = report.active_frames > 0 && report.mid_stream_dropouts == 0 && freq_ok && snr_ok;
+    let dtmf_ok = !expect_dtmf || dtmf == Some(DtmfDigit::D5);
+    audio_ok && dtmf_ok
+}
+
+fn run_interop(cli: InteropCliArgs) -> Result<(), String> {
+    let specs = [
+        InteropSpec {
+            server_label: "Asterisk",
+            engine_label: "PJSIP",
+            scenario: "Echo-PCMU-8k-440Hz",
+            server_addr: &cli.asterisk,
+            kind: InteropKind::Echo {
+                codec: CodecChoice::Pcmu,
+                rate: 8_000,
+                tone_hz: 440,
+            },
+        },
+        InteropSpec {
+            server_label: "Asterisk",
+            engine_label: "PJSIP",
+            scenario: "Echo-OPUS-48k-440Hz",
+            server_addr: &cli.asterisk,
+            kind: InteropKind::Echo {
+                codec: CodecChoice::Opus,
+                rate: 48_000,
+                tone_hz: 440,
+            },
+        },
+        InteropSpec {
+            server_label: "Asterisk",
+            engine_label: "PJSIP",
+            scenario: "Echo-OPUS-48k-6000Hz",
+            server_addr: &cli.asterisk,
+            kind: InteropKind::Echo {
+                codec: CodecChoice::Opus,
+                rate: 48_000,
+                tone_hz: 6_000,
+            },
+        },
+        InteropSpec {
+            server_label: "Asterisk",
+            engine_label: "PJSIP",
+            scenario: "Call-1001->1002-DTMF",
+            server_addr: &cli.asterisk,
+            kind: InteropKind::TwoParty {
+                codec: CodecChoice::Opus,
+                tone_hz: 440,
+            },
+        },
+        InteropSpec {
+            server_label: "FreeSWITCH",
+            engine_label: "Sofia-SIP",
+            scenario: "Echo-PCMU-8k-440Hz",
+            server_addr: &cli.freeswitch,
+            kind: InteropKind::Echo {
+                codec: CodecChoice::Pcmu,
+                rate: 8_000,
+                tone_hz: 440,
+            },
+        },
+        InteropSpec {
+            server_label: "FreeSWITCH",
+            engine_label: "Sofia-SIP",
+            scenario: "Echo-OPUS-48k-440Hz",
+            server_addr: &cli.freeswitch,
+            kind: InteropKind::Echo {
+                codec: CodecChoice::Opus,
+                rate: 48_000,
+                tone_hz: 440,
+            },
+        },
+        InteropSpec {
+            server_label: "FreeSWITCH",
+            engine_label: "Sofia-SIP",
+            scenario: "Echo-OPUS-48k-6000Hz",
+            server_addr: &cli.freeswitch,
+            kind: InteropKind::Echo {
+                codec: CodecChoice::Opus,
+                rate: 48_000,
+                tone_hz: 6_000,
+            },
+        },
+        InteropSpec {
+            server_label: "FreeSWITCH",
+            engine_label: "Sofia-SIP",
+            scenario: "Call-1001->1002-DTMF",
+            server_addr: &cli.freeswitch,
+            kind: InteropKind::TwoParty {
+                codec: CodecChoice::Opus,
+                tone_hz: 440,
+            },
+        },
+        InteropSpec {
+            server_label: "Kamailio",
+            engine_label: "SIP-Proxy",
+            scenario: "Proxy-P2P-1001->1002",
+            server_addr: &cli.kamailio,
+            kind: InteropKind::TwoParty {
+                codec: CodecChoice::Opus,
+                tone_hz: 440,
+            },
+        },
+    ];
+
+    println!(
+        "{:<11} {:<10} {:<21} {:<6} {:<6} {:<9} {:<8} {:<8} {:<5} STATUS",
+        "Server", "Engine", "Scenario", "Codec", "Rate", "RMS dBFS", "Freq Hz", "SNR dB", "DTMF"
+    );
+    println!("{}", "-".repeat(100));
+
+    let mut failed = 0usize;
+    for spec in &specs {
+        let (neg_codec, rx_wav, tone_hz, dtmf, expect_dtmf) = match spec.kind {
+            InteropKind::Echo {
+                codec,
+                rate,
+                tone_hz,
+            } => {
+                let target = format!("sip:601@{}", spec.server_addr);
+                let tx_wav = WavPcm16::generate_sine_wave(
+                    rate,
+                    tone_hz,
+                    (cli.duration_ms + 500) as u32,
+                    12_000,
+                );
+                let (c, wav) = execute_outbound_session(
+                    spec.server_addr,
+                    "1001",
+                    "secret1001",
+                    &target,
+                    cli.duration_ms,
+                    codec,
+                    4.0,
+                    false,
+                    &[],
+                    tx_wav,
+                    None,
+                    None,
+                    Some(tone_hz),
+                    true,
+                )?;
+                (c, wav, tone_hz, None, false)
+            }
+            InteropKind::TwoParty { codec, tone_hz } => {
+                let (c, d, wav) =
+                    execute_two_party_session(spec.server_addr, codec, cli.duration_ms, tone_hz)?;
+                (c, wav, tone_hz, d, true)
+            }
+        };
+
+        let report = analyzer::analyze_wav(&rx_wav, Some(tone_hz));
+        let snr = report.snr_db.unwrap_or(0.0);
+        let pass = evaluate_interop_pass(&report, tone_hz, dtmf, expect_dtmf);
+        if !pass {
+            failed += 1;
+        }
+        let dtmf_str = if !expect_dtmf {
+            "-".to_string()
+        } else {
+            dtmf.map_or_else(|| "none".to_string(), |d| d.to_char().to_string())
+        };
+        println!(
+            "{:<11} {:<10} {:<21} {:<6} {:<6} {:>6.1} dB {:>7.1}  {:>5.1} dB {:<5} {}",
+            spec.server_label,
+            spec.engine_label,
+            spec.scenario,
+            neg_codec,
+            report.sample_rate_hz,
+            report.rms_dbfs,
+            report.detected_freq_hz,
+            snr,
+            dtmf_str,
+            if pass { "PASS" } else { "FAIL" }
+        );
+    }
+
+    if failed > 0 {
+        return Err(format!("{failed} interop scenario(s) failed"));
+    }
+    Ok(())
+}
+
 fn main() -> ExitCode {
     let args: Vec<String> = std::env::args().skip(1).collect();
     if args.is_empty() || matches!(args[0].as_str(), "--help" | "-h") {
@@ -827,6 +1247,7 @@ fn main() -> ExitCode {
         "listen" => parse_listen_args(&args[1..]).and_then(run_listen),
         "analyze" => parse_analyze_args(&args[1..]).and_then(run_analyze),
         "selftest" => parse_selftest_args(&args[1..]).and_then(run_selftest),
+        "interop" => parse_interop_args(&args[1..]).and_then(run_interop),
         other => {
             eprintln!("unknown subcommand '{other}'\n");
             print_usage();
@@ -921,5 +1342,17 @@ mod tests {
         .unwrap();
         assert_eq!(s.server, "asterisk:5060");
         assert_eq!(s.duration_ms, 600);
+
+        let interop = parse_interop_args(&vec_str(&[
+            "--freeswitch",
+            "fs.local:5060",
+            "--duration-ms",
+            "450",
+        ]))
+        .unwrap();
+        assert_eq!(interop.asterisk, "asterisk:5060");
+        assert_eq!(interop.freeswitch, "fs.local:5060");
+        assert_eq!(interop.kamailio, "kamailio:5060");
+        assert_eq!(interop.duration_ms, 450);
     }
 }

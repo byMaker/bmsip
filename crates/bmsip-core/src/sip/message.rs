@@ -99,6 +99,9 @@ impl SipRequest {
         resp.headers.set("To", to);
         resp.headers.set("Call-ID", call_id);
         resp.headers.set("CSeq", cseq);
+        for rr in self.headers.get_all("Record-Route") {
+            resp.headers.add("Record-Route", rr);
+        }
         resp.headers.set("Content-Length", "0");
 
         Ok(resp)
@@ -514,6 +517,33 @@ mod tests {
             }
             SipMessage::Request(_) => panic!("expected response"),
         }
+    }
+
+    #[test]
+    fn create_response_preserves_multiple_via_and_record_route_headers() {
+        let mut req = SipRequest::new(
+            Method::Invite,
+            SipUri::parse("sip:1002@10.0.0.3:5060").unwrap(),
+        );
+        req.headers
+            .add("Via", "SIP/2.0/UDP proxy.local:5060;branch=z9hG4bKproxy1");
+        req.headers
+            .add("Via", "SIP/2.0/UDP 10.0.0.2:5060;branch=z9hG4bKuac1;rport");
+        req.headers
+            .add("Record-Route", "<sip:proxy1.local:5060;lr>");
+        req.headers
+            .add("Record-Route", "<sip:proxy2.local:5060;lr>");
+        req.headers.add("From", "<sip:1001@proxy.local>;tag=from1");
+        req.headers.add("To", "<sip:1002@proxy.local>");
+        req.headers.add("Call-ID", "rr-call-1");
+        req.headers.add("CSeq", "1 INVITE");
+
+        let resp = req.create_response(200, "OK").unwrap();
+        assert_eq!(resp.headers.get_all("Via").len(), 2);
+        assert_eq!(
+            resp.headers.get_all("Record-Route"),
+            vec!["<sip:proxy1.local:5060;lr>", "<sip:proxy2.local:5060;lr>"]
+        );
     }
 
     #[test]

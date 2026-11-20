@@ -1,0 +1,149 @@
+<?xml version="1.0"?>
+<document type="freeswitch/xml">
+  <X-PRE-PROCESS cmd="set" data="domain=freeswitch"/>
+
+  <section name="configuration" description="FreeSWITCH Configuration">
+    <configuration name="modules.conf" description="Modules">
+      <modules>
+        <load module="mod_console"/>
+        <load module="mod_logfile"/>
+        <load module="mod_commands"/>
+        <load module="mod_dptools"/>
+        <load module="mod_dialplan_xml"/>
+        <load module="mod_sofia"/>
+        <load module="mod_opus"/>
+      </modules>
+    </configuration>
+
+    <configuration name="console.conf" description="Console Logger">
+      <mappings>
+        <map name="all" value="console,warning,err,crit,alert"/>
+      </mappings>
+      <settings>
+        <param name="colorize" value="false"/>
+        <param name="loglevel" value="info"/>
+      </settings>
+    </configuration>
+
+    <configuration name="switch.conf" description="Core Configuration">
+      <settings>
+        <param name="max-sessions" value="100"/>
+        <param name="sessions-per-second" value="30"/>
+        <param name="loglevel" value="info"/>
+        <param name="rtp-start-port" value="16384"/>
+        <param name="rtp-end-port" value="16404"/>
+        <param name="core-db-name" value="/dev/shm/freeswitch-core.db"/>
+      </settings>
+    </configuration>
+
+    <configuration name="opus.conf" description="Opus Codec Configuration">
+      <settings>
+        <param name="use-vbr" value="0"/>
+        <param name="complexity" value="10"/>
+        <param name="maxaveragebitrate" value="64000"/>
+        <param name="maxplaybackrate" value="48000"/>
+        <param name="packet-loss-percent" value="0"/>
+        <param name="asymmetric-sample-rates" value="0"/>
+      </settings>
+    </configuration>
+
+    <configuration name="sofia.conf" description="Sofia SIP Endpoint">
+      <global_settings>
+        <param name="log-level" value="0"/>
+        <param name="abort-on-empty-external-profile" value="true"/>
+        <param name="auto-restart" value="false"/>
+      </global_settings>
+      <profiles>
+        <profile name="internal">
+          <settings>
+            <param name="context" value="default"/>
+            <param name="sip-port" value="5060"/>
+            <param name="dialplan" value="XML"/>
+            <param name="rtp-ip" value="$${local_ip_v4}"/>
+            <param name="sip-ip" value="$${local_ip_v4}"/>
+            <param name="ext-rtp-ip" value="$${local_ip_v4}"/>
+            <param name="ext-sip-ip" value="$${local_ip_v4}"/>
+            <param name="inbound-codec-prefs" value="OPUS,PCMU,PCMA"/>
+            <param name="outbound-codec-prefs" value="OPUS,PCMU,PCMA"/>
+            <param name="codec-ms" value="20"/>
+            <param name="dtmf-type" value="rfc2833"/>
+            <param name="rfc2833-pt" value="101"/>
+            <param name="auth-calls" value="true"/>
+            <param name="accept-blind-reg" value="false"/>
+            <param name="apply-nat-acl" value="false"/>
+            <param name="force-register-domain" value="$${domain}"/>
+            <param name="force-register-db-domain" value="$${domain}"/>
+            <param name="force-subscription-domain" value="$${domain}"/>
+            <param name="nonce-ttl" value="60"/>
+          </settings>
+        </profile>
+      </profiles>
+    </configuration>
+  </section>
+
+  <section name="directory" description="User Directory">
+    <domain name="$${domain}">
+      <params>
+        <param name="dial-string" value="{presence_id=${dialed_user}@${dialed_domain}}${sofia_contact(${dialed_user}@${dialed_domain})}"/>
+      </params>
+      <groups>
+        <group name="default">
+          <users>
+            <user id="1001">
+              <params>
+                <param name="password" value="secret1001"/>
+              </params>
+              <variables>
+                <variable name="user_context" value="default"/>
+                <variable name="effective_caller_id_number" value="1001"/>
+              </variables>
+            </user>
+            <user id="1002">
+              <params>
+                <param name="password" value="secret1002"/>
+              </params>
+              <variables>
+                <variable name="user_context" value="default"/>
+                <variable name="effective_caller_id_number" value="1002"/>
+              </variables>
+            </user>
+            <user id="1003">
+              <params>
+                <param name="password" value="secret1003"/>
+              </params>
+              <variables>
+                <variable name="user_context" value="default"/>
+                <variable name="effective_caller_id_number" value="1003"/>
+              </variables>
+            </user>
+          </users>
+        </group>
+      </groups>
+    </domain>
+  </section>
+
+  <section name="dialplan" description="XML Dialplan">
+    <context name="default">
+      <extension name="wait_600">
+        <condition field="destination_number" expression="^600$">
+          <action application="answer"/>
+          <action application="sleep" data="1000"/>
+          <action application="hangup"/>
+        </condition>
+      </extension>
+      <extension name="echo_601">
+        <condition field="destination_number" expression="^601$">
+          <action application="answer"/>
+          <action application="echo"/>
+        </condition>
+      </extension>
+      <extension name="local_users">
+        <condition field="destination_number" expression="^(100[1-3])$">
+          <action application="set" data="hangup_after_bridge=true"/>
+          <action application="bridge" data="user/$1@$${domain}"/>
+        </condition>
+      </extension>
+    </context>
+  </section>
+</document>
+

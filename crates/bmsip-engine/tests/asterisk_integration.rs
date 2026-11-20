@@ -11,12 +11,16 @@ use bmsip_media::{DtmfDigit, G711Kind, JitterBufferConfig, MediaSession, Playout
 
 static ASTERISK_TEST_MUTEX: Mutex<()> = Mutex::new(());
 
-fn resolve_asterisk() -> SocketAddr {
-    ("asterisk", 5060)
+fn resolve_server(host: &str) -> SocketAddr {
+    (host, 5060)
         .to_socket_addrs()
-        .expect("resolve asterisk:5060")
+        .expect("resolve server:5060")
         .next()
-        .expect("at least one address for asterisk:5060")
+        .expect("at least one address for server:5060")
+}
+
+fn resolve_asterisk() -> SocketAddr {
+    resolve_server("asterisk")
 }
 
 fn discover_local_ip(remote: SocketAddr) -> IpAddr {
@@ -890,5 +894,243 @@ fn live_asterisk_opus_48khz_libopus_echo_and_two_engine_call() {
         recorded.rms_energy() > 2000,
         "expected echoed 48 kHz Opus WAV RMS > 2000, got {}",
         recorded.rms_energy()
+    );
+}
+
+fn run_echo_opus_server_check(server_host: &str) {
+    let server_addr = resolve_server(server_host);
+    let registrar = SipUri::parse(&format!("sip:{server_host}:5060")).unwrap();
+    let mut ua_cfg = UaConfig::new("1001", "secret1001", server_host, registrar, "0.0.0.0", 0);
+    ua_cfg.supported_codecs = vec![
+        RtpCodec::opus(),
+        RtpCodec::pcmu(),
+        RtpCodec::pcma(),
+        RtpCodec::telephone_event(101),
+    ];
+
+    let tone_48k = WavPcm16::generate_sine_wave(48_000, 440, 1200, 12_000);
+    let (port, handle) = WavAudioPort::new(tone_48k, true);
+    let engine = SipEngine::spawn(
+        EngineConfig::new(ua_cfg, server_addr, IpAddr::V4(Ipv4Addr::UNSPECIFIED), 0),
+        Box::new(port),
+    )
+    .unwrap();
+
+    engine.send_command(EngineCommand::Register).unwrap();
+    assert!(
+        wait_for_engine_event(&engine, Duration::from_secs(10), |e| matches!(
+            e,
+            EngineEvent::RegistrationChanged(RegistrationState::Registered { .. })
+        ))
+        .is_some(),
+        "1001 failed to register on {server_host}"
+    );
+
+    engine
+        .send_command(EngineCommand::Dial {
+            target_uri: SipUri::parse(&format!("sip:601@{server_host}:5060")).unwrap(),
+        })
+        .unwrap();
+
+    let call_id = match wait_for_engine_event(&engine, Duration::from_secs(5), |e| {
+        matches!(e, EngineEvent::OutboundCallStarted { .. })
+    })
+    .expect("OutboundCallStarted")
+    {
+        EngineEvent::OutboundCallStarted { call_id } => call_id,
+        _ => unreachable!(),
+    };
+
+    let established_codec = match wait_for_engine_event(&engine, Duration::from_secs(8), |e| {
+        matches!(e, EngineEvent::CallEstablished { .. })
+    })
+    .unwrap_or_else(|| panic!("CallEstablished timed out on {server_host}"))
+    {
+        EngineEvent::CallEstablished { codec, .. } => codec,
+        _ => unreachable!(),
+    };
+    assert_eq!(established_codec, "OPUS");
+
+    thread::sleep(Duration::from_millis(450));
+
+    engine
+        .send_command(EngineCommand::Hangup { call_id })
+        .unwrap();
+    assert!(
+        wait_for_engine_event(&engine, Duration::from_secs(8), |e| matches!(
+            e,
+            EngineEvent::CallTerminated { .. }
+        ))
+        .is_some()
+    );
+    engine.send_command(EngineCommand::Unregister).unwrap();
+    let _ = wait_for_engine_event(&engine, Duration::from_secs(4), |e| {
+        matches!(
+            e,
+            EngineEvent::RegistrationChanged(RegistrationState::Unregistered)
+        )
+    });
+    engine.shutdown().unwrap();
+
+    let recorded = handle.recorded_wav();
+    assert!(
+        recorded.rms_energy() > 2000,
+        "expected {server_host} echoed 48 kHz Opus WAV RMS > 2000, got {}",
+        recorded.rms_energy()
+    );
+}
+
+#[test]
+fn live_freeswitch_and_kamailio_multi_server_interop() {
+    let _guard = ASTERISK_TEST_MUTEX
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
+
+    // 1. FreeSWITCH (Sofia-SIP, 407 Proxy-Auth, mod_opus Echo 601).
+    run_echo_opus_server_check("freeswitch");
+
+    // 2. Kamailio (RFC 3261 Proxy/Registrar, Record-Route/Route, dual Via, direct P2P RTP/DTMF).
+    let kam_addr = resolve_server("kamailio");
+    let registrar = SipUri::parse("sip:kamailio:5060").unwrap();
+
+    let mut cfg_1001 = UaConfig::new(
+        "1001",
+        "secret1001",
+        "kamailio",
+        registrar.clone(),
+        "0.0.0.0",
+        0,
+    );
+    cfg_1001.supported_codecs = vec![
+        RtpCodec::opus(),
+        RtpCodec::pcmu(),
+        RtpCodec::pcma(),
+        RtpCodec::telephone_event(101),
+    ];
+    let tone_1001 = WavPcm16::generate_sine_wave(48_000, 440, 1200, 12_000);
+    let (port_1001, _) = WavAudioPort::new(tone_1001, true);
+    let eng_1001 = SipEngine::spawn(
+        EngineConfig::new(cfg_1001, kam_addr, IpAddr::V4(Ipv4Addr::UNSPECIFIED), 0),
+        Box::new(port_1001),
+    )
+    .unwrap();
+
+    let mut cfg_1002 = UaConfig::new("1002", "secret1002", "kamailio", registrar, "0.0.0.0", 0);
+    cfg_1002.supported_codecs = vec![
+        RtpCodec::opus(),
+        RtpCodec::pcmu(),
+        RtpCodec::pcma(),
+        RtpCodec::telephone_event(101),
+    ];
+    let silence_1002 = WavPcm16::new(48_000, vec![0; 960]);
+    let (port_1002, handle_1002) = WavAudioPort::new(silence_1002, true);
+    let eng_1002 = SipEngine::spawn(
+        EngineConfig::new(cfg_1002, kam_addr, IpAddr::V4(Ipv4Addr::UNSPECIFIED), 0),
+        Box::new(port_1002),
+    )
+    .unwrap();
+
+    eng_1001.send_command(EngineCommand::Register).unwrap();
+    eng_1002.send_command(EngineCommand::Register).unwrap();
+    assert!(
+        wait_for_engine_event(&eng_1001, Duration::from_secs(10), |e| matches!(
+            e,
+            EngineEvent::RegistrationChanged(RegistrationState::Registered { .. })
+        ))
+        .is_some()
+    );
+    assert!(
+        wait_for_engine_event(&eng_1002, Duration::from_secs(10), |e| matches!(
+            e,
+            EngineEvent::RegistrationChanged(RegistrationState::Registered { .. })
+        ))
+        .is_some()
+    );
+
+    eng_1001
+        .send_command(EngineCommand::Dial {
+            target_uri: SipUri::parse("sip:1002@kamailio:5060").unwrap(),
+        })
+        .unwrap();
+
+    let call_1001 = match wait_for_engine_event(&eng_1001, Duration::from_secs(5), |e| {
+        matches!(e, EngineEvent::OutboundCallStarted { .. })
+    })
+    .expect("OutboundCallStarted on 1001")
+    {
+        EngineEvent::OutboundCallStarted { call_id } => call_id,
+        _ => unreachable!(),
+    };
+
+    let call_1002 = match wait_for_engine_event(&eng_1002, Duration::from_secs(8), |e| {
+        matches!(e, EngineEvent::IncomingCall { .. })
+    })
+    .expect("IncomingCall on 1002 via Kamailio")
+    {
+        EngineEvent::IncomingCall { call_id, .. } => call_id,
+        _ => unreachable!(),
+    };
+
+    eng_1002
+        .send_command(EngineCommand::Ring {
+            call_id: call_1002.clone(),
+        })
+        .unwrap();
+    eng_1002
+        .send_command(EngineCommand::Answer { call_id: call_1002 })
+        .unwrap();
+
+    assert!(
+        wait_for_engine_event(&eng_1001, Duration::from_secs(8), |e| matches!(
+            e,
+            EngineEvent::CallEstablished { .. }
+        ))
+        .is_some()
+    );
+    assert!(
+        wait_for_engine_event(&eng_1002, Duration::from_secs(8), |e| matches!(
+            e,
+            EngineEvent::CallEstablished { .. }
+        ))
+        .is_some()
+    );
+
+    thread::sleep(Duration::from_millis(450));
+
+    eng_1001
+        .send_command(EngineCommand::Hangup { call_id: call_1001 })
+        .unwrap();
+    assert!(
+        wait_for_engine_event(&eng_1001, Duration::from_secs(8), |e| matches!(
+            e,
+            EngineEvent::CallTerminated { .. }
+        ))
+        .is_some()
+    );
+    assert!(
+        wait_for_engine_event(&eng_1002, Duration::from_secs(8), |e| matches!(
+            e,
+            EngineEvent::CallTerminated { .. }
+        ))
+        .is_some()
+    );
+
+    for eng in [&eng_1001, &eng_1002] {
+        eng.send_command(EngineCommand::Unregister).unwrap();
+        let _ = wait_for_engine_event(eng, Duration::from_secs(4), |e| {
+            matches!(
+                e,
+                EngineEvent::RegistrationChanged(RegistrationState::Unregistered)
+            )
+        });
+    }
+    eng_1001.shutdown().unwrap();
+    eng_1002.shutdown().unwrap();
+
+    let recorded_1002 = handle_1002.recorded_wav();
+    assert!(
+        recorded_1002.rms_energy() > 1000,
+        "expected P2P RTP RMS > 1000 through Kamailio proxy, got {}",
+        recorded_1002.rms_energy()
     );
 }

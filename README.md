@@ -2,7 +2,7 @@
 
 Embeddable, cross-platform SIP library written in Rust for **Linux**, **iOS**, and **Android**.
 
-- **Current Version:** `0.7.0` ([CHANGELOG.md](./CHANGELOG.md))
+- **Current Version:** `0.8.0` ([CHANGELOG.md](./CHANGELOG.md))
 - **Architecture Specification:** [ARCHITECTURE.md](./ARCHITECTURE.md)
 - **License:** `AGPL-3.0-only` ([LICENSE](./LICENSE) · [NOTICE](./NOTICE) · commercial licensing: [bymaker.com](https://bymaker.com))
 
@@ -25,10 +25,10 @@ bindings/
 
 All Rust tooling (`rustc`, `cargo`, `rustfmt`, `clippy`) and PipeWire/ALSA audio utilities run inside the Docker Compose `dev` container.
 
-Start the dev container and local Asterisk test PBX:
+Start the dev container and the multi-server SIP testbed (Asterisk, FreeSWITCH, Kamailio):
 
 ```bash
-docker compose up -d --build dev asterisk
+docker compose up -d --build dev asterisk freeswitch kamailio
 ```
 
 Run formatting check, linter, and all workspace tests:
@@ -37,6 +37,12 @@ Run formatting check, linter, and all workspace tests:
 docker compose exec -T dev cargo fmt --all -- --check
 docker compose exec -T dev cargo clippy --workspace --all-targets -- -D warnings
 docker compose exec -T dev cargo test --workspace
+```
+
+Run the unified 9-scenario multi-server interoperability suite (`Asterisk` + `FreeSWITCH` + `Kamailio`):
+
+```bash
+docker compose exec -T dev cargo run -p bmsip-cli -- interop
 ```
 
 Run a live 48 kHz Opus microphone/speaker SIP call through the Asterisk echo test (`601`):

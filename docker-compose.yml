@@ -25,6 +25,22 @@ services:
     networks:
       - bmsip-net
 
+  freeswitch:
+    build:
+      context: .devcontainer/freeswitch
+      dockerfile: Dockerfile
+    hostname: freeswitch
+    networks:
+      - bmsip-net
+
+  kamailio:
+    build:
+      context: .devcontainer/kamailio
+      dockerfile: Dockerfile
+    hostname: kamailio
+    networks:
+      - bmsip-net
+
 volumes:
   bmsip-cargo-cache:
 

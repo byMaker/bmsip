@@ -99,6 +99,17 @@ impl RtpCodec {
         }
     }
 
+    /// RFC 4733 DTMF telephone-event codec synchronized to 48000 Hz RTP clocks (e.g., with Opus).
+    pub fn telephone_event_48k(payload_type: u8) -> Self {
+        Self {
+            payload_type,
+            encoding_name: "telephone-event".to_string(),
+            clock_rate: 48000,
+            channels: None,
+            fmtp: Some("0-16".to_string()),
+        }
+    }
+
     fn matches_format(&self, other: &Self) -> bool {
         self.encoding_name
             .eq_ignore_ascii_case(&other.encoding_name)

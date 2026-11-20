@@ -5,6 +5,18 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.8.0] - 2026-11-20
+
+### Added
+- Multi-server SIP interoperability environment in `docker-compose.yml`:
+  - `.devcontainer/freeswitch/` running FreeSWITCH 1.10 (`mod_sofia` + `mod_opus`, `407 Proxy-Authenticate`, `Echo` `601`, extensions `1001`–`1003`).
+  - `.devcontainer/kamailio/` running Kamailio 5.8 RFC 3261 SIP Proxy & Registrar (`Record-Route`/`Route` loose routing, dual `Via`, direct P2P RTP relay).
+- RFC 3261 §12.1.1 `Record-Route` preservation in `SipRequest::create_response` and `RtpCodec::telephone_event_48k` matching `48000 Hz` Opus RTP clocks (`bmsip-core`).
+- Paced 20 ms RFC 4733 DTMF transmission (`MediaSession::pop_dtmf_packet` and `SipEngine::pump_media_tick`) for strict FreeSWITCH `mod_sofia` interoperability (`bmsip-media`, `bmsip-engine`).
+- `bmsip-cli` DSP audio quality analyzer (`analyze`), 5-case PBX echo `selftest`, and unified 9-scenario multi-server `interop` command across Asterisk, FreeSWITCH, and Kamailio.
+- Smooth boundary crossfade on concealed/recovered frames in `AdaptiveJitterBuffer` (`bmsip-media`).
+- Live multi-server integration test `live_freeswitch_and_kamailio_multi_server_interop` in `crates/bmsip-engine/tests/asterisk_integration.rs`.
+
 ## [0.7.0] - 2026-11-20
 
 ### Added
