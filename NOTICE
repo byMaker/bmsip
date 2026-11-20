@@ -1,0 +1,20 @@
+bmsip — Embeddable SIP & SRTP Telephony Engine in Rust
+Copyright (C) 2026 Sergei Z. (byMaker) <git@bymaker.com>
+https://bymaker.com
+
+This program is free software: you can redistribute it and/or modify it under
+the terms of the GNU Affero General Public License as published by the Free
+Software Foundation, version 3 of the License (AGPL-3.0-only).
+
+See the LICENSE file in the repository root for the full license text.
+
+Commercial Licensing
+--------------------
+If you wish to incorporate bmsip into proprietary, closed-source, mobile store
+(Google Play / App Store), or commercial networked products without the
+obligations of the GNU AGPL-3.0-only license, commercial licenses are available
+from the copyright holder:
+
+  Sergei Z. (byMaker)
+  Email: git@bymaker.com
+  Web:   https://bymaker.com

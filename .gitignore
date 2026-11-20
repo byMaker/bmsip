@@ -1,0 +1,12 @@
+/target/
+**/*.rs.bk
+.DS_Store
+*.swp
+.idea/
+/artifacts/
+*.pcap
+*.wav
+/.agents/
+/.agent/
+/AGENTS.md
+/GEMINI.md
