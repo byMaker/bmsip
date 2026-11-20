@@ -7,6 +7,11 @@ services:
     volumes:
       - .:/workspace
       - bmsip-cargo-cache:/cargo
+      - /run/user/1000/pulse:/run/user/1000/pulse
+    environment:
+      PULSE_SERVER: unix:/run/user/1000/pulse/native
+    devices:
+      - /dev/snd:/dev/snd
     working_dir: /workspace
     command: sleep infinity
     networks:

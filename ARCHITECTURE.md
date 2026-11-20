@@ -79,4 +79,12 @@ All workspace crates share a synchronized **SemVer 2.0.0** version in root `Carg
 - **`0.2.0` — Stage 2:** Dialog & registration FSMs (`REGISTER`, `INVITE`, `CANCEL`, `BYE`, `re-INVITE`) + live Asterisk Docker Compose integration suite.
 - **`0.3.0` — Stage 3:** `bmsip-media` RTP/RTCP, adaptive jitter buffer, G.711 (`PCMU`/`PCMA`), DTMF (RFC 4733), WAV test call verification.
 - **`0.4.0` — Stage 4:** `bmsip-engine` UDP/TCP transport + `bmsip-cli` Linux softphone + per-call diagnostic flight recorder.
-- **`0.5.0` — Stage 5 (Current):** `bmsip-ffi` UniFFI `.udl` contract (Swift/Kotlin/C) + Opus codec integration.
+- **`0.5.0` — Stage 5:** `bmsip-ffi` UniFFI `.udl` contract (Swift/Kotlin/C) + Opus codec integration.
+- **`0.6.0` — Stage 6 (Current):** Linux live audio (`--live-audio` & `listen` in `bmsip-cli`) + reference iOS/Android/C platform adapters (`bindings/`).
+
+---
+
+## 6. Future Roadmap / TODO
+
+- **TODO 1 — Native `libopus` C FFI Backend (`OpusCodecBackend`):** Link `libopus` into `OpusCodecBackend` for full RFC 6716 bitstream interoperability with third-party PBXs while keeping `BuiltInOpusCodec` as a pure-Rust fallback.
+- **TODO 2 — SIP over TCP/TLS (`rustls`) & Media Encryption (`SRTP` / `DTLS-SRTP`):** Add stream framing for TCP/TLS 1.3 signalling and RFC 3711 SRTP media protection for public internet traversal.

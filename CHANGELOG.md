@@ -5,6 +5,18 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.6.0] - 2026-11-20
+
+### Added
+- Host PipeWire/PulseAudio and ALSA passthrough in `.devcontainer/Dockerfile` and `docker-compose.yml`.
+- `LiveLinuxAudioPort` (`crates/bmsip-cli/src/live_audio.rs`, `#![forbid(unsafe_code)]`) streaming 8 kHz mono PCM16 frames via `pacat` / ALSA with non-blocking queues.
+- `bmsip-cli` `--live-audio` option for `call` and new `listen` subcommand for inbound call answering.
+- Reference platform integration adapters in `bindings/`:
+  - iOS Swift bridge (`bindings/ios/BmsipIosAudioBridge.swift`) using `AVAudioEngine` (VoiceProcessingIO AEC), `CallKit`, and `NWPathMonitor`.
+  - Android Kotlin bridge (`bindings/android/BmsipAndroidAudioBridge.kt`) using `AudioRecord`/`AcousticEchoCanceler`, `AudioTrack`, and `ConnectivityManager`.
+  - C99 example (`bindings/c/minimal_phone.c`) verified with `gcc -std=c99 -Wall -Wextra -Werror`.
+- Future Roadmap / `TODO` section in `ARCHITECTURE.md` covering native `libopus` C FFI integration and TCP/TLS + SRTP transport encryption.
+
 ## [0.5.0] - 2026-11-20
 
 ### Added

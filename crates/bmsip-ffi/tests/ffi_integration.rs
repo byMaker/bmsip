@@ -106,6 +106,41 @@ fn c_header_compiles_cleanly_with_gcc_c99() {
 }
 
 #[test]
+fn c_minimal_phone_example_compiles_with_gcc_c99() {
+    let manifest_dir = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+    let include_dir = manifest_dir.join("include");
+    let example_c = manifest_dir
+        .parent()
+        .and_then(|p| p.parent())
+        .expect("workspace root")
+        .join("bindings")
+        .join("c")
+        .join("minimal_phone.c");
+    assert!(example_c.exists(), "missing {:?}", example_c);
+
+    let output = Command::new("gcc")
+        .args([
+            "-std=c99",
+            "-Wall",
+            "-Wextra",
+            "-Werror",
+            "-fsyntax-only",
+            "-I",
+        ])
+        .arg(&include_dir)
+        .arg(&example_c)
+        .output()
+        .expect("run gcc syntax check on minimal_phone.c");
+
+    assert!(
+        output.status.success(),
+        "gcc failed on minimal_phone.c:\nstdout: {}\nstderr: {}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+}
+
+#[test]
 fn sdk_and_c_api_live_asterisk_call_pcm_bridge_and_telemetry() {
     // 1. Safe Rust / UniFFI BmsipClient against live Asterisk Echo (exten 601).
     let client = BmsipClient::new(FfiConfig {
