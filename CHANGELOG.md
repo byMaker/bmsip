@@ -5,6 +5,19 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.7.0] - 2026-11-20
+
+### Added
+- Native 48 kHz `libopus` FFI backend (`LibOpusCodec` in `crates/bmsip-engine/src/opus_native.rs`) with automatic `libopus` linking (`crates/bmsip-engine/build.rs`) and `libopus-dev` in `.devcontainer/Dockerfile`.
+- End-to-end 48 kHz `AudioPort` support (`sample_rate_hz`, `capture_frame_20ms`) across `bmsip-engine`, `WavAudioPort`, and `LiveLinuxAudioPort`.
+- Microphone DSP conditioning (`condition_mic_frame` in `bmsip-media::opus`): continuous soft noise gate, fixed-point gain scaling, and rational soft-knee peak limiting.
+- Pre-roll buffering (2 frames TX, 3 frames RX) and decayed TX underrun concealment in `LiveLinuxAudioPort` eliminating live audio underrun clicks.
+- CLI flags `--codec <opus|pcmu|pcma>` (default: `opus`) and `--mic-gain <mult>` (default: `4.0`) in `bmsip-cli` for both `call` and `listen`.
+- Asterisk `allow=opus,ulaw,alaw` on PJSIP endpoints `[1001]`–`[1003]` and live 48 kHz `libopus` echo integration test (`live_asterisk_opus_48khz_libopus_echo_and_two_engine_call`).
+
+### Changed
+- Upgraded `OpusCodecBackend` and `MediaSession` to support both 48 kHz (`960` samples/20 ms) and 8 kHz (`160` samples/20 ms) frames with pluggable backend injection (`with_opus_backend`) and scaled adaptive jitter depth calculation.
+
 ## [0.6.0] - 2026-11-20
 
 ### Added

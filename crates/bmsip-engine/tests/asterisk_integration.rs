@@ -4,6 +4,7 @@ use std::thread;
 use std::time::{Duration, Instant};
 
 use bmsip_core::dialog::{CallState, RegistrationState, UaConfig, UaEvent, UserAgent};
+use bmsip_core::sdp::RtpCodec;
 use bmsip_core::sip::SipUri;
 use bmsip_engine::{EngineCommand, EngineConfig, EngineEvent, SipEngine, WavAudioPort};
 use bmsip_media::{DtmfDigit, G711Kind, JitterBufferConfig, MediaSession, PlayoutFrame, WavPcm16};
@@ -801,4 +802,93 @@ fn live_asterisk_two_engines_call_audio_dtmf_lifecycle_and_blackbox() {
 
     eng_1001.shutdown().unwrap();
     eng_1002.shutdown().unwrap();
+}
+
+#[test]
+fn live_asterisk_opus_48khz_libopus_echo_and_two_engine_call() {
+    let _guard = ASTERISK_TEST_MUTEX
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
+    let asterisk_addr = resolve_asterisk();
+    let registrar = SipUri::parse("sip:asterisk:5060").unwrap();
+
+    let mut ua_cfg = UaConfig::new("1001", "secret1001", "asterisk", registrar, "0.0.0.0", 0);
+    ua_cfg.supported_codecs = vec![
+        RtpCodec::opus(),
+        RtpCodec::pcmu(),
+        RtpCodec::pcma(),
+        RtpCodec::telephone_event(101),
+    ];
+
+    let tone_48k = WavPcm16::generate_sine_wave(48_000, 400, 1200, 12_000);
+    let (port, handle) = WavAudioPort::new(tone_48k, true);
+    let engine = SipEngine::spawn(
+        EngineConfig::new(ua_cfg, asterisk_addr, IpAddr::V4(Ipv4Addr::UNSPECIFIED), 0),
+        Box::new(port),
+    )
+    .unwrap();
+
+    engine.send_command(EngineCommand::Register).unwrap();
+    assert!(
+        wait_for_engine_event(&engine, Duration::from_secs(10), |e| matches!(
+            e,
+            EngineEvent::RegistrationChanged(RegistrationState::Registered { .. })
+        ))
+        .is_some()
+    );
+
+    engine
+        .send_command(EngineCommand::Dial {
+            target_uri: SipUri::parse("sip:601@asterisk:5060").unwrap(),
+        })
+        .unwrap();
+
+    let call_id = match wait_for_engine_event(&engine, Duration::from_secs(5), |e| {
+        matches!(e, EngineEvent::OutboundCallStarted { .. })
+    })
+    .expect("OutboundCallStarted")
+    {
+        EngineEvent::OutboundCallStarted { call_id } => call_id,
+        _ => unreachable!(),
+    };
+
+    let established_codec = match wait_for_engine_event(&engine, Duration::from_secs(8), |e| {
+        matches!(e, EngineEvent::CallEstablished { .. })
+    })
+    .expect("CallEstablished")
+    {
+        EngineEvent::CallEstablished { codec, .. } => codec,
+        _ => unreachable!(),
+    };
+    assert_eq!(established_codec, "OPUS");
+
+    thread::sleep(Duration::from_millis(450));
+
+    engine
+        .send_command(EngineCommand::Hangup { call_id })
+        .unwrap();
+    assert!(
+        wait_for_engine_event(&engine, Duration::from_secs(8), |e| matches!(
+            e,
+            EngineEvent::CallTerminated { .. }
+        ))
+        .is_some()
+    );
+
+    engine.send_command(EngineCommand::Unregister).unwrap();
+    let _ = wait_for_engine_event(&engine, Duration::from_secs(4), |e| {
+        matches!(
+            e,
+            EngineEvent::RegistrationChanged(RegistrationState::Unregistered)
+        )
+    });
+    engine.shutdown().unwrap();
+
+    let recorded = handle.recorded_wav();
+    assert_eq!(recorded.sample_rate, 48_000);
+    assert!(
+        recorded.rms_energy() > 2000,
+        "expected echoed 48 kHz Opus WAV RMS > 2000, got {}",
+        recorded.rms_energy()
+    );
 }

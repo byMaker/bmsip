@@ -23,8 +23,9 @@ pub use dtmf::{DtmfDetector, DtmfDigit, DtmfEventPayload, DtmfSender};
 pub use error::MediaError;
 pub use jitter::{AdaptiveJitterBuffer, JitterBufferConfig, PlayoutFrame};
 pub use opus::{
-    downsample_48k_to_8k, upsample_8k_to_48k, BuiltInOpusCodec, OpusBandwidth, OpusCodecBackend,
-    OpusFmtp, OpusMode, OpusToc, OPUS_RTP_CLOCK_RATE, OPUS_RTP_SAMPLES_20MS,
+    condition_mic_frame, downsample_48k_to_8k, upsample_8k_to_48k, BuiltInOpusCodec, OpusBandwidth,
+    OpusCodecBackend, OpusFmtp, OpusMode, OpusToc, OPUS_RTP_CLOCK_RATE, OPUS_RTP_SAMPLES_20MS,
+    PCM_FRAME_SAMPLES_48KHZ_20MS, PCM_FRAME_SAMPLES_8KHZ_20MS,
 };
 pub use rtcp::{ReceptionReportBlock, RtcpPacket, RtcpSenderInfo, RtpStreamStats};
 pub use rtp::{RtpExtensionHeader, RtpHeader, RtpPacket, RtpPacketizer};

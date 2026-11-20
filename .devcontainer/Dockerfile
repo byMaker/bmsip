@@ -1,7 +1,7 @@
 FROM rust:1-bookworm
 
 RUN apt-get update \
-    && apt-get install -y --no-install-recommends pulseaudio-utils alsa-utils \
+    && apt-get install -y --no-install-recommends pulseaudio-utils alsa-utils libopus-dev \
     && rm -rf /var/lib/apt/lists/* \
     && rustup component add rustfmt clippy \
     && mkdir -p /cargo /workspace \

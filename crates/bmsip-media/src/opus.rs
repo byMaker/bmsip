@@ -13,6 +13,12 @@ pub const OPUS_RTP_CLOCK_RATE: u32 = 48_000;
 /// RTP timestamp increment per 20 ms Opus frame at 48 kHz (`48000 / 50 = 960`).
 pub const OPUS_RTP_SAMPLES_20MS: u32 = 960;
 
+/// Mono PCM sample count for one 20 ms frame at 8000 Hz.
+pub const PCM_FRAME_SAMPLES_8KHZ_20MS: usize = 160;
+
+/// Mono PCM sample count for one 20 ms frame at 48000 Hz.
+pub const PCM_FRAME_SAMPLES_48KHZ_20MS: usize = 960;
+
 /// Opus audio bandwidth modes (RFC 6716 Section 2).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum OpusBandwidth {
@@ -279,56 +285,168 @@ pub fn upsample_8k_to_48k(samples_8k: &[i16]) -> Vec<i16> {
     out
 }
 
-/// Downsamples 48 kHz PCM frames (960 samples) by 6x to 8 kHz (160 samples) via box averaging.
+/// Downsamples 48 kHz PCM frames (960 samples) by 6x to 8 kHz (160 samples) via rounded box averaging.
 pub fn downsample_48k_to_8k(samples_48k: &[i16]) -> Vec<i16> {
     let mut out = Vec::with_capacity(samples_48k.len() / 6);
     for block in samples_48k.as_chunks::<6>().0 {
         let sum: i32 = block.iter().map(|&s| i32::from(s)).sum();
-        out.push((sum / 6) as i16);
+        let rounded = if sum >= 0 {
+            (sum + 3) / 6
+        } else {
+            (sum - 3) / 6
+        };
+        out.push(rounded as i16);
     }
     out
 }
 
-/// Pluggable Opus codec backend operating on 20 ms 8 kHz mono PCM frames (`160` samples).
-pub trait OpusCodecBackend: Send {
-    fn encode_20ms_8khz(&mut self, pcm_160: &[i16]) -> Result<Vec<u8>, MediaError>;
-    fn decode_20ms_8khz(&mut self, opus_pkt: &[u8]) -> Result<Vec<i16>, MediaError>;
+/// Applies a smooth noise gate (`gate_threshold`) and fixed-point microphone gain (`gain_q8 / 256`)
+/// with soft-knee limiting to `[-32000, 32000]` to eliminate low-level quantization crackle.
+pub fn condition_mic_frame(samples: &mut [i16], gate_threshold: i16, gain_q8: u16) {
+    let gate = i32::from(gate_threshold.max(0));
+    let double_gate = gate.saturating_mul(2);
+    let gain = i64::from(gain_q8);
+    const SOFT_KNEE: i64 = 24_000;
+    const SOFT_HEADROOM: i64 = 8_000;
+
+    for sample in samples.iter_mut() {
+        let raw = i32::from(*sample);
+        let ax = raw.abs();
+        let gated = if gate > 0 {
+            if ax <= gate {
+                0
+            } else if ax < double_gate {
+                (ax - gate) * 2
+            } else {
+                ax
+            }
+        } else {
+            ax
+        };
+
+        if gated == 0 {
+            *sample = 0;
+            continue;
+        }
+
+        let scaled = (i64::from(gated) * gain) >> 8;
+        let limited = if scaled <= SOFT_KNEE {
+            scaled
+        } else {
+            let excess = scaled - SOFT_KNEE;
+            SOFT_KNEE + (excess * SOFT_HEADROOM) / (excess + SOFT_HEADROOM)
+        };
+        let signed = if raw < 0 { -limited } else { limited };
+        *sample = signed.clamp(-32_000, 32_000) as i16;
+    }
+}
+
+/// Pluggable Opus codec backend operating on 20 ms mono PCM frames at 48 kHz (`960` samples) or 8 kHz (`160` samples).
+pub trait OpusCodecBackend: Send + fmt::Debug {
+    fn encode_20ms_48khz(&mut self, pcm_960: &[i16]) -> Result<Vec<u8>, MediaError>;
+    fn decode_20ms_48khz(&mut self, opus_pkt: &[u8]) -> Result<Vec<i16>, MediaError>;
+
+    fn encode_20ms_8khz(&mut self, pcm_160: &[i16]) -> Result<Vec<u8>, MediaError> {
+        if pcm_160.len() != PCM_FRAME_SAMPLES_8KHZ_20MS {
+            return Err(MediaError::BufferError(format!(
+                "expected {PCM_FRAME_SAMPLES_8KHZ_20MS} PCM samples for 20 ms 8 kHz Opus frame, got {}",
+                pcm_160.len()
+            )));
+        }
+        let pcm_48k = upsample_8k_to_48k(pcm_160);
+        self.encode_20ms_48khz(&pcm_48k)
+    }
+
+    fn decode_20ms_8khz(&mut self, opus_pkt: &[u8]) -> Result<Vec<i16>, MediaError> {
+        let pcm_48k = self.decode_20ms_48khz(opus_pkt)?;
+        if pcm_48k.len() < PCM_FRAME_SAMPLES_48KHZ_20MS {
+            return Err(MediaError::BufferError(format!(
+                "expected >= {PCM_FRAME_SAMPLES_48KHZ_20MS} decoded 48 kHz samples, got {}",
+                pcm_48k.len()
+            )));
+        }
+        Ok(downsample_48k_to_8k(
+            &pcm_48k[..PCM_FRAME_SAMPLES_48KHZ_20MS],
+        ))
+    }
 }
 
 /// Pure-Rust `#![forbid(unsafe_code)]` RFC 6716 TOC-framed speech codec adapter.
 ///
-/// Packs an RFC 6716 SILK Narrowband 20 ms mono TOC header (`0x08`) followed by companded
-/// speech samples so pure-Rust builds run without unsafe C dependencies while maintaining
-/// RFC 7587 SDP/RTP negotiation and pluggable compatibility with native `libopus`.
+/// Packs an RFC 6716 20 ms mono TOC header followed by companded speech samples so pure-Rust builds
+/// run without unsafe C dependencies while maintaining RFC 7587 SDP/RTP negotiation and pluggable
+/// compatibility with native `libopus`.
 #[derive(Debug, Default)]
 pub struct BuiltInOpusCodec {
-    toc: Option<OpusToc>,
+    toc_8k: Option<OpusToc>,
+    toc_48k: Option<OpusToc>,
 }
 
 impl BuiltInOpusCodec {
-    /// Creates a [`BuiltInOpusCodec`] configured for 20 ms mono SILK narrowband frames.
+    /// Creates a [`BuiltInOpusCodec`] configured for 20 ms mono frames.
     pub fn new() -> Self {
         Self {
-            toc: Some(OpusToc {
+            toc_8k: Some(OpusToc {
                 mode: OpusMode::SilkOnly,
                 bandwidth: OpusBandwidth::Narrowband,
                 frame_duration_ms_x2: 40,
                 stereo: false,
                 frame_count_code: 0,
             }),
+            toc_48k: Some(OpusToc {
+                mode: OpusMode::Hybrid,
+                bandwidth: OpusBandwidth::Fullband,
+                frame_duration_ms_x2: 40,
+                stereo: false,
+                frame_count_code: 0,
+            }),
         }
+    }
+
+    fn decode_inner_8khz(opus_pkt: &[u8]) -> Result<Vec<i16>, MediaError> {
+        if opus_pkt.is_empty() {
+            return Err(MediaError::PacketTooShort);
+        }
+        let _toc = OpusToc::parse(opus_pkt[0]);
+        let body = &opus_pkt[1..];
+        if body.is_empty() {
+            return Ok(vec![0; PCM_FRAME_SAMPLES_8KHZ_20MS]);
+        }
+        let mut pcm = decode_pcmu(body);
+        pcm.resize(PCM_FRAME_SAMPLES_8KHZ_20MS, 0);
+        Ok(pcm)
     }
 }
 
 impl OpusCodecBackend for BuiltInOpusCodec {
-    fn encode_20ms_8khz(&mut self, pcm_160: &[i16]) -> Result<Vec<u8>, MediaError> {
-        if pcm_160.len() != 160 {
+    fn encode_20ms_48khz(&mut self, pcm_960: &[i16]) -> Result<Vec<u8>, MediaError> {
+        if pcm_960.len() != PCM_FRAME_SAMPLES_48KHZ_20MS {
             return Err(MediaError::BufferError(format!(
-                "expected 160 PCM samples for 20 ms Opus frame, got {}",
+                "expected {PCM_FRAME_SAMPLES_48KHZ_20MS} PCM samples for 20 ms 48 kHz Opus frame, got {}",
+                pcm_960.len()
+            )));
+        }
+        let pcm_8k = downsample_48k_to_8k(pcm_960);
+        let toc_byte = self.toc_48k.unwrap_or(OpusToc::parse(0x78)).to_byte();
+        let mut out = Vec::with_capacity(1 + pcm_8k.len());
+        out.push(toc_byte);
+        out.extend_from_slice(&encode_pcmu(&pcm_8k));
+        Ok(out)
+    }
+
+    fn decode_20ms_48khz(&mut self, opus_pkt: &[u8]) -> Result<Vec<i16>, MediaError> {
+        let pcm_8k = Self::decode_inner_8khz(opus_pkt)?;
+        Ok(upsample_8k_to_48k(&pcm_8k))
+    }
+
+    fn encode_20ms_8khz(&mut self, pcm_160: &[i16]) -> Result<Vec<u8>, MediaError> {
+        if pcm_160.len() != PCM_FRAME_SAMPLES_8KHZ_20MS {
+            return Err(MediaError::BufferError(format!(
+                "expected {PCM_FRAME_SAMPLES_8KHZ_20MS} PCM samples for 20 ms Opus frame, got {}",
                 pcm_160.len()
             )));
         }
-        let toc_byte = self.toc.unwrap_or(OpusToc::parse(0x08)).to_byte();
+        let toc_byte = self.toc_8k.unwrap_or(OpusToc::parse(0x08)).to_byte();
         let mut out = Vec::with_capacity(1 + pcm_160.len());
         out.push(toc_byte);
         out.extend_from_slice(&encode_pcmu(pcm_160));
@@ -336,17 +454,7 @@ impl OpusCodecBackend for BuiltInOpusCodec {
     }
 
     fn decode_20ms_8khz(&mut self, opus_pkt: &[u8]) -> Result<Vec<i16>, MediaError> {
-        if opus_pkt.is_empty() {
-            return Err(MediaError::PacketTooShort);
-        }
-        let _toc = OpusToc::parse(opus_pkt[0]);
-        let body = &opus_pkt[1..];
-        if body.is_empty() {
-            return Ok(vec![0; 160]);
-        }
-        let mut pcm = decode_pcmu(body);
-        pcm.resize(160, 0);
-        Ok(pcm)
+        Self::decode_inner_8khz(opus_pkt)
     }
 }
 
@@ -407,5 +515,28 @@ mod tests {
         let decoded = codec.decode_20ms_8khz(&encoded).unwrap();
         assert_eq!(decoded.len(), 160);
         assert!(WavPcm16::new(8000, decoded).rms_energy() > 6000);
+
+        let encoded_48 = codec.encode_20ms_48khz(&up).unwrap();
+        assert_eq!(
+            OpusToc::parse(encoded_48[0]).bandwidth,
+            OpusBandwidth::Fullband
+        );
+        let decoded_48 = codec.decode_20ms_48khz(&encoded_48).unwrap();
+        assert_eq!(decoded_48.len(), 960);
+        assert!(WavPcm16::new(48000, decoded_48).rms_energy() > 6000);
+    }
+
+    #[test]
+    fn condition_mic_frame_gates_noise_and_soft_limits_peaks() {
+        let mut quiet = vec![0, 4, -8, 12, -12, 5];
+        condition_mic_frame(&mut quiet, 12, 1024);
+        assert_eq!(quiet, vec![0, 0, 0, 0, 0, 0]);
+
+        let mut speech = vec![100, -100, 30_000, -30_000];
+        condition_mic_frame(&mut speech, 12, 1024);
+        assert_eq!(speech[0], 400);
+        assert_eq!(speech[1], -400);
+        assert!(speech[2] <= 32_000 && speech[2] > 28_000);
+        assert!(speech[3] >= -32_000 && speech[3] < -28_000);
     }
 }

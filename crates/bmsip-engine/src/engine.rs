@@ -10,11 +10,15 @@ use std::time::{Duration, Instant};
 
 use bmsip_core::dialog::{CallState, RegistrationState, UaEvent, UserAgent};
 use bmsip_core::sip::SipMessage;
-use bmsip_media::{G711Kind, JitterBufferConfig, MediaSession, RtpPacket, SessionCodec};
+use bmsip_media::{
+    BuiltInOpusCodec, G711Kind, JitterBufferConfig, MediaSession, OpusCodecBackend, RtpPacket,
+    SessionCodec, PCM_FRAME_SAMPLES_48KHZ_20MS, PCM_FRAME_SAMPLES_8KHZ_20MS,
+};
 
 use crate::audio::AudioPort;
 use crate::command::{EngineCommand, EngineConfig, EngineEvent};
 use crate::error::EngineError;
+use crate::opus_native::LibOpusCodec;
 use crate::telemetry::{FlightRecorder, TelemetryCategory};
 
 const MEDIA_TICK_MS: u64 = 20;
@@ -328,13 +332,24 @@ impl WorkerCtx {
             .map(|c| c.payload_type)
             .unwrap_or(101);
 
+        let port_rate = self.audio_port.sample_rate_hz();
+        let frame_samples = if port_rate == 48_000 {
+            PCM_FRAME_SAMPLES_48KHZ_20MS
+        } else {
+            PCM_FRAME_SAMPLES_8KHZ_20MS
+        };
         self.ssrc_counter = self.ssrc_counter.wrapping_add(1);
-        let session = MediaSession::new_with_session_codec(
-            session_codec,
-            dtmf_pt,
-            self.ssrc_counter,
-            JitterBufferConfig::default(),
-        );
+        let jb_cfg = JitterBufferConfig {
+            frame_samples,
+            ..JitterBufferConfig::default()
+        };
+        let opus_backend: Box<dyn OpusCodecBackend> = match LibOpusCodec::new() {
+            Ok(native) => Box::new(native),
+            Err(_) => Box::new(BuiltInOpusCodec::new()),
+        };
+        let session =
+            MediaSession::new_with_session_codec(session_codec, dtmf_pt, self.ssrc_counter, jb_cfg)
+                .with_opus_backend(opus_backend);
         self.active_media.insert(
             call_id.to_string(),
             CallMediaRuntime {
@@ -664,7 +679,7 @@ impl WorkerCtx {
 
             // Capture and play out audio frames on the primary active call.
             if idx == 0 {
-                let tx_pcm = self.audio_port.capture_20ms();
+                let tx_pcm = self.audio_port.capture_frame_20ms();
                 if let Ok(pkt) = media.session.encode_pcm_frame(&tx_pcm) {
                     if media.rtp_socket.send_to(&pkt, media.remote_rtp).is_ok() {
                         media.rtp_packets_sent = media.rtp_packets_sent.saturating_add(1);

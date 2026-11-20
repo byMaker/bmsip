@@ -1,6 +1,6 @@
-//! MODULE_CONTRACT: Linux live microphone/speaker `AudioPort` adapter using PipeWire/PulseAudio (`pacat`) or ALSA (`arecord`/`aplay`).
-//! INVARIANTS: `#![forbid(unsafe_code)]`; non-blocking 20 ms `AudioPort` queues so slow OS audio I/O never stalls `SipEngine`; terminates child processes cleanly on `Drop`.
-//! RFC_REFS: RFC 3551 (20 ms 8 kHz mono PCM16).
+//! MODULE_CONTRACT: Linux live microphone/speaker `AudioPort` adapter at 48 kHz using PipeWire/PulseAudio (`pacat`) or ALSA (`arecord`/`aplay`).
+//! INVARIANTS: `#![forbid(unsafe_code)]`; non-blocking 20 ms `AudioPort` queues (`960` samples @ 48 kHz) with pre-roll buffering, soft noise gating, and decayed underrun concealment; terminates child processes cleanly on `Drop`.
+//! RFC_REFS: RFC 3551, RFC 6716 (20 ms @ 48 kHz fullband mono PCM16).
 
 use std::collections::VecDeque;
 use std::io::{Read, Write};
@@ -9,11 +9,17 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Condvar, Mutex};
 use std::thread::{self, JoinHandle};
 
-use bmsip_engine::bmsip_media::WavPcm16;
-use bmsip_engine::{AudioPort, PCM_FRAME_SAMPLES_8KHZ_20MS};
+use bmsip_engine::bmsip_media::{
+    condition_mic_frame, downsample_48k_to_8k, upsample_8k_to_48k, WavPcm16,
+};
+use bmsip_engine::{AudioPort, PCM_FRAME_SAMPLES_48KHZ_20MS, PCM_FRAME_SAMPLES_8KHZ_20MS};
 
+const LIVE_SAMPLE_RATE_HZ: u32 = 48_000;
 const MAX_QUEUED_FRAMES: usize = 16;
-const FRAME_BYTES: usize = PCM_FRAME_SAMPLES_8KHZ_20MS * 2;
+const TX_PREROLL_FRAMES: usize = 2;
+const RX_PREROLL_FRAMES: usize = 3;
+const MIC_GATE_THRESHOLD: i16 = 12;
+const FRAME_BYTES_48K: usize = PCM_FRAME_SAMPLES_48KHZ_20MS * 2;
 
 /// Thread-safe handle for inspecting playout audio captured during live sessions.
 #[derive(Debug, Clone)]
@@ -22,18 +28,23 @@ pub struct LiveAudioHandle {
 }
 
 impl LiveAudioHandle {
-    /// Returns all received RX playout samples as a [`WavPcm16`] clip.
+    /// Returns all received RX playout samples as a 48 kHz [`WavPcm16`] clip.
     pub fn recorded_wav(&self) -> WavPcm16 {
         let guard = self.recorded.lock().unwrap_or_else(|e| e.into_inner());
-        WavPcm16::new(8000, guard.clone())
+        WavPcm16::new(LIVE_SAMPLE_RATE_HZ, guard.clone())
     }
 }
 
-/// Live Linux [`AudioPort`] streaming 8 kHz mono 16-bit PCM via `pacat` (PipeWire/PulseAudio) or ALSA.
+/// Live Linux [`AudioPort`] streaming 48 kHz mono 16-bit PCM via `pacat` (PipeWire/PulseAudio) or ALSA.
 pub struct LiveLinuxAudioPort {
     stop: Arc<AtomicBool>,
-    tx_queue: Arc<Mutex<VecDeque<[i16; PCM_FRAME_SAMPLES_8KHZ_20MS]>>>,
-    rx_queue: Arc<(Mutex<VecDeque<[i16; PCM_FRAME_SAMPLES_8KHZ_20MS]>>, Condvar)>,
+    tx_queue: Arc<Mutex<VecDeque<[i16; PCM_FRAME_SAMPLES_48KHZ_20MS]>>>,
+    tx_primed: bool,
+    last_tx_frame: [i16; PCM_FRAME_SAMPLES_48KHZ_20MS],
+    rx_queue: Arc<(
+        Mutex<VecDeque<[i16; PCM_FRAME_SAMPLES_48KHZ_20MS]>>,
+        Condvar,
+    )>,
     recorded: Arc<Mutex<Vec<i16>>>,
     rec_child: Option<Child>,
     play_child: Option<Child>,
@@ -42,20 +53,22 @@ pub struct LiveLinuxAudioPort {
 }
 
 impl LiveLinuxAudioPort {
-    /// Spawns live Linux audio capture/playback subprocesses, falling back gracefully if audio hardware is unavailable.
-    pub fn spawn() -> (Self, LiveAudioHandle) {
+    /// Spawns live Linux 48 kHz audio capture/playback subprocesses with custom linear mic gain.
+    pub fn spawn_with_gain(mic_gain: f32) -> (Self, LiveAudioHandle) {
         let stop = Arc::new(AtomicBool::new(false));
         let tx_queue = Arc::new(Mutex::new(
-            VecDeque::<[i16; PCM_FRAME_SAMPLES_8KHZ_20MS]>::new(),
+            VecDeque::<[i16; PCM_FRAME_SAMPLES_48KHZ_20MS]>::new(),
         ));
         let rx_queue = Arc::new((
-            Mutex::new(VecDeque::<[i16; PCM_FRAME_SAMPLES_8KHZ_20MS]>::new()),
+            Mutex::new(VecDeque::<[i16; PCM_FRAME_SAMPLES_48KHZ_20MS]>::new()),
             Condvar::new(),
         ));
         let recorded = Arc::new(Mutex::new(Vec::new()));
         let handle = LiveAudioHandle {
             recorded: Arc::clone(&recorded),
         };
+
+        let gain_q8 = (mic_gain.clamp(0.1, 16.0) * 256.0).round() as u16;
 
         let mut rec_child = spawn_recorder();
         let rec_thread = rec_child.as_mut().and_then(|child| {
@@ -65,15 +78,16 @@ impl LiveLinuxAudioPort {
             thread::Builder::new()
                 .name("bmsip-live-rec".to_string())
                 .spawn(move || {
-                    let mut buf = [0u8; FRAME_BYTES];
+                    let mut buf = [0u8; FRAME_BYTES_48K];
                     while !stop_flag.load(Ordering::Relaxed) {
                         if stdout.read_exact(&mut buf).is_err() {
                             break;
                         }
-                        let mut frame = [0i16; PCM_FRAME_SAMPLES_8KHZ_20MS];
+                        let mut frame = [0i16; PCM_FRAME_SAMPLES_48KHZ_20MS];
                         for (dst, pair) in frame.iter_mut().zip(buf.as_chunks::<2>().0) {
                             *dst = i16::from_le_bytes(*pair);
                         }
+                        condition_mic_frame(&mut frame, MIC_GATE_THRESHOLD, gain_q8);
                         if let Ok(mut guard) = q.lock() {
                             if guard.len() >= MAX_QUEUED_FRAMES {
                                 guard.pop_front();
@@ -93,26 +107,32 @@ impl LiveLinuxAudioPort {
             thread::Builder::new()
                 .name("bmsip-live-play".to_string())
                 .spawn(move || {
-                    let mut out_bytes = [0u8; FRAME_BYTES];
+                    let mut out_bytes = [0u8; FRAME_BYTES_48K];
+                    let mut rx_primed = false;
                     loop {
                         let next_frame = {
                             let Ok(guard) = q.0.lock() else {
                                 break;
                             };
+                            let required = if rx_primed { 1 } else { RX_PREROLL_FRAMES };
                             let Ok(mut guard) = q.1.wait_while(guard, |dq| {
-                                dq.is_empty() && !stop_flag.load(Ordering::Relaxed)
+                                dq.len() < required && !stop_flag.load(Ordering::Relaxed)
                             }) else {
                                 break;
                             };
-                            if stop_flag.load(Ordering::Relaxed) && guard.is_empty() {
-                                break;
-                            }
-                            guard.pop_front()
-                        };
-                        let Some(frame) = next_frame else {
                             if stop_flag.load(Ordering::Relaxed) {
                                 break;
                             }
+                            if guard.len() >= RX_PREROLL_FRAMES {
+                                rx_primed = true;
+                            }
+                            let popped = guard.pop_front();
+                            if guard.is_empty() {
+                                rx_primed = false;
+                            }
+                            popped
+                        };
+                        let Some(frame) = next_frame else {
                             continue;
                         };
                         for (dst, &sample) in
@@ -131,6 +151,8 @@ impl LiveLinuxAudioPort {
         let port = Self {
             stop,
             tx_queue,
+            tx_primed: false,
+            last_tx_frame: [0; PCM_FRAME_SAMPLES_48KHZ_20MS],
             rx_queue,
             recorded,
             rec_child,
@@ -143,21 +165,63 @@ impl LiveLinuxAudioPort {
 }
 
 impl AudioPort for LiveLinuxAudioPort {
+    fn sample_rate_hz(&self) -> u32 {
+        LIVE_SAMPLE_RATE_HZ
+    }
+
     fn capture_20ms(&mut self) -> [i16; PCM_FRAME_SAMPLES_8KHZ_20MS] {
-        self.tx_queue
-            .lock()
-            .ok()
-            .and_then(|mut guard| guard.pop_front())
-            .unwrap_or([0; PCM_FRAME_SAMPLES_8KHZ_20MS])
+        let frame_48k = self.capture_frame_20ms();
+        let down = downsample_48k_to_8k(&frame_48k);
+        let mut out = [0i16; PCM_FRAME_SAMPLES_8KHZ_20MS];
+        let n = down.len().min(PCM_FRAME_SAMPLES_8KHZ_20MS);
+        out[..n].copy_from_slice(&down[..n]);
+        out
+    }
+
+    fn capture_frame_20ms(&mut self) -> Vec<i16> {
+        let popped = self.tx_queue.lock().ok().and_then(|mut guard| {
+            if !self.tx_primed {
+                if guard.len() < TX_PREROLL_FRAMES {
+                    return None;
+                }
+                self.tx_primed = true;
+            }
+            guard.pop_front()
+        });
+
+        match popped {
+            Some(frame) => {
+                self.last_tx_frame = frame;
+                frame.to_vec()
+            }
+            None => {
+                if self.tx_primed {
+                    // Decayed PLC concealment instead of injecting a hard zero step into RTP.
+                    for sample in &mut self.last_tx_frame {
+                        *sample = ((*sample as i32 * 3) / 4) as i16;
+                    }
+                    self.last_tx_frame.to_vec()
+                } else {
+                    vec![0; PCM_FRAME_SAMPLES_48KHZ_20MS]
+                }
+            }
+        }
     }
 
     fn playout_20ms(&mut self, samples: &[i16]) {
-        if let Ok(mut rec) = self.recorded.lock() {
-            rec.extend_from_slice(samples);
+        let mut frame = [0i16; PCM_FRAME_SAMPLES_48KHZ_20MS];
+        if samples.len() == PCM_FRAME_SAMPLES_8KHZ_20MS {
+            let up = upsample_8k_to_48k(samples);
+            let n = up.len().min(PCM_FRAME_SAMPLES_48KHZ_20MS);
+            frame[..n].copy_from_slice(&up[..n]);
+        } else {
+            let copy_len = samples.len().min(PCM_FRAME_SAMPLES_48KHZ_20MS);
+            frame[..copy_len].copy_from_slice(&samples[..copy_len]);
         }
-        let mut frame = [0i16; PCM_FRAME_SAMPLES_8KHZ_20MS];
-        let copy_len = samples.len().min(PCM_FRAME_SAMPLES_8KHZ_20MS);
-        frame[..copy_len].copy_from_slice(&samples[..copy_len]);
+
+        if let Ok(mut rec) = self.recorded.lock() {
+            rec.extend_from_slice(&frame);
+        }
 
         if let Ok(mut guard) = self.rx_queue.0.lock() {
             if guard.len() >= MAX_QUEUED_FRAMES {
@@ -197,9 +261,9 @@ fn spawn_recorder() -> Option<Child> {
             "--record",
             "--raw",
             "--format=s16le",
-            "--rate=8000",
+            "--rate=48000",
             "--channels=1",
-            "--latency-msec=20",
+            "--latency-msec=40",
             "--client-name=bmsip-cli",
         ])
         .stdin(Stdio::null())
@@ -211,7 +275,7 @@ fn spawn_recorder() -> Option<Child> {
     }
 
     Command::new("arecord")
-        .args(["-q", "-t", "raw", "-f", "S16_LE", "-r", "8000", "-c", "1"])
+        .args(["-q", "-t", "raw", "-f", "S16_LE", "-r", "48000", "-c", "1"])
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::null())
@@ -225,9 +289,9 @@ fn spawn_player() -> Option<Child> {
             "--playback",
             "--raw",
             "--format=s16le",
-            "--rate=8000",
+            "--rate=48000",
             "--channels=1",
-            "--latency-msec=20",
+            "--latency-msec=40",
             "--client-name=bmsip-cli",
         ])
         .stdin(Stdio::piped())
@@ -239,7 +303,7 @@ fn spawn_player() -> Option<Child> {
     }
 
     Command::new("aplay")
-        .args(["-q", "-t", "raw", "-f", "S16_LE", "-r", "8000", "-c", "1"])
+        .args(["-q", "-t", "raw", "-f", "S16_LE", "-r", "48000", "-c", "1"])
         .stdin(Stdio::piped())
         .stdout(Stdio::null())
         .stderr(Stdio::null())

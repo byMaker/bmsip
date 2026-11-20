@@ -6,7 +6,11 @@ use crate::codec::G711Kind;
 use crate::dtmf::{DtmfDetector, DtmfDigit, DtmfEventPayload, DtmfSender};
 use crate::error::MediaError;
 use crate::jitter::{AdaptiveJitterBuffer, JitterBufferConfig, PlayoutFrame};
-use crate::opus::{BuiltInOpusCodec, OpusCodecBackend, OPUS_RTP_CLOCK_RATE, OPUS_RTP_SAMPLES_20MS};
+use crate::opus::{
+    downsample_48k_to_8k, upsample_8k_to_48k, BuiltInOpusCodec, OpusCodecBackend,
+    OPUS_RTP_CLOCK_RATE, OPUS_RTP_SAMPLES_20MS, PCM_FRAME_SAMPLES_48KHZ_20MS,
+    PCM_FRAME_SAMPLES_8KHZ_20MS,
+};
 use crate::rtcp::{RtcpPacket, RtpStreamStats};
 use crate::rtp::{RtpPacket, RtpPacketizer};
 
@@ -39,7 +43,7 @@ impl SessionCodec {
 #[derive(Debug)]
 pub struct MediaSession {
     codec: SessionCodec,
-    opus: BuiltInOpusCodec,
+    opus: Box<dyn OpusCodecBackend>,
     dtmf_payload_type: u8,
     frame_samples: usize,
     packetizer: RtpPacketizer,
@@ -76,7 +80,7 @@ impl MediaSession {
         let frame_samples = jitter_config.frame_samples.max(1);
         Self {
             codec,
-            opus: BuiltInOpusCodec::new(),
+            opus: Box::new(BuiltInOpusCodec::new()),
             dtmf_payload_type,
             frame_samples,
             packetizer: RtpPacketizer::new(local_ssrc, codec.payload_type(), 1, 0),
@@ -86,6 +90,17 @@ impl MediaSession {
             dtmf_detector: DtmfDetector::new(),
             remote_ssrc: None,
         }
+    }
+
+    /// Installs a custom [`OpusCodecBackend`] (such as native `LibOpusCodec`) using builder style.
+    pub fn with_opus_backend(mut self, backend: Box<dyn OpusCodecBackend>) -> Self {
+        self.opus = backend;
+        self
+    }
+
+    /// Replaces the active [`OpusCodecBackend`].
+    pub fn set_opus_backend(&mut self, backend: Box<dyn OpusCodecBackend>) {
+        self.opus = backend;
     }
 
     /// Returns the RTP clock rate in Hz for the active [`SessionCodec`].
@@ -103,8 +118,22 @@ impl MediaSession {
             )));
         }
         let (encoded, ts_advance) = match self.codec {
-            SessionCodec::G711(kind) => (kind.encode(pcm), self.frame_samples as u32),
-            SessionCodec::Opus { .. } => (self.opus.encode_20ms_8khz(pcm)?, OPUS_RTP_SAMPLES_20MS),
+            SessionCodec::G711(kind) => {
+                if self.frame_samples == PCM_FRAME_SAMPLES_48KHZ_20MS {
+                    let pcm_8k = downsample_48k_to_8k(pcm);
+                    (kind.encode(&pcm_8k), PCM_FRAME_SAMPLES_8KHZ_20MS as u32)
+                } else {
+                    (kind.encode(pcm), self.frame_samples as u32)
+                }
+            }
+            SessionCodec::Opus { .. } => {
+                let pkt = if self.frame_samples == PCM_FRAME_SAMPLES_48KHZ_20MS {
+                    self.opus.encode_20ms_48khz(pcm)?
+                } else {
+                    self.opus.encode_20ms_8khz(pcm)?
+                };
+                (pkt, OPUS_RTP_SAMPLES_20MS)
+            }
         };
         let pkt = self.packetizer.next_packet(encoded, ts_advance, false);
         Ok(pkt.to_bytes())
@@ -152,7 +181,11 @@ impl MediaSession {
 
         let pcm = if matches!(self.codec, SessionCodec::Opus { payload_type } if payload_type == pkt.header.payload_type)
         {
-            self.opus.decode_20ms_8khz(&pkt.payload)?
+            if self.frame_samples == PCM_FRAME_SAMPLES_48KHZ_20MS {
+                self.opus.decode_20ms_48khz(&pkt.payload)?
+            } else {
+                self.opus.decode_20ms_8khz(&pkt.payload)?
+            }
         } else {
             let rx_codec =
                 G711Kind::from_payload_type(pkt.header.payload_type).ok_or_else(|| {
@@ -161,11 +194,25 @@ impl MediaSession {
                         pkt.header.payload_type
                     ))
                 })?;
-            rx_codec.decode(&pkt.payload)
+            let pcm_8k = rx_codec.decode(&pkt.payload);
+            if self.frame_samples == PCM_FRAME_SAMPLES_48KHZ_20MS {
+                upsample_8k_to_48k(&pcm_8k)
+            } else {
+                pcm_8k
+            }
         };
 
+        let rtp_samples_per_frame = self.codec.clock_rate_hz() / 50;
+        let scaled_jitter =
+            if rtp_samples_per_frame > 0 && rtp_samples_per_frame != self.frame_samples as u32 {
+                ((u64::from(self.stats.jitter()) * u64::from(self.frame_samples as u32))
+                    / u64::from(rtp_samples_per_frame)) as u32
+            } else {
+                self.stats.jitter()
+            };
+
         self.jitter
-            .push(pkt.header.sequence_number, pcm, self.stats.jitter());
+            .push(pkt.header.sequence_number, pcm, scaled_jitter);
         Ok(None)
     }
 

@@ -49,6 +49,7 @@ bmsip-ffi  ──┘                 └─────────────�
 | RFC 2617 / 7616 | Digest authentication (`MD5`, `MD5-sess`, `SHA-256`, `SHA-256-sess`, `qop=auth`) | Implemented (`v0.1.0`) |
 | RFC 3261 Sec 12–16 | Dialogs, `REGISTER` refresh, `INVITE`/`CANCEL`/`BYE`/`re-INVITE` | Implemented (`v0.2.0`) |
 | RFC 3550 / 4733 | RTP/RTCP media transport and DTMF telephone-event | Implemented (`v0.3.0`) |
+| RFC 6716 / 7587 | Native `libopus` 48 kHz VoIP codec + TOC/`fmtp` + mic DSP conditioning | Implemented (`v0.7.0`) |
 
 ---
 
@@ -80,11 +81,11 @@ All workspace crates share a synchronized **SemVer 2.0.0** version in root `Carg
 - **`0.3.0` — Stage 3:** `bmsip-media` RTP/RTCP, adaptive jitter buffer, G.711 (`PCMU`/`PCMA`), DTMF (RFC 4733), WAV test call verification.
 - **`0.4.0` — Stage 4:** `bmsip-engine` UDP/TCP transport + `bmsip-cli` Linux softphone + per-call diagnostic flight recorder.
 - **`0.5.0` — Stage 5:** `bmsip-ffi` UniFFI `.udl` contract (Swift/Kotlin/C) + Opus codec integration.
-- **`0.6.0` — Stage 6 (Current):** Linux live audio (`--live-audio` & `listen` in `bmsip-cli`) + reference iOS/Android/C platform adapters (`bindings/`).
+- **`0.6.0` — Stage 6:** Linux live audio (`--live-audio` & `listen` in `bmsip-cli`) + reference iOS/Android/C platform adapters (`bindings/`).
+- **`0.7.0` — Stage 7 (Current):** Native `libopus` 48 kHz VoIP backend (`LibOpusCodec`), Asterisk Opus negotiation, soft noise-gate/gain mic DSP (`condition_mic_frame`), and glitch-free 48 kHz live Linux audio pre-roll buffering.
 
 ---
 
 ## 6. Future Roadmap / TODO
 
-- **TODO 1 — Native `libopus` C FFI Backend (`OpusCodecBackend`):** Link `libopus` into `OpusCodecBackend` for full RFC 6716 bitstream interoperability with third-party PBXs while keeping `BuiltInOpusCodec` as a pure-Rust fallback.
-- **TODO 2 — SIP over TCP/TLS (`rustls`) & Media Encryption (`SRTP` / `DTLS-SRTP`):** Add stream framing for TCP/TLS 1.3 signalling and RFC 3711 SRTP media protection for public internet traversal.
+- **TODO 1 — SIP over TCP/TLS (`rustls`) & Media Encryption (`SRTP` / `DTLS-SRTP`):** Add stream framing for TCP/TLS 1.3 signalling and RFC 3711 SRTP media protection for public internet traversal.
