@@ -1,0 +1,92 @@
+namespace bmsip {};
+
+[Error]
+enum FfiError {
+    "InvalidArgument",
+    "RuntimeError",
+    "Closed",
+};
+
+dictionary FfiConfig {
+    string username;
+    string password;
+    string domain;
+    string registrar_addr;
+    string bind_ip;
+    u16 sip_port;
+    boolean enable_opus;
+};
+
+enum FfiEventKind {
+    "RegistrationChanged",
+    "OutboundCallStarted",
+    "IncomingCall",
+    "CallRinging",
+    "CallEstablished",
+    "CallMediaUpdated",
+    "DtmfReceived",
+    "CallTerminated",
+    "Suspended",
+    "Resumed",
+    "NetworkUpdated",
+    "TelemetryExported",
+    "Warning",
+    "Stopped",
+};
+
+dictionary FfiEvent {
+    FfiEventKind kind;
+    string? call_id;
+    string? detail;
+    u16? status_code;
+    string? black_box_json;
+};
+
+interface BmsipClient {
+    [Throws=FfiError]
+    constructor(FfiConfig config);
+
+    [Throws=FfiError]
+    void register_account();
+
+    [Throws=FfiError]
+    void unregister_account();
+
+    [Throws=FfiError]
+    void dial(string target_uri);
+
+    [Throws=FfiError]
+    void ring(string call_id);
+
+    [Throws=FfiError]
+    void answer(string call_id);
+
+    [Throws=FfiError]
+    void hangup(string call_id);
+
+    [Throws=FfiError]
+    void send_dtmf(string call_id, string digit);
+
+    [Throws=FfiError]
+    void notify_network_changed(string bind_ip, u16 sip_port);
+
+    [Throws=FfiError]
+    void suspend();
+
+    [Throws=FfiError]
+    void resume();
+
+    [Throws=FfiError]
+    void request_telemetry(string? call_id);
+
+    [Throws=FfiError]
+    void push_captured_pcm(sequence<i16> samples);
+
+    sequence<i16>? pop_playout_pcm();
+
+    FfiEvent? poll_event(u32 timeout_ms);
+
+    string local_sip_address();
+
+    void shutdown();
+};

@@ -5,6 +5,8 @@ edition.workspace = true
 license.workspace = true
 description = "Cross-platform FFI facade (iOS, Android, Linux) for bmsip"
 
+[lib]
+crate-type = ["rlib", "cdylib", "staticlib"]
+
 [dependencies]
 bmsip-engine = { path = "../bmsip-engine" }
-

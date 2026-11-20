@@ -5,6 +5,16 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.5.0] - 2026-11-20
+
+### Added
+- `bmsip-media::opus` RFC 6716 Opus TOC framing, RFC 7587 `fmtp` parser, 8 kHz <-> 48 kHz resampling helpers, `OpusCodecBackend` trait, `BuiltInOpusCodec`, and 48 kHz `SessionCodec::Opus` support in `MediaSession` and `SipEngine`.
+- `bmsip-ffi` cross-platform SDK boundary (`cdylib`, `staticlib`, `rlib`):
+  - Authoritative UniFFI IDL contract (`crates/bmsip-ffi/src/bmsip.udl`) for Swift (iOS) and Kotlin (Android).
+  - Safe `BmsipClient` SDK wrapper (`crates/bmsip-ffi/src/client.rs`, `#![forbid(unsafe_code)]`) over `SipEngine` and `PcmQueueAudioPort`.
+  - C99/C++-compatible `extern "C"` ABI (`crates/bmsip-ffi/src/c_api.rs`) and header (`crates/bmsip-ffi/include/bmsip.h`).
+- FFI schema validation, `gcc -std=c99 -Werror` header check, and live Asterisk `BmsipClient` + C-API integration test (`crates/bmsip-ffi/tests/ffi_integration.rs`).
+
 ## [0.4.0] - 2026-11-20
 
 ### Added

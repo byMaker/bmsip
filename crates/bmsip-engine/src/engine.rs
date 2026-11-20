@@ -10,7 +10,7 @@ use std::time::{Duration, Instant};
 
 use bmsip_core::dialog::{CallState, RegistrationState, UaEvent, UserAgent};
 use bmsip_core::sip::SipMessage;
-use bmsip_media::{G711Kind, JitterBufferConfig, MediaSession, RtpPacket};
+use bmsip_media::{G711Kind, JitterBufferConfig, MediaSession, RtpPacket, SessionCodec};
 
 use crate::audio::AudioPort;
 use crate::command::{EngineCommand, EngineConfig, EngineEvent};
@@ -301,10 +301,27 @@ impl WorkerCtx {
         };
         let remote_rtp = SocketAddr::new(remote_ip, remote_sdp.audio_port);
 
-        let codec = negotiated_codecs
+        let (session_codec, codec_name) = negotiated_codecs
             .iter()
-            .find_map(|c| G711Kind::from_payload_type(c.payload_type))
-            .unwrap_or(G711Kind::Pcmu);
+            .find_map(|c| {
+                if c.encoding_name.eq_ignore_ascii_case("opus") {
+                    Some((
+                        SessionCodec::Opus {
+                            payload_type: c.payload_type,
+                        },
+                        "OPUS".to_string(),
+                    ))
+                } else {
+                    G711Kind::from_payload_type(c.payload_type).map(|k| {
+                        let label = match k {
+                            G711Kind::Pcmu => "PCMU",
+                            G711Kind::Pcma => "PCMA",
+                        };
+                        (SessionCodec::G711(k), label.to_string())
+                    })
+                }
+            })
+            .unwrap_or((SessionCodec::G711(G711Kind::Pcmu), "PCMU".to_string()));
         let dtmf_pt = negotiated_codecs
             .iter()
             .find(|c| c.encoding_name.eq_ignore_ascii_case("telephone-event"))
@@ -312,8 +329,8 @@ impl WorkerCtx {
             .unwrap_or(101);
 
         self.ssrc_counter = self.ssrc_counter.wrapping_add(1);
-        let session = MediaSession::new(
-            codec,
+        let session = MediaSession::new_with_session_codec(
+            session_codec,
             dtmf_pt,
             self.ssrc_counter,
             JitterBufferConfig::default(),
@@ -328,11 +345,6 @@ impl WorkerCtx {
                 rtp_packets_sent: 0,
             },
         );
-
-        let codec_name = match codec {
-            G711Kind::Pcmu => "PCMU".to_string(),
-            G711Kind::Pcma => "PCMA".to_string(),
-        };
         self.recorder.record(
             now,
             TelemetryCategory::DialogFsm,
@@ -627,8 +639,9 @@ impl WorkerCtx {
             loop {
                 match media.rtp_socket.recv_from(&mut rtp_buf) {
                     Ok((len, _)) => {
-                        let arrival_samples =
-                            (media.started_at.elapsed().as_millis() as u32).saturating_mul(8);
+                        let samples_per_ms = media.session.clock_rate_hz() / 1000;
+                        let arrival_samples = (media.started_at.elapsed().as_millis() as u32)
+                            .saturating_mul(samples_per_ms);
                         if RtpPacket::parse(&rtp_buf[..len]).is_ok() {
                             if let Ok(Some(digit)) =
                                 media.session.receive_rtp(&rtp_buf[..len], arrival_samples)
