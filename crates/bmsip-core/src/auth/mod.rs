@@ -217,10 +217,8 @@ impl DigestCredentials {
 }
 
 fn strip_digest_scheme(input: &str) -> Option<&str> {
-    if input.len() < 7 {
-        return None;
-    }
-    let (prefix, rest) = input.split_at(6);
+    let prefix = input.get(..6)?;
+    let rest = input.get(6..)?;
     if prefix.eq_ignore_ascii_case("digest") && rest.starts_with(char::is_whitespace) {
         Some(rest.trim())
     } else {

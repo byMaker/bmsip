@@ -5,6 +5,21 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.9.1] - 2026-11-21
+
+### Changed
+- **Anti-Aliasing FIR Resamplers & Cross-Frame `StreamResampler` (`bmsip-media`):**
+  - Replaced box-averaging downsamplers (`downsample_48k_to_8k`, `downsample_16k_to_8k`, `downsample_48k_to_16k`) with symmetric low-pass triangular FIR kernels for cleaner live microphone downsampling into G.711 and G.722.
+  - Added stateful cross-frame `StreamResampler` in `MediaSession` so sequential 20 ms frame upsampling preserves boundary slope continuity.
+- **Zero-Copy RTP Hot Path (`bmsip-media`, `bmsip-engine`):**
+  - Added `RtpPacketRef::parse` borrowed validation and `RtpPacketizer::next_packet_bytes` / `build_custom_packet_bytes` direct serialization to eliminate per-packet payload `Vec` clones on every 20 ms tick.
+- **Instant Command Wakeup & Adaptive Polling (`bmsip-engine`):**
+  - Added `Condvar` notification in `SipEngine::send_command` for microsecond command responsiveness and scaled idle polling (`20 ms` idle / `5 ms` active call) to reduce CPU wakeups.
+- **Live RTCP Socket & Periodic Receiver Reports (`bmsip-media`, `bmsip-engine`):**
+  - Added best-effort companion RTCP UDP socket binding (`rtp_port + 1`), `MediaSession::receive_rtcp` for Sender Report `LSR` tracking, and periodic 5-second RTCP `RR` transmission during active calls.
+- **Deterministic Wire-Parser Mutation Fuzzing (`bmsip-core`, `bmsip-media`):**
+  - Added 4,000-iteration deterministic mutation stress suites covering `SipMessage`, `SdpSession`, `DigestChallenge`, `SipUri`, `UserAgent`, `RtpPacketRef`, `RtpPacket`, `RtcpPacket`, `DtmfEventPayload`, `OpusToc`/`OpusFmtp`, and `G722Codec`.
+
 ## [0.9.0] - 2026-11-21
 
 ### Added

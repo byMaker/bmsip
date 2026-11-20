@@ -11,6 +11,8 @@ use crate::sdp::{negotiate_offer_answer, RtpCodec, SdpSession};
 use crate::sip::{CSeq, Method, NameAddr, SipMessage, SipRequest, SipResponse, SipUri, Via};
 use crate::transaction::{RfcTimers, TransactionEvent, TransactionId, TransactionManager};
 
+const DEFAULT_USER_AGENT: &str = concat!("bmsip/", env!("CARGO_PKG_VERSION"));
+
 /// SIP account registration lifecycle state (RFC 3261 Section 10).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum RegistrationState {
@@ -854,7 +856,7 @@ impl UserAgent {
         req.headers.set("Expires", expires.to_string());
         req.headers
             .set("Allow", "INVITE, ACK, CANCEL, BYE, OPTIONS");
-        req.headers.set("User-Agent", "bmsip/0.6.0");
+        req.headers.set("User-Agent", DEFAULT_USER_AGENT);
         if let Some((hdr_name, hdr_val)) = auth_header {
             req.headers.set(hdr_name, hdr_val);
         }
@@ -899,7 +901,7 @@ impl UserAgent {
             .set("Contact", NameAddr::new(config.contact_uri()).to_string());
         req.headers
             .set("Allow", "INVITE, ACK, CANCEL, BYE, OPTIONS");
-        req.headers.set("User-Agent", "bmsip/0.6.0");
+        req.headers.set("User-Agent", DEFAULT_USER_AGENT);
         if let Some((hdr_name, hdr_val)) = auth_header {
             req.headers.set(hdr_name, hdr_val);
         }

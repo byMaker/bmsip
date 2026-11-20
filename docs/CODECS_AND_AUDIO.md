@@ -27,7 +27,7 @@ This document describes `bmsip`'s audio pipeline (`bmsip-media` and `bmsip-engin
 
 - **24-Tap QMF Analysis/Synthesis Bank:** Splits `16 kHz` audio into `0–4 kHz` lower and `4–8 kHz` upper subbands cleanly with unity gain.
 - **SB-ADPCM Predictor (`G722Band::block4`):** 2-pole / 6-zero adaptive ARMA predictor + 6-bit lower / 2-bit upper quantizer tables matching ITU-T G.722 and `codec_g722.so` / `mod_spandsp`.
-- **Multi-Rate 20 ms Resamplers:** `upsample_8k_to_16k`, `downsample_16k_to_8k`, `upsample_16k_to_48k`, `downsample_48k_to_16k`, and unified `resample_pcm_20ms`.
+- **Anti-Aliasing FIR Resamplers & Cross-Frame `StreamResampler`:** Symmetric triangular low-pass FIR filters (`11`-tap for `48 -> 8 kHz`, `5`-tap for `48 -> 16 kHz`, `3`-tap `[1, 2, 1]/4` for `16 -> 8 kHz`) plus stateful boundary-continuous `StreamResampler` inside `MediaSession`.
 
 ---
 

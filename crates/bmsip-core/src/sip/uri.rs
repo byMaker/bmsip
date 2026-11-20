@@ -250,12 +250,9 @@ fn parse_hostport(hostport: &str) -> Result<(String, Option<u16>), SipError> {
 }
 
 fn strip_prefix_ignore_ascii_case<'a>(input: &'a str, prefix: &str) -> Option<&'a str> {
-    if input.len() < prefix.len() {
-        return None;
-    }
-    let (head, tail) = input.split_at(prefix.len());
+    let head = input.get(..prefix.len())?;
     if head.eq_ignore_ascii_case(prefix) {
-        Some(tail)
+        input.get(prefix.len()..)
     } else {
         None
     }

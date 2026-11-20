@@ -1,6 +1,7 @@
 use std::time::{Duration, Instant};
 
 use bmsip_core::auth::{DigestChallenge, DigestCredentials};
+use bmsip_core::dialog::{UaConfig, UserAgent};
 use bmsip_core::sdp::{negotiate_offer_answer, Direction, RtpCodec, SdpSession};
 use bmsip_core::sim::{NetworkPolicy, VirtualNetwork};
 use bmsip_core::sip::{Method, SipMessage, SipRequest, SipResponse, SipUri};
@@ -423,4 +424,64 @@ fn malformed_wire_message_does_not_panic_and_emits_warning() {
         events.as_slice(),
         [TransactionEvent::ProtocolWarning(_)]
     ));
+}
+
+#[test]
+fn deterministic_mutation_fuzz_sip_sdp_auth_and_ua_never_panic() {
+    let mut prng: u64 = 0x517c_c1b7_2722_0a95;
+    let next_u64 = |state: &mut u64| -> u64 {
+        *state ^= *state << 13;
+        *state ^= *state >> 7;
+        *state ^= *state << 17;
+        *state
+    };
+
+    let seed_sip = build_request(Method::Invite, "call-fuzz", "z9hG4bK-fuzz", 7)
+        .with_body(
+            "application/sdp",
+            b"v=0\r\no=alice 1 1 IN IP4 10.0.0.1\r\ns=x\r\nc=IN IP4 10.0.0.1\r\nt=0 0\r\nm=audio 4000 RTP/AVP 9 0 101\r\na=rtpmap:101 telephone-event/8000\r\n"
+                .to_vec(),
+        )
+        .to_bytes();
+    let seed_auth = b"Digest realm=\"asterisk\", nonce=\"abc\", qop=\"auth\", algorithm=SHA-256";
+    let seed_oversized = b"INVITE sip:bob@pbx.local SIP/2.0\r\nVia: SIP/2.0/UDP 10.0.0.1:5060;branch=z9hG4bK-x\r\nFrom: <sip:a@b>;tag=1\r\nTo: <sip:b@c>\r\nCall-ID: id\r\nCSeq: 1 INVITE\r\nContent-Length: 99999999\r\n\r\nhi";
+
+    let t0 = Instant::now();
+    let mut ua = UserAgent::new(UaConfig::new(
+        "alice",
+        "secret",
+        "pbx.local",
+        SipUri::parse("sip:pbx.local:5060").unwrap(),
+        "10.0.0.1",
+        5060,
+    ));
+    let mut buf = Vec::with_capacity(512);
+
+    for iter in 0..4_000usize {
+        let seed: &[u8] = match iter % 4 {
+            0 => &seed_sip,
+            1 => seed_auth,
+            2 => seed_oversized,
+            _ => &[],
+        };
+        let target_len = (next_u64(&mut prng) as usize) % 380;
+        buf.clear();
+        for i in 0..target_len {
+            let base = if i < seed.len() { seed[i] } else { b'a' };
+            let r = next_u64(&mut prng);
+            let mut byte = if (r & 3) == 0 { (r >> 8) as u8 } else { base };
+            if (r & 31) == 0 {
+                byte = if (r & 32) == 0 { b'\r' } else { b'\n' };
+            }
+            buf.push(byte);
+        }
+
+        let _ = SipMessage::parse(&buf);
+        let text = String::from_utf8_lossy(&buf);
+        let _ = SdpSession::parse(&text);
+        let _ = DigestChallenge::parse(&text);
+        let _ = SipUri::parse(&text);
+        let now = t0 + Duration::from_millis(iter as u64);
+        let _ = ua.receive_datagram(&buf, now);
+    }
 }

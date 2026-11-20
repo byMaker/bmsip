@@ -6,7 +6,7 @@ use crate::codec::G711Kind;
 use crate::dtmf::{DtmfDetector, DtmfDigit, DtmfEventPayload, DtmfSender};
 use crate::error::MediaError;
 use crate::g722::{
-    resample_pcm_20ms, G722Codec, G722_PAYLOAD_TYPE, G722_RTP_CLOCK_RATE, G722_RTP_SAMPLES_20MS,
+    G722Codec, StreamResampler, G722_PAYLOAD_TYPE, G722_RTP_CLOCK_RATE, G722_RTP_SAMPLES_20MS,
     PCM_FRAME_SAMPLES_16KHZ_20MS,
 };
 use crate::jitter::{AdaptiveJitterBuffer, JitterBufferConfig, PlayoutFrame};
@@ -16,7 +16,7 @@ use crate::opus::{
 };
 use crate::plugin::AudioCodecPlugin;
 use crate::rtcp::{RtcpPacket, RtpStreamStats};
-use crate::rtp::{RtpPacket, RtpPacketizer};
+use crate::rtp::{RtpPacketRef, RtpPacketizer};
 
 /// Active audio codec selected for [`MediaSession`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -72,6 +72,8 @@ pub struct MediaSession {
     opus: Box<dyn OpusCodecBackend>,
     g722: G722Codec,
     custom_plugin: Option<Box<dyn AudioCodecPlugin>>,
+    tx_resampler: StreamResampler,
+    rx_resampler: StreamResampler,
     dtmf_payload_type: u8,
     frame_samples: usize,
     packetizer: RtpPacketizer,
@@ -111,6 +113,8 @@ impl MediaSession {
             opus: Box::new(BuiltInOpusCodec::new()),
             g722: G722Codec::new(),
             custom_plugin: None,
+            tx_resampler: StreamResampler::new(),
+            rx_resampler: StreamResampler::new(),
             dtmf_payload_type,
             frame_samples,
             packetizer: RtpPacketizer::new(local_ssrc, codec.payload_type(), 1, 0),
@@ -175,7 +179,9 @@ impl MediaSession {
             match self.codec {
                 SessionCodec::G711(kind) => {
                     if self.frame_samples != PCM_FRAME_SAMPLES_8KHZ_20MS {
-                        let pcm_8k = resample_pcm_20ms(pcm, PCM_FRAME_SAMPLES_8KHZ_20MS)?;
+                        let pcm_8k = self
+                            .tx_resampler
+                            .resample_20ms(pcm, PCM_FRAME_SAMPLES_8KHZ_20MS)?;
                         (kind.encode(&pcm_8k), PCM_FRAME_SAMPLES_8KHZ_20MS as u32)
                     } else {
                         (kind.encode(pcm), PCM_FRAME_SAMPLES_8KHZ_20MS as u32)
@@ -185,7 +191,9 @@ impl MediaSession {
                     let pkt = if self.frame_samples == PCM_FRAME_SAMPLES_16KHZ_20MS {
                         self.g722.encode_16khz(pcm)?
                     } else {
-                        let pcm_16k = resample_pcm_20ms(pcm, PCM_FRAME_SAMPLES_16KHZ_20MS)?;
+                        let pcm_16k = self
+                            .tx_resampler
+                            .resample_20ms(pcm, PCM_FRAME_SAMPLES_16KHZ_20MS)?;
                         self.g722.encode_16khz(&pcm_16k)?
                     };
                     (pkt, G722_RTP_SAMPLES_20MS)
@@ -196,7 +204,9 @@ impl MediaSession {
                     } else if self.frame_samples == PCM_FRAME_SAMPLES_8KHZ_20MS {
                         self.opus.encode_20ms_8khz(pcm)?
                     } else {
-                        let pcm_48k = resample_pcm_20ms(pcm, PCM_FRAME_SAMPLES_48KHZ_20MS)?;
+                        let pcm_48k = self
+                            .tx_resampler
+                            .resample_20ms(pcm, PCM_FRAME_SAMPLES_48KHZ_20MS)?;
                         self.opus.encode_20ms_48khz(&pcm_48k)?
                     };
                     (pkt, OPUS_RTP_SAMPLES_20MS)
@@ -208,8 +218,9 @@ impl MediaSession {
                 }
             }
         };
-        let pkt = self.packetizer.next_packet(encoded, ts_advance, false);
-        Ok(pkt.to_bytes())
+        Ok(self
+            .packetizer
+            .next_packet_bytes(&encoded, ts_advance, false))
     }
 
     /// Queues an outbound RFC 4733 DTMF tone at the current media timestamp.
@@ -221,14 +232,13 @@ impl MediaSession {
     /// Pops the next queued RFC 4733 DTMF RTP datagram for paced 20 ms transmission.
     pub fn pop_dtmf_packet(&mut self) -> Option<Vec<u8>> {
         self.dtmf_sender.pop_packet().map(|spec| {
-            self.packetizer
-                .build_custom_packet(
-                    self.dtmf_payload_type,
-                    spec.timestamp,
-                    spec.marker,
-                    spec.payload.to_bytes(),
-                )
-                .to_bytes()
+            let payload = spec.payload.to_bytes();
+            self.packetizer.build_custom_packet_bytes(
+                self.dtmf_payload_type,
+                spec.timestamp,
+                spec.marker,
+                &payload,
+            )
         })
     }
 
@@ -241,52 +251,66 @@ impl MediaSession {
         out
     }
 
-    /// Processes an inbound RTP packet, updating RTCP stats and pushing decoded PCM or detecting DTMF.
+    /// Processes an inbound RTP packet without intermediate payload allocations, updating RTCP stats and pushing decoded PCM or detecting DTMF.
     pub fn receive_rtp(
         &mut self,
         raw: &[u8],
         arrival_timestamp_samples: u32,
     ) -> Result<Option<DtmfDigit>, MediaError> {
-        let pkt = RtpPacket::parse(raw)?;
-        self.remote_ssrc = Some(pkt.header.ssrc);
+        let pkt = RtpPacketRef::parse(raw)?;
+        self.remote_ssrc = Some(pkt.ssrc);
         self.stats.record_packet(
-            pkt.header.sequence_number,
-            pkt.header.timestamp,
+            pkt.sequence_number,
+            pkt.timestamp,
             arrival_timestamp_samples,
         );
 
-        if pkt.header.payload_type == self.dtmf_payload_type {
-            let ev = DtmfEventPayload::parse(&pkt.payload)?;
-            return Ok(self.dtmf_detector.feed(pkt.header.timestamp, ev));
+        if pkt.payload_type == self.dtmf_payload_type {
+            let ev = DtmfEventPayload::parse(pkt.payload)?;
+            return Ok(self.dtmf_detector.feed(pkt.timestamp, ev));
         }
 
         let pcm = if let Some(plugin) = self.custom_plugin.as_mut() {
-            if pkt.header.payload_type == self.codec.payload_type() {
-                plugin.decode_20ms(&pkt.payload, self.frame_samples)?
+            if pkt.payload_type == self.codec.payload_type() {
+                plugin.decode_20ms(pkt.payload, self.frame_samples)?
             } else {
-                decode_fallback_builtin(&mut self.g722, &pkt, self.frame_samples)?
+                decode_fallback_builtin(
+                    &mut self.g722,
+                    &mut self.rx_resampler,
+                    pkt.payload_type,
+                    pkt.payload,
+                    self.frame_samples,
+                )?
             }
-        } else if matches!(self.codec, SessionCodec::Opus { payload_type } if payload_type == pkt.header.payload_type)
+        } else if matches!(self.codec, SessionCodec::Opus { payload_type } if payload_type == pkt.payload_type)
         {
             if self.frame_samples == PCM_FRAME_SAMPLES_48KHZ_20MS {
-                self.opus.decode_20ms_48khz(&pkt.payload)?
+                self.opus.decode_20ms_48khz(pkt.payload)?
             } else if self.frame_samples == PCM_FRAME_SAMPLES_16KHZ_20MS {
-                let pcm_48k = self.opus.decode_20ms_48khz(&pkt.payload)?;
-                resample_pcm_20ms(&pcm_48k, PCM_FRAME_SAMPLES_16KHZ_20MS)?
+                let pcm_48k = self.opus.decode_20ms_48khz(pkt.payload)?;
+                self.rx_resampler
+                    .resample_20ms(&pcm_48k, PCM_FRAME_SAMPLES_16KHZ_20MS)?
             } else {
-                self.opus.decode_20ms_8khz(&pkt.payload)?
+                self.opus.decode_20ms_8khz(pkt.payload)?
             }
-        } else if matches!(self.codec, SessionCodec::G722 { payload_type } if payload_type == pkt.header.payload_type)
-            || pkt.header.payload_type == G722_PAYLOAD_TYPE
+        } else if matches!(self.codec, SessionCodec::G722 { payload_type } if payload_type == pkt.payload_type)
+            || pkt.payload_type == G722_PAYLOAD_TYPE
         {
-            let pcm_16k = self.g722.decode_16khz(&pkt.payload)?;
+            let pcm_16k = self.g722.decode_16khz(pkt.payload)?;
             if self.frame_samples == PCM_FRAME_SAMPLES_16KHZ_20MS {
                 pcm_16k
             } else {
-                resample_pcm_20ms(&pcm_16k, self.frame_samples)?
+                self.rx_resampler
+                    .resample_20ms(&pcm_16k, self.frame_samples)?
             }
         } else {
-            decode_fallback_builtin(&mut self.g722, &pkt, self.frame_samples)?
+            decode_fallback_builtin(
+                &mut self.g722,
+                &mut self.rx_resampler,
+                pkt.payload_type,
+                pkt.payload,
+                self.frame_samples,
+            )?
         };
 
         let rtp_samples_per_frame = self.codec.clock_rate_hz() / 50;
@@ -298,9 +322,20 @@ impl MediaSession {
                 self.stats.jitter()
             };
 
-        self.jitter
-            .push(pkt.header.sequence_number, pcm, scaled_jitter);
+        self.jitter.push(pkt.sequence_number, pcm, scaled_jitter);
         Ok(None)
+    }
+
+    /// Processes an inbound compound RTCP datagram, recording any Sender Report NTP timestamps (`LSR`).
+    pub fn receive_rtcp(&mut self, raw: &[u8]) -> Result<usize, MediaError> {
+        let packets = RtcpPacket::parse_compound(raw)?;
+        let count = packets.len();
+        for pkt in packets {
+            if let RtcpPacket::SenderReport { sender_info, .. } = pkt {
+                self.stats.record_sender_report(sender_info.ntp_timestamp);
+            }
+        }
+        Ok(count)
     }
 
     /// Pops the next 20 ms playout frame from the adaptive jitter buffer.
@@ -334,35 +369,35 @@ impl MediaSession {
 
 fn decode_fallback_builtin(
     g722: &mut G722Codec,
-    pkt: &RtpPacket,
+    resampler: &mut StreamResampler,
+    payload_type: u8,
+    payload: &[u8],
     target_frame_samples: usize,
 ) -> Result<Vec<i16>, MediaError> {
-    if pkt.header.payload_type == G722_PAYLOAD_TYPE {
-        let pcm_16k = g722.decode_16khz(&pkt.payload)?;
+    if payload_type == G722_PAYLOAD_TYPE {
+        let pcm_16k = g722.decode_16khz(payload)?;
         return if target_frame_samples == PCM_FRAME_SAMPLES_16KHZ_20MS {
             Ok(pcm_16k)
         } else {
-            resample_pcm_20ms(&pcm_16k, target_frame_samples)
+            resampler.resample_20ms(&pcm_16k, target_frame_samples)
         };
     }
 
-    let rx_codec = G711Kind::from_payload_type(pkt.header.payload_type).ok_or_else(|| {
-        MediaError::UnsupportedCodec(format!(
-            "unsupported RTP payload type {}",
-            pkt.header.payload_type
-        ))
+    let rx_codec = G711Kind::from_payload_type(payload_type).ok_or_else(|| {
+        MediaError::UnsupportedCodec(format!("unsupported RTP payload type {payload_type}"))
     })?;
-    let pcm_8k = rx_codec.decode(&pkt.payload);
+    let pcm_8k = rx_codec.decode(payload);
     if target_frame_samples == PCM_FRAME_SAMPLES_8KHZ_20MS {
         Ok(pcm_8k)
     } else {
-        resample_pcm_20ms(&pcm_8k, target_frame_samples)
+        resampler.resample_20ms(&pcm_8k, target_frame_samples)
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::rtp::RtpPacket;
     use crate::wav::WavPcm16;
 
     #[test]
@@ -483,5 +518,76 @@ mod tests {
             played.extend_from_slice(rx.pop_playout_frame().samples());
         }
         assert!(WavPcm16::new(16_000, played[640..].to_vec()).rms_energy() > 6000);
+    }
+
+    #[test]
+    fn deterministic_mutation_fuzz_rtp_rtcp_dtmf_and_codecs_never_panic() {
+        use crate::opus::{OpusFmtp, OpusToc};
+
+        let mut prng: u64 = 0x9e37_79b9_7f4a_7c15;
+        let next_u64 = |state: &mut u64| -> u64 {
+            *state ^= *state << 13;
+            *state ^= *state >> 7;
+            *state ^= *state << 17;
+            *state
+        };
+
+        let valid_rtp = [
+            0x80, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0xa0, 0x11, 0x22, 0x33, 0x44, 0xff, 0x7f,
+        ];
+        let valid_rtcp = RtcpPacket::ReceiverReport {
+            ssrc: 0x1122_3344,
+            reports: Vec::new(),
+        }
+        .to_bytes();
+
+        let cfg = JitterBufferConfig::default();
+        let mut session_pcmu = MediaSession::new(G711Kind::Pcmu, 101, 0x1010, cfg);
+        let mut session_g722 = MediaSession::new_with_session_codec(
+            SessionCodec::g722(),
+            101,
+            0x2020,
+            JitterBufferConfig {
+                frame_samples: PCM_FRAME_SAMPLES_16KHZ_20MS,
+                ..cfg
+            },
+        );
+        let mut g722 = G722Codec::new();
+        let mut buf = Vec::with_capacity(256);
+
+        for iter in 0..4_000usize {
+            let len = (next_u64(&mut prng) as usize) % 240;
+            buf.clear();
+            let seed_src = match iter % 4 {
+                0 => valid_rtp.as_slice(),
+                1 => valid_rtcp.as_slice(),
+                _ => &[],
+            };
+            for i in 0..len {
+                let base = if i < seed_src.len() { seed_src[i] } else { 0 };
+                let xor = if (next_u64(&mut prng) & 3) == 0 {
+                    (next_u64(&mut prng) & 0xff) as u8
+                } else {
+                    0
+                };
+                buf.push(base ^ xor);
+            }
+
+            let _ = RtpPacketRef::parse(&buf);
+            let _ = RtpPacket::parse(&buf);
+            let _ = RtcpPacket::parse_compound(&buf);
+            let _ = DtmfEventPayload::parse(&buf);
+            if !buf.is_empty() {
+                let _ = OpusToc::parse(buf[0]);
+            }
+            let txt = String::from_utf8_lossy(&buf);
+            let _ = OpusFmtp::parse(&txt);
+            let _ = g722.decode_16khz(&buf);
+            let _ = session_pcmu.receive_rtp(&buf, iter as u32 * 160);
+            let _ = session_pcmu.receive_rtcp(&buf);
+            let _ = session_g722.receive_rtp(&buf, iter as u32 * 160);
+        }
+        let _ = session_pcmu.pop_playout_frame();
+        let _ = session_g722.pop_playout_frame();
     }
 }

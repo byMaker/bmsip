@@ -517,12 +517,9 @@ fn static_audio_codec(pt: u8) -> Option<(&'static str, u32)> {
 }
 
 fn strip_prefix_ci<'a>(input: &'a str, prefix: &str) -> Option<&'a str> {
-    if input.len() < prefix.len() {
-        return None;
-    }
-    let (head, tail) = input.split_at(prefix.len());
+    let head = input.get(..prefix.len())?;
     if head.eq_ignore_ascii_case(prefix) {
-        Some(tail)
+        input.get(prefix.len()..)
     } else {
         None
     }

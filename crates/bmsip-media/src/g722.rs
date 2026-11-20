@@ -95,17 +95,26 @@ pub fn upsample_8k_to_16k(samples_8k: &[i16]) -> Vec<i16> {
     out
 }
 
-/// Downsamples 16 kHz mono PCM frames (320 samples) by 2x to 8 kHz (160 samples).
+/// Downsamples 16 kHz mono PCM frames (320 samples) by 2x to 8 kHz (160 samples) using a 3-tap `[1, 2, 1]/4` low-pass FIR filter.
 pub fn downsample_16k_to_8k(samples_16k: &[i16]) -> Vec<i16> {
-    let mut out = Vec::with_capacity(samples_16k.len() / 2);
-    for pair in samples_16k.as_chunks::<2>().0 {
-        let sum = i32::from(pair[0]) + i32::from(pair[1]);
-        let rounded = if sum >= 0 {
-            (sum + 1) / 2
+    let block_count = samples_16k.len() / 2;
+    if samples_16k.is_empty() || block_count == 0 {
+        return Vec::new();
+    }
+    let last_idx = samples_16k.len() - 1;
+    let mut out = Vec::with_capacity(block_count);
+    for b in 0..block_count {
+        let center = b * 2;
+        let prev = i32::from(samples_16k[center.saturating_sub(1)]);
+        let cur = i32::from(samples_16k[center]);
+        let next = i32::from(samples_16k[(center + 1).min(last_idx)]);
+        let acc = prev + (cur * 2) + next;
+        let rounded = if acc >= 0 {
+            (acc + 2) / 4
         } else {
-            (sum - 1) / 2
+            (acc - 2) / 4
         };
-        out.push(rounded as i16);
+        out.push(rounded.clamp(i32::from(i16::MIN), i32::from(i16::MAX)) as i16);
     }
     out
 }
@@ -123,17 +132,32 @@ pub fn upsample_16k_to_48k(samples_16k: &[i16]) -> Vec<i16> {
     out
 }
 
-/// Downsamples 48 kHz mono PCM frames (960 samples) by 3x to 16 kHz (320 samples).
+/// Downsamples 48 kHz mono PCM frames (960 samples) by 3x to 16 kHz (320 samples) using a 5-tap `[1, 2, 3, 2, 1]/9` low-pass FIR filter.
 pub fn downsample_48k_to_16k(samples_48k: &[i16]) -> Vec<i16> {
-    let mut out = Vec::with_capacity(samples_48k.len() / 3);
-    for triple in samples_48k.as_chunks::<3>().0 {
-        let sum = i32::from(triple[0]) + i32::from(triple[1]) + i32::from(triple[2]);
-        let rounded = if sum >= 0 {
-            (sum + 1) / 3
+    const TAPS: [i32; 5] = [1, 2, 3, 2, 1];
+    const WEIGHT_SUM: i32 = 9;
+
+    let block_count = samples_48k.len() / 3;
+    if samples_48k.is_empty() || block_count == 0 {
+        return Vec::new();
+    }
+    let last_idx = (samples_48k.len() - 1) as isize;
+    let mut out = Vec::with_capacity(block_count);
+
+    for b in 0..block_count {
+        let center = (b * 3 + 1) as isize;
+        let mut acc = 0i32;
+        for (tap_idx, &weight) in TAPS.iter().enumerate() {
+            let offset = tap_idx as isize - 2;
+            let idx = (center + offset).clamp(0, last_idx) as usize;
+            acc += i32::from(samples_48k[idx]) * weight;
+        }
+        let rounded = if acc >= 0 {
+            (acc + 4) / WEIGHT_SUM
         } else {
-            (sum - 1) / 3
+            (acc - 4) / WEIGHT_SUM
         };
-        out.push(rounded as i16);
+        out.push(rounded.clamp(i32::from(i16::MIN), i32::from(i16::MAX)) as i16);
     }
     out
 }
@@ -163,6 +187,60 @@ pub fn resample_pcm_20ms(src: &[i16], target_samples: usize) -> Result<Vec<i16>,
             src.len(),
             target_samples
         ))),
+    }
+}
+
+/// Stateful cross-frame 20 ms PCM resampler eliminating slope discontinuities across frame boundaries.
+#[derive(Debug, Clone, Default)]
+pub struct StreamResampler {
+    prev_last: Option<i16>,
+}
+
+impl StreamResampler {
+    /// Creates a new [`StreamResampler`] with cleared frame boundary state.
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Resamples one 20 ms frame to `target_samples`, interpolating smoothly across the previous frame tail.
+    pub fn resample_20ms(
+        &mut self,
+        src: &[i16],
+        target_samples: usize,
+    ) -> Result<Vec<i16>, MediaError> {
+        let ratio = match (src.len(), target_samples) {
+            (PCM_FRAME_SAMPLES_8KHZ_20MS, PCM_FRAME_SAMPLES_16KHZ_20MS) => Some(2usize),
+            (PCM_FRAME_SAMPLES_8KHZ_20MS, PCM_FRAME_SAMPLES_48KHZ_20MS) => Some(6usize),
+            (PCM_FRAME_SAMPLES_16KHZ_20MS, PCM_FRAME_SAMPLES_48KHZ_20MS) => Some(3usize),
+            _ => None,
+        };
+
+        if let Some(ratio) = ratio {
+            let Some(first) = src.first().copied() else {
+                return Ok(Vec::new());
+            };
+            let out = if let Some(mut prev) = self.prev_last {
+                let ratio_i32 = ratio as i32;
+                let mut buf = Vec::with_capacity(src.len() * ratio);
+                for &cur in src {
+                    for step in 1..=ratio_i32 {
+                        let interp = (i32::from(prev) * (ratio_i32 - step) + i32::from(cur) * step)
+                            / ratio_i32;
+                        buf.push(interp as i16);
+                    }
+                    prev = cur;
+                }
+                buf
+            } else {
+                let _ = first;
+                resample_pcm_20ms(src, target_samples)?
+            };
+            self.prev_last = src.last().copied();
+            return Ok(out);
+        }
+
+        self.prev_last = src.last().copied();
+        resample_pcm_20ms(src, target_samples)
     }
 }
 

@@ -85,7 +85,8 @@ All workspace crates share a synchronized **SemVer 2.0.0** version in root `Carg
 - **`0.6.0` — Stage 6:** Linux live audio (`--live-audio` & `listen` in `bmsip-cli`) + reference iOS/Android/C platform adapters (`bindings/`).
 - **`0.7.0` — Stage 7:** Native `libopus` 48 kHz VoIP backend (`LibOpusCodec`), Asterisk Opus negotiation, soft noise-gate/gain mic DSP (`condition_mic_frame`), and glitch-free 48 kHz live Linux audio pre-roll buffering.
 - **`0.8.0` — Stage 8:** RFC 3261 `Record-Route` response copying, multi-server Docker testbed (**Asterisk** `PJSIP` + **FreeSWITCH** `Sofia-SIP` + **Kamailio** `SIP Proxy`), unified `bmsip-cli interop` benchmark, and DSP audio analyzer / jitter PLC crossfade.
-- **`0.9.0` — Stage 9 (Current):** Universal pluggable audio codec registry (`AudioCodecPlugin`, `AudioCodecFactory`, `CodecRegistry`, `EngineConfig::register_custom_codec`) and built-in pure-Rust **ITU-T G.722** (16 kHz wideband HD Voice, PT `9`) verified across Asterisk, FreeSWITCH (`mod_spandsp`), and Kamailio.
+- **`0.9.0` — Stage 9:** Universal pluggable audio codec registry (`AudioCodecPlugin`, `AudioCodecFactory`, `CodecRegistry`, `EngineConfig::register_custom_codec`) and built-in pure-Rust **ITU-T G.722** (16 kHz wideband HD Voice, PT `9`) verified across Asterisk, FreeSWITCH (`mod_spandsp`), and Kamailio.
+- **`0.9.1` — Stage 9 Polish (Current):** Symmetric low-pass FIR downsamplers + stateful `StreamResampler`, zero-copy `RtpPacketRef` hot path, `Condvar` instant command wakeup & adaptive idle polling, live companion RTCP (`rtp_port + 1`) reporting, and deterministic parser mutation fuzz tests.
 
 ---
 

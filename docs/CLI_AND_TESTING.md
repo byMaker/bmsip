@@ -119,7 +119,7 @@ Runs 12 live SIP/RTP/DTMF scenarios verifying compatibility across distinct SIP 
 
 All verification commands run inside `dev`:
 
-- **Unit & Sans-I/O Simulation Tests (`bmsip-core`):** SIP/SDP parsers, MD5/SHA-256 Digest auth, RFC 3261 transaction timers under loss/duplication (`tests/rfc_simulation.rs`), and dialog/handover FSMs (`tests/dialog_simulation.rs`).
-- **Media Unit Tests (`bmsip-media`):** G.711 zero codes, ITU-T G.722 lowband/highband unity-gain roundtrip, Opus TOC/`fmtp`/mic-conditioning, custom `CodecRegistry` resampling, RFC 4733 DTMF deduplication, RTCP stats, and adaptive jitter PLC crossfade.
+- **Unit, Simulation & Mutation Fuzz Tests (`bmsip-core`):** SIP/SDP parsers, MD5/SHA-256 Digest auth, RFC 3261 transaction timers under loss/duplication (`tests/rfc_simulation.rs`), dialog/handover FSMs (`tests/dialog_simulation.rs`), and 4,000-iteration deterministic parser mutation stress testing.
+- **Media Unit & Fuzz Tests (`bmsip-media`):** G.711 zero codes, ITU-T G.722 lowband/highband unity-gain roundtrip, Opus TOC/`fmtp`/mic-conditioning, custom `CodecRegistry` resampling, RFC 4733 DTMF deduplication, RTCP stats, adaptive jitter PLC crossfade, and 4,000-iteration zero-copy RTP/RTCP/codec fuzzing.
 - **FFI & C ABI Tests (`bmsip-ffi`):** `bmsip.udl` API parity (`udl_schema_matches_rust_sdk_surface`), C99 compilation checks with `gcc -std=c99 -Wall -Wextra -Werror` on `include/bmsip.h` and `bindings/c/minimal_phone.c`, plus live Asterisk call over `BmsipClient` and `bmsip_*` C functions (`tests/ffi_integration.rs`).
 - **Live PBX & Custom Plugin Integration Tests (`bmsip-engine`):** 6 live tests in `crates/bmsip-engine/tests/asterisk_integration.rs` covering `REGISTER`/`INVITE`/`BYE`, `PCMU` Echo, `Opus 48 kHz` Echo, `Suspend`/`Resume` + Black-Box JSON, FreeSWITCH `407`/Echo + Kamailio P2P, G.722 Echo across Asterisk/FreeSWITCH, and external custom `L16/16000` codec plugin calls routed via Kamailio.

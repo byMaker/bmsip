@@ -12,8 +12,8 @@ use bmsip_core::dialog::{CallState, RegistrationState, UaEvent, UserAgent};
 use bmsip_core::sip::SipMessage;
 use bmsip_media::{
     BuiltInOpusCodec, CodecRegistry, G711Kind, JitterBufferConfig, MediaSession, OpusCodecBackend,
-    RtpPacket, SessionCodec, G722_PAYLOAD_TYPE, PCM_FRAME_SAMPLES_16KHZ_20MS,
-    PCM_FRAME_SAMPLES_48KHZ_20MS, PCM_FRAME_SAMPLES_8KHZ_20MS,
+    SessionCodec, G722_PAYLOAD_TYPE, PCM_FRAME_SAMPLES_16KHZ_20MS, PCM_FRAME_SAMPLES_48KHZ_20MS,
+    PCM_FRAME_SAMPLES_8KHZ_20MS,
 };
 
 use crate::audio::AudioPort;
@@ -23,18 +23,25 @@ use crate::opus_native::LibOpusCodec;
 use crate::telemetry::{FlightRecorder, TelemetryCategory};
 
 const MEDIA_TICK_MS: u64 = 20;
-const WORKER_IDLE_POLL_MS: u64 = 5;
+const WORKER_ACTIVE_POLL_MS: u64 = 5;
+const WORKER_IDLE_POLL_MS: u64 = 20;
+const RTCP_REPORT_INTERVAL_MS: u64 = 5_000;
 
 struct CallMediaRuntime {
     rtp_socket: UdpSocket,
+    rtcp_socket: Option<UdpSocket>,
     remote_rtp: SocketAddr,
+    remote_rtcp: SocketAddr,
     session: MediaSession,
     started_at: Instant,
     rtp_packets_sent: u32,
+    initial_rtcp_sent: bool,
+    next_rtcp_at: Instant,
 }
 
 struct SharedState {
     commands: Mutex<VecDeque<EngineCommand>>,
+    cmd_cv: Condvar,
     events: Mutex<(VecDeque<EngineEvent>, bool)>,
     event_cv: Condvar,
     local_sip_addr: Mutex<SocketAddr>,
@@ -62,6 +69,7 @@ impl SipEngine {
 
         let shared = Arc::new(SharedState {
             commands: Mutex::new(VecDeque::new()),
+            cmd_cv: Condvar::new(),
             events: Mutex::new((VecDeque::new(), false)),
             event_cv: Condvar::new(),
             local_sip_addr: Mutex::new(advertised_addr),
@@ -87,7 +95,7 @@ impl SipEngine {
         })
     }
 
-    /// Enqueues a non-blocking command to the engine worker.
+    /// Enqueues a non-blocking command to the engine worker and wakes it immediately.
     pub fn send_command(&self, cmd: EngineCommand) -> Result<(), EngineError> {
         let mut guard = self
             .shared
@@ -95,6 +103,7 @@ impl SipEngine {
             .lock()
             .map_err(|_| EngineError::ChannelClosed)?;
         guard.push_back(cmd);
+        self.shared.cmd_cv.notify_one();
         Ok(())
     }
 
@@ -152,7 +161,7 @@ struct WorkerCtx {
     codec_registry: CodecRegistry,
     audio_port: Box<dyn AudioPort>,
     recorder: FlightRecorder,
-    pending_rtp_sockets: HashMap<String, UdpSocket>,
+    pending_rtp_sockets: HashMap<String, (UdpSocket, Option<UdpSocket>)>,
     active_media: HashMap<String, CallMediaRuntime>,
     suspended: bool,
     was_registered_before_suspend: bool,
@@ -248,6 +257,8 @@ impl WorkerCtx {
                         let remote_rtp = SocketAddr::new(ip, remote_sdp.audio_port);
                         if let Some(media) = self.active_media.get_mut(&call_id) {
                             media.remote_rtp = remote_rtp;
+                            media.remote_rtcp =
+                                SocketAddr::new(ip, remote_sdp.audio_port.saturating_add(1));
                         }
                         self.recorder.record(
                             now,
@@ -284,7 +295,7 @@ impl WorkerCtx {
         negotiated_codecs: &[bmsip_core::sdp::RtpCodec],
         now: Instant,
     ) {
-        let Some(rtp_socket) = self.pending_rtp_sockets.remove(call_id) else {
+        let Some((rtp_socket, rtcp_socket)) = self.pending_rtp_sockets.remove(call_id) else {
             let msg = format!("missing bound RTP socket for established call {call_id}");
             self.recorder
                 .record(now, TelemetryCategory::Warning, Some(call_id), msg.clone());
@@ -382,14 +393,19 @@ impl WorkerCtx {
         if let Some(plugin) = custom_plugin {
             session = session.with_codec_plugin(plugin);
         }
+        let remote_rtcp = SocketAddr::new(remote_ip, remote_sdp.audio_port.saturating_add(1));
         self.active_media.insert(
             call_id.to_string(),
             CallMediaRuntime {
                 rtp_socket,
+                rtcp_socket,
                 remote_rtp,
+                remote_rtcp,
                 session,
                 started_at: now,
                 rtp_packets_sent: 0,
+                initial_rtcp_sent: false,
+                next_rtcp_at: now + Duration::from_millis(RTCP_REPORT_INTERVAL_MS),
             },
         );
         self.recorder.record(
@@ -462,10 +478,11 @@ impl WorkerCtx {
             }
             EngineCommand::Dial { target_uri } => {
                 match bind_rtp_socket(self.bind_ip, self.local_sip_addr.ip()) {
-                    Ok((rtp_sock, rtp_port)) => {
+                    Ok((rtp_sock, rtcp_sock, rtp_port)) => {
                         match self.ua.dial(target_uri.clone(), rtp_port, now) {
                             Ok(call_id) => {
-                                self.pending_rtp_sockets.insert(call_id.clone(), rtp_sock);
+                                self.pending_rtp_sockets
+                                    .insert(call_id.clone(), (rtp_sock, rtcp_sock));
                                 self.recorder.begin_call(&call_id, "outbound");
                                 self.recorder.record(
                                     now,
@@ -493,8 +510,9 @@ impl WorkerCtx {
             }
             EngineCommand::Answer { call_id } => {
                 match bind_rtp_socket(self.bind_ip, self.local_sip_addr.ip()) {
-                    Ok((rtp_sock, rtp_port)) => {
-                        self.pending_rtp_sockets.insert(call_id.clone(), rtp_sock);
+                    Ok((rtp_sock, rtcp_sock, rtp_port)) => {
+                        self.pending_rtp_sockets
+                            .insert(call_id.clone(), (rtp_sock, rtcp_sock));
                         if let Err(err) = self.ua.answer(&call_id, rtp_port, now) {
                             self.pending_rtp_sockets.remove(&call_id);
                             self.emit_cmd_error("answer", err);
@@ -685,12 +703,10 @@ impl WorkerCtx {
                         let samples_per_ms = media.session.clock_rate_hz() / 1000;
                         let arrival_samples = (media.started_at.elapsed().as_millis() as u32)
                             .saturating_mul(samples_per_ms);
-                        if RtpPacket::parse(&rtp_buf[..len]).is_ok() {
-                            if let Ok(Some(digit)) =
-                                media.session.receive_rtp(&rtp_buf[..len], arrival_samples)
-                            {
-                                dtmf_events.push((call_id.clone(), digit));
-                            }
+                        if let Ok(Some(digit)) =
+                            media.session.receive_rtp(&rtp_buf[..len], arrival_samples)
+                        {
+                            dtmf_events.push((call_id.clone(), digit));
                         }
                     }
                     Err(e)
@@ -702,6 +718,26 @@ impl WorkerCtx {
                         break;
                     }
                     Err(_) => break,
+                }
+            }
+
+            if let Some(rtcp_sock) = media.rtcp_socket.as_ref() {
+                let mut rtcp_buf = [0u8; 1024];
+                loop {
+                    match rtcp_sock.recv_from(&mut rtcp_buf) {
+                        Ok((len, _)) => {
+                            let _ = media.session.receive_rtcp(&rtcp_buf[..len]);
+                        }
+                        Err(e)
+                            if matches!(
+                                e.kind(),
+                                std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut
+                            ) =>
+                        {
+                            break;
+                        }
+                        Err(_) => break,
+                    }
                 }
             }
 
@@ -743,6 +779,7 @@ impl WorkerCtx {
 
         let call_ids: Vec<String> = self.active_media.keys().cloned().collect();
         let mut stats_updates: Vec<(String, u32, u32, i32, u32)> = Vec::new();
+        let mut rtcp_sent_calls: Vec<String> = Vec::new();
 
         for (idx, call_id) in call_ids.iter().enumerate() {
             let Some(media) = self.active_media.get_mut(call_id) else {
@@ -775,6 +812,18 @@ impl WorkerCtx {
                 self.audio_port.playout_20ms(playout.samples());
             }
 
+            if let Some(rtcp_sock) = media.rtcp_socket.as_ref() {
+                let rx_count = media.session.stats().received_count();
+                if rx_count >= 20 && (!media.initial_rtcp_sent || now >= media.next_rtcp_at) {
+                    let rr = media.session.build_rtcp_receiver_report();
+                    if rtcp_sock.send_to(&rr, media.remote_rtcp).is_ok() {
+                        media.initial_rtcp_sent = true;
+                        media.next_rtcp_at = now + Duration::from_millis(RTCP_REPORT_INTERVAL_MS);
+                        rtcp_sent_calls.push(call_id.clone());
+                    }
+                }
+            }
+
             let st = media.session.stats();
             stats_updates.push((
                 call_id.clone(),
@@ -783,6 +832,15 @@ impl WorkerCtx {
                 st.cumulative_lost(),
                 st.jitter(),
             ));
+        }
+
+        for cid in rtcp_sent_calls {
+            self.recorder.record(
+                now,
+                TelemetryCategory::RtpStats,
+                Some(&cid),
+                "sent RTCP ReceiverReport",
+            );
         }
 
         for (cid, sent, rx, lost, jitter) in stats_updates {
@@ -857,8 +915,18 @@ fn run_worker(
             }
         }
 
-        let sleep_cap = Duration::from_millis(WORKER_IDLE_POLL_MS);
-        let until_media = next_media_tick.saturating_duration_since(Instant::now());
+        let has_active_work = !ctx.active_media.is_empty() || !ctx.pending_rtp_sockets.is_empty();
+        let poll_ms = if has_active_work {
+            WORKER_ACTIVE_POLL_MS
+        } else {
+            WORKER_IDLE_POLL_MS
+        };
+        let sleep_cap = Duration::from_millis(poll_ms);
+        let until_media = if ctx.active_media.is_empty() {
+            sleep_cap
+        } else {
+            next_media_tick.saturating_duration_since(Instant::now())
+        };
         let until_sip = ctx
             .ua
             .poll_timeout()
@@ -866,7 +934,12 @@ fn run_worker(
             .unwrap_or(sleep_cap);
         let wait_dur = sleep_cap.min(until_media).min(until_sip);
         if !wait_dur.is_zero() {
-            thread::sleep(wait_dur);
+            if let Ok(guard) = ctx.shared.commands.lock() {
+                let _ = ctx
+                    .shared
+                    .cmd_cv
+                    .wait_timeout_while(guard, wait_dur, |cmds| cmds.is_empty());
+            }
         }
     }
 
@@ -900,16 +973,20 @@ fn bind_sip_socket(
 fn bind_rtp_socket(
     bind_ip: IpAddr,
     advertised_ip: IpAddr,
-) -> Result<(UdpSocket, u16), EngineError> {
+) -> Result<(UdpSocket, Option<UdpSocket>, u16), EngineError> {
     let target_ip = if bind_ip.is_unspecified() {
         bind_ip
     } else {
         advertised_ip
     };
-    let sock = UdpSocket::bind((target_ip, 0))?;
-    sock.set_nonblocking(true)?;
-    let port = sock.local_addr()?.port();
-    Ok((sock, port))
+    let rtp_sock = UdpSocket::bind((target_ip, 0))?;
+    rtp_sock.set_nonblocking(true)?;
+    let port = rtp_sock.local_addr()?.port();
+    let rtcp_sock = port
+        .checked_add(1)
+        .and_then(|rtcp_port| UdpSocket::bind((target_ip, rtcp_port)).ok())
+        .and_then(|sock| sock.set_nonblocking(true).ok().map(|()| sock));
+    Ok((rtp_sock, rtcp_sock, port))
 }
 
 fn summarize_sip_datagram(raw: &[u8]) -> Option<(Option<String>, String)> {

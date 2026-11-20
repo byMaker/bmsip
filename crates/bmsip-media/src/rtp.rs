@@ -34,96 +34,144 @@ pub struct RtpPacket {
     pub payload: Vec<u8>,
 }
 
+/// Borrowed zero-allocation view of a validated wire RTP packet.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct RtpPacketRef<'a> {
+    pub version: u8,
+    pub padding: bool,
+    pub extension: bool,
+    pub csrc_count: u8,
+    pub marker: bool,
+    pub payload_type: u8,
+    pub sequence_number: u16,
+    pub timestamp: u32,
+    pub ssrc: u32,
+    pub payload: &'a [u8],
+}
+
+impl<'a> RtpPacketRef<'a> {
+    /// Parses and validates raw RTP wire bytes without heap allocations.
+    pub fn parse(raw: &'a [u8]) -> Result<Self, MediaError> {
+        let (parsed, _) = parse_rtp_bounds(raw)?;
+        Ok(parsed)
+    }
+}
+
+fn parse_rtp_bounds<'a>(raw: &'a [u8]) -> Result<(RtpPacketRef<'a>, usize), MediaError> {
+    if raw.len() < 12 {
+        return Err(MediaError::PacketTooShort);
+    }
+
+    let version = (raw[0] >> 6) & 0x03;
+    if version != 2 {
+        return Err(MediaError::UnsupportedRtpVersion(version));
+    }
+
+    let padding = (raw[0] & 0x20) != 0;
+    let extension = (raw[0] & 0x10) != 0;
+    let csrc_count = raw[0] & 0x0f;
+    let marker = (raw[1] & 0x80) != 0;
+    let payload_type = raw[1] & 0x7f;
+    let sequence_number = u16::from_be_bytes([raw[2], raw[3]]);
+    let timestamp = u32::from_be_bytes([raw[4], raw[5], raw[6], raw[7]]);
+    let ssrc = u32::from_be_bytes([raw[8], raw[9], raw[10], raw[11]]);
+
+    let mut offset = 12usize;
+    let csrc_bytes = usize::from(csrc_count) * 4;
+    if raw.len() < offset + csrc_bytes {
+        return Err(MediaError::PacketTooShort);
+    }
+    offset += csrc_bytes;
+
+    if extension {
+        if raw.len() < offset + 4 {
+            return Err(MediaError::PacketTooShort);
+        }
+        let length_words = u16::from_be_bytes([raw[offset + 2], raw[offset + 3]]);
+        offset += 4;
+        let ext_bytes = usize::from(length_words) * 4;
+        if raw.len() < offset + ext_bytes {
+            return Err(MediaError::PacketTooShort);
+        }
+        offset += ext_bytes;
+    }
+
+    let raw_payload = &raw[offset..];
+    let payload = if padding {
+        let Some(&pad_len_byte) = raw_payload.last() else {
+            return Err(MediaError::InvalidHeader(
+                "RTP padding bit set with empty payload".to_string(),
+            ));
+        };
+        let pad_len = usize::from(pad_len_byte);
+        if pad_len == 0 || pad_len > raw_payload.len() {
+            return Err(MediaError::InvalidHeader(format!(
+                "invalid RTP padding length {pad_len} for payload len {}",
+                raw_payload.len()
+            )));
+        }
+        &raw_payload[..raw_payload.len() - pad_len]
+    } else {
+        raw_payload
+    };
+
+    Ok((
+        RtpPacketRef {
+            version,
+            padding,
+            extension,
+            csrc_count,
+            marker,
+            payload_type,
+            sequence_number,
+            timestamp,
+            ssrc,
+            payload,
+        },
+        12 + csrc_bytes,
+    ))
+}
+
 impl RtpPacket {
     /// Parses raw wire bytes into an [`RtpPacket`], stripping trailing RTP padding if `P=1`.
     pub fn parse(raw: &[u8]) -> Result<Self, MediaError> {
-        if raw.len() < 12 {
-            return Err(MediaError::PacketTooShort);
+        let (hdr, ext_offset) = parse_rtp_bounds(raw)?;
+        let mut csrcs = Vec::with_capacity(usize::from(hdr.csrc_count));
+        for i in 0..usize::from(hdr.csrc_count) {
+            let off = 12 + i * 4;
+            csrcs.push(u32::from_be_bytes([
+                raw[off],
+                raw[off + 1],
+                raw[off + 2],
+                raw[off + 3],
+            ]));
         }
 
-        let version = (raw[0] >> 6) & 0x03;
-        if version != 2 {
-            return Err(MediaError::UnsupportedRtpVersion(version));
-        }
-
-        let padding = (raw[0] & 0x20) != 0;
-        let extension = (raw[0] & 0x10) != 0;
-        let csrc_count = raw[0] & 0x0f;
-        let marker = (raw[1] & 0x80) != 0;
-        let payload_type = raw[1] & 0x7f;
-        let sequence_number = u16::from_be_bytes([raw[2], raw[3]]);
-        let timestamp = u32::from_be_bytes([raw[4], raw[5], raw[6], raw[7]]);
-        let ssrc = u32::from_be_bytes([raw[8], raw[9], raw[10], raw[11]]);
-
-        let mut offset = 12usize;
-        let csrc_bytes = usize::from(csrc_count) * 4;
-        if raw.len() < offset + csrc_bytes {
-            return Err(MediaError::PacketTooShort);
-        }
-        let mut csrcs = Vec::with_capacity(usize::from(csrc_count));
-        for _ in 0..csrc_count {
-            let val = u32::from_be_bytes([
-                raw[offset],
-                raw[offset + 1],
-                raw[offset + 2],
-                raw[offset + 3],
-            ]);
-            csrcs.push(val);
-            offset += 4;
-        }
-
-        let extension_header = if extension {
-            if raw.len() < offset + 4 {
-                return Err(MediaError::PacketTooShort);
-            }
-            let profile = u16::from_be_bytes([raw[offset], raw[offset + 1]]);
-            let length_words = u16::from_be_bytes([raw[offset + 2], raw[offset + 3]]);
-            offset += 4;
+        let extension_header = if hdr.extension {
+            let profile = u16::from_be_bytes([raw[ext_offset], raw[ext_offset + 1]]);
+            let length_words = u16::from_be_bytes([raw[ext_offset + 2], raw[ext_offset + 3]]);
             let ext_bytes = usize::from(length_words) * 4;
-            if raw.len() < offset + ext_bytes {
-                return Err(MediaError::PacketTooShort);
-            }
-            let data = raw[offset..offset + ext_bytes].to_vec();
-            offset += ext_bytes;
+            let data = raw[ext_offset + 4..ext_offset + 4 + ext_bytes].to_vec();
             Some(RtpExtensionHeader { profile, data })
         } else {
             None
         };
 
-        let raw_payload = &raw[offset..];
-        let payload = if padding {
-            let Some(&pad_len_byte) = raw_payload.last() else {
-                return Err(MediaError::InvalidHeader(
-                    "RTP padding bit set with empty payload".to_string(),
-                ));
-            };
-            let pad_len = usize::from(pad_len_byte);
-            if pad_len == 0 || pad_len > raw_payload.len() {
-                return Err(MediaError::InvalidHeader(format!(
-                    "invalid RTP padding length {pad_len} for payload len {}",
-                    raw_payload.len()
-                )));
-            }
-            raw_payload[..raw_payload.len() - pad_len].to_vec()
-        } else {
-            raw_payload.to_vec()
-        };
-
         Ok(Self {
             header: RtpHeader {
-                version,
-                padding,
-                extension,
-                csrc_count,
-                marker,
-                payload_type,
-                sequence_number,
-                timestamp,
-                ssrc,
+                version: hdr.version,
+                padding: hdr.padding,
+                extension: hdr.extension,
+                csrc_count: hdr.csrc_count,
+                marker: hdr.marker,
+                payload_type: hdr.payload_type,
+                sequence_number: hdr.sequence_number,
+                timestamp: hdr.timestamp,
+                ssrc: hdr.ssrc,
                 csrcs,
                 extension_header,
             },
-            payload,
+            payload: hdr.payload.to_vec(),
         })
     }
 
@@ -240,6 +288,28 @@ impl RtpPacketizer {
         pkt
     }
 
+    /// Serializes the next RTP packet directly into wire bytes without intermediate allocations.
+    pub fn next_packet_bytes(
+        &mut self,
+        payload: &[u8],
+        samples_advanced: u32,
+        marker: bool,
+    ) -> Vec<u8> {
+        let m = self.first_packet || marker;
+        self.first_packet = false;
+        let out = serialize_simple_rtp(
+            self.payload_type,
+            m,
+            self.sequence_number,
+            self.timestamp,
+            self.ssrc,
+            payload,
+        );
+        self.sequence_number = self.sequence_number.wrapping_add(1);
+        self.timestamp = self.timestamp.wrapping_add(samples_advanced);
+        out
+    }
+
     /// Builds an RTP packet with an alternate payload type (e.g. RFC 4733 DTMF) without advancing main media clock unless requested.
     pub fn build_custom_packet(
         &mut self,
@@ -267,6 +337,44 @@ impl RtpPacketizer {
         self.sequence_number = self.sequence_number.wrapping_add(1);
         pkt
     }
+
+    /// Serializes an alternate payload-type RTP packet directly to wire bytes.
+    pub fn build_custom_packet_bytes(
+        &mut self,
+        payload_type: u8,
+        timestamp: u32,
+        marker: bool,
+        payload: &[u8],
+    ) -> Vec<u8> {
+        let out = serialize_simple_rtp(
+            payload_type,
+            marker,
+            self.sequence_number,
+            timestamp,
+            self.ssrc,
+            payload,
+        );
+        self.sequence_number = self.sequence_number.wrapping_add(1);
+        out
+    }
+}
+
+fn serialize_simple_rtp(
+    payload_type: u8,
+    marker: bool,
+    sequence_number: u16,
+    timestamp: u32,
+    ssrc: u32,
+    payload: &[u8],
+) -> Vec<u8> {
+    let mut out = Vec::with_capacity(12 + payload.len());
+    out.push(0x80); // V=2, P=0, X=0, CC=0
+    out.push((u8::from(marker) << 7) | (payload_type & 0x7f));
+    out.extend_from_slice(&sequence_number.to_be_bytes());
+    out.extend_from_slice(&timestamp.to_be_bytes());
+    out.extend_from_slice(&ssrc.to_be_bytes());
+    out.extend_from_slice(payload);
+    out
 }
 
 #[cfg(test)]

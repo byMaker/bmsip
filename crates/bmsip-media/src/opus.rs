@@ -285,17 +285,32 @@ pub fn upsample_8k_to_48k(samples_8k: &[i16]) -> Vec<i16> {
     out
 }
 
-/// Downsamples 48 kHz PCM frames (960 samples) by 6x to 8 kHz (160 samples) via rounded box averaging.
+/// Downsamples 48 kHz PCM frames (960 samples) by 6x to 8 kHz (160 samples) using an 11-tap triangular anti-aliasing FIR filter.
 pub fn downsample_48k_to_8k(samples_48k: &[i16]) -> Vec<i16> {
-    let mut out = Vec::with_capacity(samples_48k.len() / 6);
-    for block in samples_48k.as_chunks::<6>().0 {
-        let sum: i32 = block.iter().map(|&s| i32::from(s)).sum();
-        let rounded = if sum >= 0 {
-            (sum + 3) / 6
+    const TAPS: [i32; 11] = [1, 2, 3, 4, 5, 6, 5, 4, 3, 2, 1];
+    const WEIGHT_SUM: i32 = 36;
+
+    let block_count = samples_48k.len() / 6;
+    if samples_48k.is_empty() || block_count == 0 {
+        return Vec::new();
+    }
+    let last_idx = (samples_48k.len() - 1) as isize;
+    let mut out = Vec::with_capacity(block_count);
+
+    for b in 0..block_count {
+        let center = (b * 6 + 2) as isize;
+        let mut acc = 0i32;
+        for (tap_idx, &weight) in TAPS.iter().enumerate() {
+            let offset = tap_idx as isize - 5;
+            let idx = (center + offset).clamp(0, last_idx) as usize;
+            acc += i32::from(samples_48k[idx]) * weight;
+        }
+        let rounded = if acc >= 0 {
+            (acc + (WEIGHT_SUM / 2)) / WEIGHT_SUM
         } else {
-            (sum - 3) / 6
+            (acc - (WEIGHT_SUM / 2)) / WEIGHT_SUM
         };
-        out.push(rounded as i16);
+        out.push(rounded.clamp(i32::from(i16::MIN), i32::from(i16::MAX)) as i16);
     }
     out
 }

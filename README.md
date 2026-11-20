@@ -2,7 +2,7 @@
 
 **bmsip** is a modern, embeddable, cross-platform SIP & RTP telephony library written in Rust from the ground up for **Linux**, **iOS**, and **Android**, complete with a live-audio Linux CLI softphone and an automated multi-server SIP interoperability lab.
 
-- **Current Version:** `0.9.0` ([CHANGELOG.md](./CHANGELOG.md))
+- **Current Version:** `0.9.1` ([CHANGELOG.md](./CHANGELOG.md))
 - **Architecture Specification:** [ARCHITECTURE.md](./ARCHITECTURE.md)
 - **Developer Guides:** [SDK Guide](./docs/SDK_GUIDE.md) · [Codecs & Audio Pipeline](./docs/CODECS_AND_AUDIO.md) · [CLI & Interop Lab](./docs/CLI_AND_TESTING.md)
 - **License:** `AGPL-3.0-only` ([LICENSE](./LICENSE) · [NOTICE](./NOTICE) · commercial licensing: [bymaker.com](https://bymaker.com))
