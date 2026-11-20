@@ -2,7 +2,7 @@
 
 Embeddable, cross-platform SIP library written in Rust for **Linux**, **iOS**, and **Android**.
 
-- **Current Version:** `0.2.0` ([CHANGELOG.md](./CHANGELOG.md))
+- **Current Version:** `0.3.0` ([CHANGELOG.md](./CHANGELOG.md))
 - **Architecture Specification:** [ARCHITECTURE.md](./ARCHITECTURE.md)
 - **License:** `AGPL-3.0-only` ([LICENSE](./LICENSE) · [NOTICE](./NOTICE) · commercial licensing: [bymaker.com](https://bymaker.com))
 

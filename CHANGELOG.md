@@ -5,6 +5,18 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.3.0] - 2026-11-20
+
+### Added
+- `bmsip-media` hardware-agnostic RTP/RTCP, codec, and jitter buffer crate (`#![forbid(unsafe_code)]`):
+  - RFC 3550 RTP parser/serializer with CSRC, extension headers, padding validation, and `RtpPacketizer`.
+  - RFC 3550 RTCP compound packet parser/serializer (`SR`, `RR`, `BYE`) and `RtpStreamStats` loss/wraparound/jitter tracker.
+  - Pure-Rust ITU-T G.711 `PCMU` (μ-law, PT 0) and `PCMA` (A-law, PT 8) codecs.
+  - RFC 4733 `telephone-event` DTMF packet generator (`DtmfSender`) and deduplicating detector (`DtmfDetector`).
+  - `AdaptiveJitterBuffer` with 16-bit sequence wraparound reordering, jitter-driven depth adaptation, and decayed PLC.
+  - In-memory RIFF/WAVE 16-bit mono PCM codec (`WavPcm16`) and unified `MediaSession` pipeline.
+- Live Asterisk `Echo()` RTP/G.711 audio echo and WAV round-trip integration test (`live_asterisk_rtp_g711_audio_echo_and_wav_roundtrip`).
+
 ## [0.2.0] - 2026-11-20
 
 ### Added

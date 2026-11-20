@@ -48,7 +48,7 @@ bmsip-ffi  ──┘                 └─────────────�
 | RFC 4566 / 3264 | SDP audio parsing/generation and Offer/Answer negotiation | Implemented (`v0.1.0`) |
 | RFC 2617 / 7616 | Digest authentication (`MD5`, `MD5-sess`, `SHA-256`, `SHA-256-sess`, `qop=auth`) | Implemented (`v0.1.0`) |
 | RFC 3261 Sec 12–16 | Dialogs, `REGISTER` refresh, `INVITE`/`CANCEL`/`BYE`/`re-INVITE` | Implemented (`v0.2.0`) |
-| RFC 3550 / 4733 | RTP/RTCP media transport and DTMF telephone-event | Planned (`v0.3.0`) |
+| RFC 3550 / 4733 | RTP/RTCP media transport and DTMF telephone-event | Implemented (`v0.3.0`) |
 
 ---
 
@@ -76,7 +76,7 @@ Because `bmsip` is an embeddable native library rather than an HTTP service, Ope
 All workspace crates share a synchronized **SemVer 2.0.0** version in root `Cargo.toml` (`[workspace.package]`), recorded in [CHANGELOG.md](./CHANGELOG.md).
 
 - **`0.1.0` — Stage 1:** Workspace skeleton + `bmsip-core` Sans-I/O SIP/SDP parsers, MD5/SHA-256 Digest Auth, RFC 3261 transactions, and deterministic lossy network simulator.
-- **`0.2.0` — Stage 2 (Current):** Dialog & registration FSMs (`REGISTER`, `INVITE`, `CANCEL`, `BYE`, `re-INVITE`) + live Asterisk Docker Compose integration suite.
-- **`0.3.0` — Stage 3:** `bmsip-media` RTP/RTCP, adaptive jitter buffer, G.711 (`PCMU`/`PCMA`), DTMF (RFC 4733), WAV test call verification.
+- **`0.2.0` — Stage 2:** Dialog & registration FSMs (`REGISTER`, `INVITE`, `CANCEL`, `BYE`, `re-INVITE`) + live Asterisk Docker Compose integration suite.
+- **`0.3.0` — Stage 3 (Current):** `bmsip-media` RTP/RTCP, adaptive jitter buffer, G.711 (`PCMU`/`PCMA`), DTMF (RFC 4733), WAV test call verification.
 - **`0.4.0` — Stage 4:** `bmsip-engine` UDP/TCP transport + `bmsip-cli` Linux softphone + per-call diagnostic flight recorder.
 - **`0.5.0` — Stage 5:** `bmsip-ffi` UniFFI `.udl` contract (Swift/Kotlin/C) + Opus codec integration.
