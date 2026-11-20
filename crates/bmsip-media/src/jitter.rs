@@ -55,6 +55,7 @@ pub struct AdaptiveJitterBuffer {
     next_playout_seq: u32,
     target_depth_frames: usize,
     last_good_frame: Vec<i16>,
+    last_emitted_sample: i16,
     consecutive_concealed: usize,
     late_drops: u64,
     duplicate_drops: u64,
@@ -76,6 +77,7 @@ impl AdaptiveJitterBuffer {
             next_playout_seq: 0,
             target_depth_frames: clamped_init,
             last_good_frame: vec![0; config.frame_samples],
+            last_emitted_sample: 0,
             consecutive_concealed: 0,
             late_drops: 0,
             duplicate_drops: 0,
@@ -135,25 +137,33 @@ impl AdaptiveJitterBuffer {
     /// Pops the next 20 ms playout frame, emitting concealed audio or buffering silence when needed.
     pub fn pop(&mut self) -> PlayoutFrame {
         if !self.initialized {
+            self.last_emitted_sample = 0;
             return PlayoutFrame::Buffering(vec![0; self.config.frame_samples]);
         }
 
         if !self.primed {
             if self.frames.len() < self.target_depth_frames {
+                self.last_emitted_sample = 0;
                 return PlayoutFrame::Buffering(vec![0; self.config.frame_samples]);
             }
             self.primed = true;
         }
 
-        if let Some(pcm) = self.frames.remove(&self.next_playout_seq) {
+        if let Some(mut pcm) = self.frames.remove(&self.next_playout_seq) {
             self.next_playout_seq += 1;
-            self.consecutive_concealed = 0;
             self.last_good_frame = pcm.clone();
+            if self.consecutive_concealed > 0 && self.config.frame_samples >= 16 {
+                let fade_len = (self.config.frame_samples / 8).min(32);
+                crossfade_head(&mut pcm, self.last_emitted_sample, fade_len);
+            }
+            self.consecutive_concealed = 0;
+            self.last_emitted_sample = *pcm.last().unwrap_or(&0);
             return PlayoutFrame::Normal(pcm);
         }
 
         if self.frames.is_empty() && self.consecutive_concealed >= 4 {
             self.primed = false;
+            self.last_emitted_sample = 0;
             return PlayoutFrame::Buffering(vec![0; self.config.frame_samples]);
         }
 
@@ -164,7 +174,13 @@ impl AdaptiveJitterBuffer {
         for sample in &mut self.last_good_frame {
             *sample = ((*sample as i32 * 3) / 4) as i16;
         }
-        PlayoutFrame::Concealed(self.last_good_frame.clone())
+        let mut concealed = self.last_good_frame.clone();
+        if self.config.frame_samples >= 16 {
+            let fade_len = (self.config.frame_samples / 8).min(32);
+            crossfade_head(&mut concealed, self.last_emitted_sample, fade_len);
+        }
+        self.last_emitted_sample = *concealed.last().unwrap_or(&0);
+        PlayoutFrame::Concealed(concealed)
     }
 
     /// Returns the current adaptive target playout depth in frames.
@@ -192,6 +208,20 @@ impl AdaptiveJitterBuffer {
         } else if desired < self.target_depth_frames {
             self.target_depth_frames -= 1;
         }
+    }
+}
+
+fn crossfade_head(samples: &mut [i16], prev_sample: i16, fade_len: usize) {
+    let n = fade_len.min(samples.len());
+    if n == 0 {
+        return;
+    }
+    let denom = i32::from(n as i16);
+    let prev = i32::from(prev_sample);
+    for (idx, sample) in samples.iter_mut().take(n).enumerate() {
+        let i = i32::from(idx as i16);
+        let blended = (prev * (denom - i) + i32::from(*sample) * i) / denom;
+        *sample = blended as i16;
     }
 }
 
@@ -254,5 +284,39 @@ mod tests {
         assert_eq!(jb.pop(), PlayoutFrame::Normal(vec![10; 2]));
         assert_eq!(jb.pop(), PlayoutFrame::Normal(vec![20; 2]));
         assert_eq!(jb.pop(), PlayoutFrame::Normal(vec![30; 2]));
+    }
+
+    #[test]
+    fn concealed_frame_crossfades_boundary_without_phase_click() {
+        let cfg = JitterBufferConfig {
+            min_depth_frames: 2,
+            max_depth_frames: 8,
+            initial_depth_frames: 2,
+            frame_samples: 160,
+        };
+        let mut jb = AdaptiveJitterBuffer::new(cfg);
+
+        // Ramp from +8000 down to -8000 so uncrossfaded wraparound would jump by ~14000.
+        let ramp: Vec<i16> = (0..160).map(|i| 8000 - (i as i16 * 100)).collect();
+        jb.push(1, ramp.clone(), 0);
+        jb.push(3, ramp, 0);
+
+        let f1 = jb.pop();
+        let f2 = jb.pop();
+        let f3 = jb.pop();
+        assert!(matches!(f1, PlayoutFrame::Normal(_)));
+        assert!(matches!(f2, PlayoutFrame::Concealed(_)));
+        assert!(matches!(f3, PlayoutFrame::Normal(_)));
+
+        let jump_into_plc = (i32::from(f2.samples()[0]) - i32::from(f1.samples()[159])).abs();
+        let jump_out_of_plc = (i32::from(f3.samples()[0]) - i32::from(f2.samples()[159])).abs();
+        assert!(
+            jump_into_plc < 500,
+            "expected smooth PLC entry jump < 500, got {jump_into_plc}"
+        );
+        assert!(
+            jump_out_of_plc < 500,
+            "expected smooth PLC recovery jump < 500, got {jump_out_of_plc}"
+        );
     }
 }
