@@ -15,7 +15,7 @@ bmsip-ffi  ──┘                 └─────────────�
 | Crate | Scope | Hard Invariants |
 |---|---|---|
 | `bmsip-core` | SIP message parser/serializer, URI/header types, SDP offer/answer, Digest Auth, RFC 3261 transactions, dialogs, account registration state | `#![forbid(unsafe_code)]`; empty `[dependencies]`; zero `std::net`, `std::thread`, `std::fs`, `Instant::now()`, `SystemTime::now()`, or async runtimes |
-| `bmsip-media` | RTP/RTCP framing, DTMF (RFC 4733), adaptive jitter buffer, G.711/Opus codecs, 20 ms PCM frame pipeline | `#![forbid(unsafe_code)]`; zero direct OS audio device calls (ALSA, PipeWire, CoreAudio, Oboe) |
+| `bmsip-media` | RTP/RTCP framing, DTMF (RFC 4733), adaptive jitter buffer, G.711/G.722/Opus codecs, universal `CodecRegistry` plugin API, 20 ms PCM frame pipeline | `#![forbid(unsafe_code)]`; zero direct OS audio device calls (ALSA, PipeWire, CoreAudio, Oboe) |
 | `bmsip-engine` | UDP/TCP socket loop, monotonic timer driver, `Command`/`Event` queues, `AudioPort` trait, call flight recorder | Zero global singletons (`static mut`); zero user callbacks invoked under held locks; multi-instance safe |
 | `bmsip-ffi` | Public cross-platform SDK boundary (UniFFI for Swift/Kotlin + C-API header for Linux) | Thin translation layer over `bmsip-engine` `Command`/`Event` model |
 | `bmsip-cli` | Linux CLI SIP endpoint and automated integration test runner | Consumes only `bmsip-engine` public API |
@@ -50,6 +50,7 @@ bmsip-ffi  ──┘                 └─────────────�
 | RFC 3261 Sec 12–16 | Dialogs, `REGISTER` refresh, `INVITE`/`CANCEL`/`BYE`/`re-INVITE` | Implemented (`v0.2.0`) |
 | RFC 3550 / 4733 | RTP/RTCP media transport and DTMF telephone-event | Implemented (`v0.3.0`) |
 | RFC 6716 / 7587 | Native `libopus` 48 kHz VoIP codec + TOC/`fmtp` + mic DSP conditioning | Implemented (`v0.7.0`) |
+| ITU-T G.722 / RFC 3551 §4.5.2 | Pure-Rust 16 kHz wideband G.722 codec (PT 9) + universal pluggable `AudioCodecPlugin` / `CodecRegistry` | Implemented (`v0.9.0`) |
 
 ---
 
@@ -83,7 +84,8 @@ All workspace crates share a synchronized **SemVer 2.0.0** version in root `Carg
 - **`0.5.0` — Stage 5:** `bmsip-ffi` UniFFI `.udl` contract (Swift/Kotlin/C) + Opus codec integration.
 - **`0.6.0` — Stage 6:** Linux live audio (`--live-audio` & `listen` in `bmsip-cli`) + reference iOS/Android/C platform adapters (`bindings/`).
 - **`0.7.0` — Stage 7:** Native `libopus` 48 kHz VoIP backend (`LibOpusCodec`), Asterisk Opus negotiation, soft noise-gate/gain mic DSP (`condition_mic_frame`), and glitch-free 48 kHz live Linux audio pre-roll buffering.
-- **`0.8.0` — Stage 8 (Current):** RFC 3261 `Record-Route` response copying, multi-server Docker testbed (**Asterisk** `PJSIP` + **FreeSWITCH** `Sofia-SIP` + **Kamailio** `SIP Proxy`), unified `bmsip-cli interop` benchmark, and DSP audio analyzer / jitter PLC crossfade.
+- **`0.8.0` — Stage 8:** RFC 3261 `Record-Route` response copying, multi-server Docker testbed (**Asterisk** `PJSIP` + **FreeSWITCH** `Sofia-SIP` + **Kamailio** `SIP Proxy`), unified `bmsip-cli interop` benchmark, and DSP audio analyzer / jitter PLC crossfade.
+- **`0.9.0` — Stage 9 (Current):** Universal pluggable audio codec registry (`AudioCodecPlugin`, `AudioCodecFactory`, `CodecRegistry`, `EngineConfig::register_custom_codec`) and built-in pure-Rust **ITU-T G.722** (16 kHz wideband HD Voice, PT `9`) verified across Asterisk, FreeSWITCH (`mod_spandsp`), and Kamailio.
 
 ---
 

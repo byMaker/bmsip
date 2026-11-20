@@ -5,6 +5,19 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.9.0] - 2026-11-21
+
+### Added
+- Universal pluggable audio codec plugin system (`crates/bmsip-media/src/plugin.rs`, `#![forbid(unsafe_code)]`):
+  - `AudioCodecDescriptor`, `AudioCodecPlugin`, `AudioCodecFactory`, `FnCodecFactory`, and `CodecRegistry` supporting arbitrary sample rates (`8`/`16`/`48` kHz) via automatic 20 ms PCM resampling (`resample_pcm_20ms`).
+  - `MediaSession::new_with_plugin` / `.with_codec_plugin` and `SessionCodec::Custom` in `bmsip-media`.
+  - `EngineConfig::register_codec` and `EngineConfig::register_custom_codec` in `bmsip-engine` so host applications can register external codecs without modifying core crates.
+- Built-in pure-Rust ITU-T G.722 (64 kbps Mode 1, 16 kHz wideband HD Voice, static payload type `9` with RFC 3551 §4.5.2 8 kHz RTP clock) in `crates/bmsip-media/src/g722.rs` (`#![forbid(unsafe_code)]`) and `RtpCodec::g722()` in `bmsip-core`.
+- 16 kHz `WavAudioPort` support and `PCM_FRAME_SAMPLES_16KHZ_20MS` export in `bmsip-engine`.
+- `--codec g722` flag in `bmsip-cli`, G.722 wideband echo checks in `selftest` (7 cases) and `interop` (12 scenarios).
+- Enabled `g722` on Asterisk PJSIP endpoints (`allow=opus,g722,ulaw,alaw`) and loaded `mod_spandsp` with `G722` codec preferences in FreeSWITCH.
+- Live integration test `live_g722_and_custom_codec_plugin_interop` verifying G.722 wideband echo against Asterisk/FreeSWITCH and an external custom `L16/16000` codec plugin routed through Kamailio proxy.
+
 ## [0.8.0] - 2026-11-20
 
 ### Added

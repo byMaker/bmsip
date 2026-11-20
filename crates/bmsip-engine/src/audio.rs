@@ -6,7 +6,9 @@ use std::collections::VecDeque;
 use std::sync::{Arc, Mutex};
 
 use bmsip_media::WavPcm16;
-pub use bmsip_media::{PCM_FRAME_SAMPLES_48KHZ_20MS, PCM_FRAME_SAMPLES_8KHZ_20MS};
+pub use bmsip_media::{
+    PCM_FRAME_SAMPLES_16KHZ_20MS, PCM_FRAME_SAMPLES_48KHZ_20MS, PCM_FRAME_SAMPLES_8KHZ_20MS,
+};
 
 /// Host-supplied audio I/O bridge consumed every 20 ms by [`crate::SipEngine`].
 pub trait AudioPort: Send {
@@ -71,10 +73,10 @@ pub struct WavAudioPort {
 impl WavAudioPort {
     /// Creates a [`WavAudioPort`] and returns both the port and an inspection [`WavAudioHandle`].
     pub fn new(tx_clip: WavPcm16, loop_tx: bool) -> (Self, WavAudioHandle) {
-        let rate = if tx_clip.sample_rate == 48_000 {
-            48_000
-        } else {
-            8_000
+        let rate = match tx_clip.sample_rate {
+            48_000 => 48_000,
+            16_000 => 16_000,
+            _ => 8_000,
         };
         let recorded = Arc::new(Mutex::new(Vec::new()));
         let handle = WavAudioHandle {
@@ -124,10 +126,10 @@ impl AudioPort for WavAudioPort {
     }
 
     fn capture_frame_20ms(&mut self) -> Vec<i16> {
-        let len = if self.sample_rate == 48_000 {
-            PCM_FRAME_SAMPLES_48KHZ_20MS
-        } else {
-            PCM_FRAME_SAMPLES_8KHZ_20MS
+        let len = match self.sample_rate {
+            48_000 => PCM_FRAME_SAMPLES_48KHZ_20MS,
+            16_000 => PCM_FRAME_SAMPLES_16KHZ_20MS,
+            _ => PCM_FRAME_SAMPLES_8KHZ_20MS,
         };
         self.next_frame(len)
     }

@@ -1,16 +1,20 @@
 //! MODULE_CONTRACT: Unified Sans-I/O 20 ms PCM <-> RTP/RTCP/DTMF media session pipeline (`MediaSession`).
-//! INVARIANTS: Zero OS audio or socket APIs; operates strictly on byte slices and 20 ms `i16` PCM frames; routes DTMF payload type to `DtmfDetector`, G.711 and Opus payload types to `AdaptiveJitterBuffer`.
+//! INVARIANTS: Zero OS audio or socket APIs; operates strictly on byte slices and 20 ms `i16` PCM frames; routes DTMF payload type to `DtmfDetector`, G.711, G.722, Opus, and custom plugin payload types to `AdaptiveJitterBuffer`.
 //! RFC_REFS: RFC 3550, RFC 3551, RFC 4733, RFC 7587.
 
 use crate::codec::G711Kind;
 use crate::dtmf::{DtmfDetector, DtmfDigit, DtmfEventPayload, DtmfSender};
 use crate::error::MediaError;
+use crate::g722::{
+    resample_pcm_20ms, G722Codec, G722_PAYLOAD_TYPE, G722_RTP_CLOCK_RATE, G722_RTP_SAMPLES_20MS,
+    PCM_FRAME_SAMPLES_16KHZ_20MS,
+};
 use crate::jitter::{AdaptiveJitterBuffer, JitterBufferConfig, PlayoutFrame};
 use crate::opus::{
-    downsample_48k_to_8k, upsample_8k_to_48k, BuiltInOpusCodec, OpusCodecBackend,
-    OPUS_RTP_CLOCK_RATE, OPUS_RTP_SAMPLES_20MS, PCM_FRAME_SAMPLES_48KHZ_20MS,
-    PCM_FRAME_SAMPLES_8KHZ_20MS,
+    BuiltInOpusCodec, OpusCodecBackend, OPUS_RTP_CLOCK_RATE, OPUS_RTP_SAMPLES_20MS,
+    PCM_FRAME_SAMPLES_48KHZ_20MS, PCM_FRAME_SAMPLES_8KHZ_20MS,
 };
+use crate::plugin::AudioCodecPlugin;
 use crate::rtcp::{RtcpPacket, RtpStreamStats};
 use crate::rtp::{RtpPacket, RtpPacketizer};
 
@@ -18,32 +22,56 @@ use crate::rtp::{RtpPacket, RtpPacketizer};
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SessionCodec {
     G711(G711Kind),
-    Opus { payload_type: u8 },
+    G722 {
+        payload_type: u8,
+    },
+    Opus {
+        payload_type: u8,
+    },
+    Custom {
+        payload_type: u8,
+        rtp_clock_rate_hz: u32,
+    },
 }
 
 impl SessionCodec {
+    /// Standard static ITU-T G.722 codec entry (payload type `9`, `8000` Hz RTP clock per RFC 3551).
+    pub fn g722() -> Self {
+        Self::G722 {
+            payload_type: G722_PAYLOAD_TYPE,
+        }
+    }
+
     /// Returns the RTP payload type number used for outbound media packets.
     pub fn payload_type(self) -> u8 {
         match self {
             Self::G711(k) => k.payload_type(),
-            Self::Opus { payload_type } => payload_type,
+            Self::G722 { payload_type }
+            | Self::Opus { payload_type }
+            | Self::Custom { payload_type, .. } => payload_type,
         }
     }
 
-    /// Returns the RTP clock rate in Hz (`8000` for G.711, `48000` for Opus).
+    /// Returns the RTP clock rate in Hz (`8000` for G.711/G.722, `48000` for Opus, or custom rate).
     pub fn clock_rate_hz(self) -> u32 {
         match self {
             Self::G711(_) => 8_000,
+            Self::G722 { .. } => G722_RTP_CLOCK_RATE,
             Self::Opus { .. } => OPUS_RTP_CLOCK_RATE,
+            Self::Custom {
+                rtp_clock_rate_hz, ..
+            } => rtp_clock_rate_hz,
         }
     }
 }
 
-/// Integrated Sans-I/O audio media pipeline combining packetizer, G.711/Opus codec, DTMF, jitter buffer, and RTCP stats.
+/// Integrated Sans-I/O audio media pipeline combining packetizer, built-in or pluggable codecs, DTMF, jitter buffer, and RTCP stats.
 #[derive(Debug)]
 pub struct MediaSession {
     codec: SessionCodec,
     opus: Box<dyn OpusCodecBackend>,
+    g722: G722Codec,
+    custom_plugin: Option<Box<dyn AudioCodecPlugin>>,
     dtmf_payload_type: u8,
     frame_samples: usize,
     packetizer: RtpPacketizer,
@@ -70,7 +98,7 @@ impl MediaSession {
         )
     }
 
-    /// Creates a [`MediaSession`] configured for any [`SessionCodec`] (G.711 or Opus).
+    /// Creates a [`MediaSession`] configured for any [`SessionCodec`] (`G711`, `G722`, `Opus`, or `Custom`).
     pub fn new_with_session_codec(
         codec: SessionCodec,
         dtmf_payload_type: u8,
@@ -81,6 +109,8 @@ impl MediaSession {
         Self {
             codec,
             opus: Box::new(BuiltInOpusCodec::new()),
+            g722: G722Codec::new(),
+            custom_plugin: None,
             dtmf_payload_type,
             frame_samples,
             packetizer: RtpPacketizer::new(local_ssrc, codec.payload_type(), 1, 0),
@@ -92,9 +122,31 @@ impl MediaSession {
         }
     }
 
+    /// Creates a [`MediaSession`] driven by an arbitrary pluggable [`AudioCodecPlugin`].
+    pub fn new_with_plugin(
+        plugin: Box<dyn AudioCodecPlugin>,
+        payload_type: u8,
+        dtmf_payload_type: u8,
+        local_ssrc: u32,
+        jitter_config: JitterBufferConfig,
+    ) -> Self {
+        let codec = SessionCodec::Custom {
+            payload_type,
+            rtp_clock_rate_hz: plugin.descriptor().rtp_clock_rate_hz,
+        };
+        Self::new_with_session_codec(codec, dtmf_payload_type, local_ssrc, jitter_config)
+            .with_codec_plugin(plugin)
+    }
+
     /// Installs a custom [`OpusCodecBackend`] (such as native `LibOpusCodec`) using builder style.
     pub fn with_opus_backend(mut self, backend: Box<dyn OpusCodecBackend>) -> Self {
         self.opus = backend;
+        self
+    }
+
+    /// Installs a custom [`AudioCodecPlugin`] backend using builder style.
+    pub fn with_codec_plugin(mut self, plugin: Box<dyn AudioCodecPlugin>) -> Self {
+        self.custom_plugin = Some(plugin);
         self
     }
 
@@ -117,22 +169,43 @@ impl MediaSession {
                 pcm.len()
             )));
         }
-        let (encoded, ts_advance) = match self.codec {
-            SessionCodec::G711(kind) => {
-                if self.frame_samples == PCM_FRAME_SAMPLES_48KHZ_20MS {
-                    let pcm_8k = downsample_48k_to_8k(pcm);
-                    (kind.encode(&pcm_8k), PCM_FRAME_SAMPLES_8KHZ_20MS as u32)
-                } else {
-                    (kind.encode(pcm), self.frame_samples as u32)
+        let (encoded, ts_advance) = if let Some(plugin) = self.custom_plugin.as_mut() {
+            (plugin.encode_20ms(pcm)?, self.codec.clock_rate_hz() / 50)
+        } else {
+            match self.codec {
+                SessionCodec::G711(kind) => {
+                    if self.frame_samples != PCM_FRAME_SAMPLES_8KHZ_20MS {
+                        let pcm_8k = resample_pcm_20ms(pcm, PCM_FRAME_SAMPLES_8KHZ_20MS)?;
+                        (kind.encode(&pcm_8k), PCM_FRAME_SAMPLES_8KHZ_20MS as u32)
+                    } else {
+                        (kind.encode(pcm), PCM_FRAME_SAMPLES_8KHZ_20MS as u32)
+                    }
                 }
-            }
-            SessionCodec::Opus { .. } => {
-                let pkt = if self.frame_samples == PCM_FRAME_SAMPLES_48KHZ_20MS {
-                    self.opus.encode_20ms_48khz(pcm)?
-                } else {
-                    self.opus.encode_20ms_8khz(pcm)?
-                };
-                (pkt, OPUS_RTP_SAMPLES_20MS)
+                SessionCodec::G722 { .. } => {
+                    let pkt = if self.frame_samples == PCM_FRAME_SAMPLES_16KHZ_20MS {
+                        self.g722.encode_16khz(pcm)?
+                    } else {
+                        let pcm_16k = resample_pcm_20ms(pcm, PCM_FRAME_SAMPLES_16KHZ_20MS)?;
+                        self.g722.encode_16khz(&pcm_16k)?
+                    };
+                    (pkt, G722_RTP_SAMPLES_20MS)
+                }
+                SessionCodec::Opus { .. } => {
+                    let pkt = if self.frame_samples == PCM_FRAME_SAMPLES_48KHZ_20MS {
+                        self.opus.encode_20ms_48khz(pcm)?
+                    } else if self.frame_samples == PCM_FRAME_SAMPLES_8KHZ_20MS {
+                        self.opus.encode_20ms_8khz(pcm)?
+                    } else {
+                        let pcm_48k = resample_pcm_20ms(pcm, PCM_FRAME_SAMPLES_48KHZ_20MS)?;
+                        self.opus.encode_20ms_48khz(&pcm_48k)?
+                    };
+                    (pkt, OPUS_RTP_SAMPLES_20MS)
+                }
+                SessionCodec::Custom { payload_type, .. } => {
+                    return Err(MediaError::UnsupportedCodec(format!(
+                        "custom session codec PT {payload_type} requires an installed AudioCodecPlugin"
+                    )));
+                }
             }
         };
         let pkt = self.packetizer.next_packet(encoded, ts_advance, false);
@@ -187,27 +260,33 @@ impl MediaSession {
             return Ok(self.dtmf_detector.feed(pkt.header.timestamp, ev));
         }
 
-        let pcm = if matches!(self.codec, SessionCodec::Opus { payload_type } if payload_type == pkt.header.payload_type)
+        let pcm = if let Some(plugin) = self.custom_plugin.as_mut() {
+            if pkt.header.payload_type == self.codec.payload_type() {
+                plugin.decode_20ms(&pkt.payload, self.frame_samples)?
+            } else {
+                decode_fallback_builtin(&mut self.g722, &pkt, self.frame_samples)?
+            }
+        } else if matches!(self.codec, SessionCodec::Opus { payload_type } if payload_type == pkt.header.payload_type)
         {
             if self.frame_samples == PCM_FRAME_SAMPLES_48KHZ_20MS {
                 self.opus.decode_20ms_48khz(&pkt.payload)?
+            } else if self.frame_samples == PCM_FRAME_SAMPLES_16KHZ_20MS {
+                let pcm_48k = self.opus.decode_20ms_48khz(&pkt.payload)?;
+                resample_pcm_20ms(&pcm_48k, PCM_FRAME_SAMPLES_16KHZ_20MS)?
             } else {
                 self.opus.decode_20ms_8khz(&pkt.payload)?
             }
-        } else {
-            let rx_codec =
-                G711Kind::from_payload_type(pkt.header.payload_type).ok_or_else(|| {
-                    MediaError::UnsupportedCodec(format!(
-                        "unsupported RTP payload type {}",
-                        pkt.header.payload_type
-                    ))
-                })?;
-            let pcm_8k = rx_codec.decode(&pkt.payload);
-            if self.frame_samples == PCM_FRAME_SAMPLES_48KHZ_20MS {
-                upsample_8k_to_48k(&pcm_8k)
+        } else if matches!(self.codec, SessionCodec::G722 { payload_type } if payload_type == pkt.header.payload_type)
+            || pkt.header.payload_type == G722_PAYLOAD_TYPE
+        {
+            let pcm_16k = self.g722.decode_16khz(&pkt.payload)?;
+            if self.frame_samples == PCM_FRAME_SAMPLES_16KHZ_20MS {
+                pcm_16k
             } else {
-                pcm_8k
+                resample_pcm_20ms(&pcm_16k, self.frame_samples)?
             }
+        } else {
+            decode_fallback_builtin(&mut self.g722, &pkt, self.frame_samples)?
         };
 
         let rtp_samples_per_frame = self.codec.clock_rate_hz() / 50;
@@ -250,6 +329,34 @@ impl MediaSession {
     /// Returns the jitter buffer's current adaptive target depth in frames.
     pub fn jitter_target_depth(&self) -> usize {
         self.jitter.target_depth_frames()
+    }
+}
+
+fn decode_fallback_builtin(
+    g722: &mut G722Codec,
+    pkt: &RtpPacket,
+    target_frame_samples: usize,
+) -> Result<Vec<i16>, MediaError> {
+    if pkt.header.payload_type == G722_PAYLOAD_TYPE {
+        let pcm_16k = g722.decode_16khz(&pkt.payload)?;
+        return if target_frame_samples == PCM_FRAME_SAMPLES_16KHZ_20MS {
+            Ok(pcm_16k)
+        } else {
+            resample_pcm_20ms(&pcm_16k, target_frame_samples)
+        };
+    }
+
+    let rx_codec = G711Kind::from_payload_type(pkt.header.payload_type).ok_or_else(|| {
+        MediaError::UnsupportedCodec(format!(
+            "unsupported RTP payload type {}",
+            pkt.header.payload_type
+        ))
+    })?;
+    let pcm_8k = rx_codec.decode(&pkt.payload);
+    if target_frame_samples == PCM_FRAME_SAMPLES_8KHZ_20MS {
+        Ok(pcm_8k)
+    } else {
+        resample_pcm_20ms(&pcm_8k, target_frame_samples)
     }
 }
 
@@ -344,5 +451,37 @@ mod tests {
             played.extend_from_slice(rx.pop_playout_frame().samples());
         }
         assert!(WavPcm16::new(8000, played).rms_energy() > 6000);
+    }
+
+    #[test]
+    fn g722_media_session_uses_8khz_rtp_clock_for_16khz_wideband_audio() {
+        let cfg = JitterBufferConfig {
+            min_depth_frames: 2,
+            max_depth_frames: 8,
+            initial_depth_frames: 2,
+            frame_samples: PCM_FRAME_SAMPLES_16KHZ_20MS,
+        };
+        let mut tx =
+            MediaSession::new_with_session_codec(SessionCodec::g722(), 101, 0xeeee_0001, cfg);
+        let mut rx =
+            MediaSession::new_with_session_codec(SessionCodec::g722(), 101, 0xffff_0002, cfg);
+        assert_eq!(tx.clock_rate_hz(), 8_000);
+
+        let tone = WavPcm16::generate_sine_wave(16_000, 3_000, 200, 12_000);
+        let mut ts_list = Vec::new();
+        for (idx, frame) in tone.samples.as_chunks::<320>().0.iter().enumerate() {
+            let rtp = tx.encode_pcm_frame(frame).unwrap();
+            let parsed = RtpPacket::parse(&rtp).unwrap();
+            assert_eq!(parsed.header.payload_type, 9);
+            ts_list.push(parsed.header.timestamp);
+            rx.receive_rtp(&rtp, (idx as u32) * 160).unwrap();
+        }
+        assert_eq!(ts_list[..5], [0, 160, 320, 480, 640]);
+
+        let mut played = Vec::new();
+        for _ in 0..10 {
+            played.extend_from_slice(rx.pop_playout_frame().samples());
+        }
+        assert!(WavPcm16::new(16_000, played[640..].to_vec()).rms_energy() > 6000);
     }
 }

@@ -2,7 +2,7 @@
 
 Embeddable, cross-platform SIP library written in Rust for **Linux**, **iOS**, and **Android**.
 
-- **Current Version:** `0.8.0` ([CHANGELOG.md](./CHANGELOG.md))
+- **Current Version:** `0.9.0` ([CHANGELOG.md](./CHANGELOG.md))
 - **Architecture Specification:** [ARCHITECTURE.md](./ARCHITECTURE.md)
 - **License:** `AGPL-3.0-only` ([LICENSE](./LICENSE) · [NOTICE](./NOTICE) · commercial licensing: [bymaker.com](https://bymaker.com))
 
@@ -11,10 +11,10 @@ Embeddable, cross-platform SIP library written in Rust for **Linux**, **iOS**, a
 ```text
 crates/
 ├── bmsip-core/     # 100% Sans-I/O SIP, SDP, Digest Auth, RFC 3261 transactions & dialogs
-├── bmsip-media/    # Hardware-agnostic RTP/RTCP, jitter buffer, G.711/Opus, DTMF, 20 ms PCM & mic DSP
-├── bmsip-engine/   # Lock-safe Command/Event runtime with UDP sockets, timers, libopus & flight recorder
+├── bmsip-media/    # Hardware-agnostic RTP/RTCP, jitter buffer, G.711/G.722/Opus, CodecRegistry, DTMF & DSP
+├── bmsip-engine/   # Lock-safe Command/Event runtime with UDP sockets, timers, libopus, custom codecs & flight recorder
 ├── bmsip-ffi/      # Cross-platform UniFFI (Swift/Kotlin) & C-API facade + bmsip.h
-└── bmsip-cli/      # Linux CLI SIP softphone (`call --live-audio --codec opus`, `listen`)
+└── bmsip-cli/      # Linux CLI SIP softphone (`call --live-audio --codec opus|g722|pcmu|pcma`, `listen`, `selftest`, `interop`)
 bindings/
 ├── ios/            # Reference Swift AVAudioEngine + CallKit + NWPathMonitor adapter
 ├── android/        # Reference Kotlin AudioRecord/AudioTrack + AEC + ConnectivityManager adapter
@@ -39,7 +39,7 @@ docker compose exec -T dev cargo clippy --workspace --all-targets -- -D warnings
 docker compose exec -T dev cargo test --workspace
 ```
 
-Run the unified 9-scenario multi-server interoperability suite (`Asterisk` + `FreeSWITCH` + `Kamailio`):
+Run the unified 12-scenario multi-server interoperability suite (`Asterisk` + `FreeSWITCH` + `Kamailio` across `PCMU`, `G722`, `Opus`, and `DTMF`):
 
 ```bash
 docker compose exec -T dev cargo run -p bmsip-cli -- interop

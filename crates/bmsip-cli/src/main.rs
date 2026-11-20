@@ -24,6 +24,7 @@ use live_audio::{LiveAudioHandle, LiveLinuxAudioPort};
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum CodecChoice {
     Opus,
+    G722,
     Pcmu,
     Pcma,
 }
@@ -32,11 +33,20 @@ impl CodecChoice {
     fn parse(raw: &str) -> Result<Self, String> {
         match raw.to_ascii_lowercase().as_str() {
             "opus" => Ok(Self::Opus),
+            "g722" => Ok(Self::G722),
             "pcmu" => Ok(Self::Pcmu),
             "pcma" => Ok(Self::Pcma),
             _ => Err(format!(
-                "unsupported --codec '{raw}' (expected opus, pcmu, or pcma)"
+                "unsupported --codec '{raw}' (expected opus, g722, pcmu, or pcma)"
             )),
+        }
+    }
+
+    fn default_wav_sample_rate_hz(self) -> u32 {
+        match self {
+            Self::Opus => 48_000,
+            Self::G722 => 16_000,
+            Self::Pcmu | Self::Pcma => 8_000,
         }
     }
 
@@ -44,9 +54,16 @@ impl CodecChoice {
         match self {
             Self::Opus => vec![
                 RtpCodec::opus(),
+                RtpCodec::g722(),
                 RtpCodec::pcmu(),
                 RtpCodec::pcma(),
                 RtpCodec::telephone_event_48k(102),
+                RtpCodec::telephone_event(101),
+            ],
+            Self::G722 => vec![
+                RtpCodec::g722(),
+                RtpCodec::pcmu(),
+                RtpCodec::pcma(),
                 RtpCodec::telephone_event(101),
             ],
             Self::Pcmu => vec![
@@ -143,7 +160,7 @@ fn print_usage() {
          OPTIONS:\n  \
            --duration-ms <ms>     Active call duration in milliseconds (default: 1000 / 10000 listen / 800 selftest / 500 interop)\n  \
            --tone-hz <hz>         Generated sine tone frequency or expected tone for analyze/call (default: 440)\n  \
-           --codec <name>         Preferred audio codec: opus (default, 48 kHz), pcmu, or pcma\n  \
+           --codec <name>         Preferred audio codec: opus (default, 48 kHz), g722 (16 kHz HD), pcmu, or pcma\n  \
            --mic-gain <mult>      Live microphone gain multiplier (default: 4.0)\n  \
            --live-audio           Use 48 kHz live Linux microphone/speaker via PipeWire/PulseAudio/ALSA\n  \
            --wav <path>           Input 16-bit mono WAV file for analyze subcommand\n  \
@@ -593,10 +610,10 @@ fn run_call(cli: CallCliArgs) -> Result<(), String> {
             (WavPcm16::decode(&bytes).map_err(|e| e.to_string())?, None)
         }
         None => {
-            let sample_rate = if cli.codec == CodecChoice::Opus || cli.live_audio {
+            let sample_rate = if cli.live_audio {
                 48_000
             } else {
-                8_000
+                cli.codec.default_wav_sample_rate_hz()
             };
             let wav = WavPcm16::generate_sine_wave(
                 sample_rate,
@@ -648,11 +665,12 @@ fn run_listen(cli: ListenCliArgs) -> Result<(), String> {
     ua_cfg.supported_codecs = cli.codec.supported_codecs();
     let eng_cfg = EngineConfig::new(ua_cfg, registrar_addr, IpAddr::V4(Ipv4Addr::UNSPECIFIED), 0);
 
-    let (silence_rate, silence_len) = if cli.codec == CodecChoice::Opus || cli.live_audio {
-        (48_000, 960)
+    let silence_rate = if cli.live_audio {
+        48_000
     } else {
-        (8_000, 160)
+        cli.codec.default_wav_sample_rate_hz()
     };
+    let silence_len = (silence_rate / 50) as usize;
     let (audio_port, inspector) = build_audio_port(
         cli.live_audio,
         cli.mic_gain,
@@ -744,7 +762,7 @@ struct SelftestCase {
 }
 
 fn run_selftest(cli: SelftestCliArgs) -> Result<(), String> {
-    const CASES: [SelftestCase; 5] = [
+    const CASES: [SelftestCase; 7] = [
         SelftestCase {
             name: "PCMU-8k-440Hz",
             codec: CodecChoice::Pcmu,
@@ -757,6 +775,20 @@ fn run_selftest(cli: SelftestCliArgs) -> Result<(), String> {
             codec: CodecChoice::Pcma,
             sample_rate_hz: 8_000,
             tone_hz: 1_000,
+            amplitude: 12_000,
+        },
+        SelftestCase {
+            name: "G722-16k-440Hz",
+            codec: CodecChoice::G722,
+            sample_rate_hz: 16_000,
+            tone_hz: 440,
+            amplitude: 12_000,
+        },
+        SelftestCase {
+            name: "G722-16k-3000Hz-WB",
+            codec: CodecChoice::G722,
+            sample_rate_hz: 16_000,
+            tone_hz: 3_000,
             amplitude: 12_000,
         },
         SelftestCase {
@@ -861,12 +893,8 @@ fn execute_two_party_session(
     let registrar_addr = resolve_server_addr(server)?;
     let server_host = server.split(':').next().unwrap_or(server);
     let registrar_uri = SipUri::parse(&format!("sip:{server}")).map_err(|e| e.to_string())?;
-    let rate = if codec == CodecChoice::Opus {
-        48_000
-    } else {
-        8_000
-    };
-    let frame_len = if rate == 48_000 { 960 } else { 160 };
+    let rate = codec.default_wav_sample_rate_hz();
+    let frame_len = (rate / 50) as usize;
 
     let mut cfg_1001 = UaConfig::new(
         "1001",
@@ -1069,6 +1097,17 @@ fn run_interop(cli: InteropCliArgs) -> Result<(), String> {
         InteropSpec {
             server_label: "Asterisk",
             engine_label: "PJSIP",
+            scenario: "Echo-G722-16k-3000Hz",
+            server_addr: &cli.asterisk,
+            kind: InteropKind::Echo {
+                codec: CodecChoice::G722,
+                rate: 16_000,
+                tone_hz: 3_000,
+            },
+        },
+        InteropSpec {
+            server_label: "Asterisk",
+            engine_label: "PJSIP",
             scenario: "Echo-OPUS-48k-440Hz",
             server_addr: &cli.asterisk,
             kind: InteropKind::Echo {
@@ -1112,6 +1151,17 @@ fn run_interop(cli: InteropCliArgs) -> Result<(), String> {
         InteropSpec {
             server_label: "FreeSWITCH",
             engine_label: "Sofia-SIP",
+            scenario: "Echo-G722-16k-3000Hz",
+            server_addr: &cli.freeswitch,
+            kind: InteropKind::Echo {
+                codec: CodecChoice::G722,
+                rate: 16_000,
+                tone_hz: 3_000,
+            },
+        },
+        InteropSpec {
+            server_label: "FreeSWITCH",
+            engine_label: "Sofia-SIP",
             scenario: "Echo-OPUS-48k-440Hz",
             server_addr: &cli.freeswitch,
             kind: InteropKind::Echo {
@@ -1138,6 +1188,16 @@ fn run_interop(cli: InteropCliArgs) -> Result<(), String> {
             server_addr: &cli.freeswitch,
             kind: InteropKind::TwoParty {
                 codec: CodecChoice::Opus,
+                tone_hz: 440,
+            },
+        },
+        InteropSpec {
+            server_label: "Kamailio",
+            engine_label: "SIP-Proxy",
+            scenario: "Proxy-G722-1001->1002",
+            server_addr: &cli.kamailio,
+            kind: InteropKind::TwoParty {
+                codec: CodecChoice::G722,
                 tone_hz: 440,
             },
         },
@@ -1296,6 +1356,8 @@ mod tests {
         assert_eq!(parsed.user, "1001");
         assert_eq!(parsed.duration_ms, 500);
         assert_eq!(parsed.codec, CodecChoice::Pcmu);
+        assert_eq!(CodecChoice::parse("g722").unwrap(), CodecChoice::G722);
+        assert_eq!(CodecChoice::G722.default_wav_sample_rate_hz(), 16_000);
         assert_eq!(parsed.mic_gain, 2.5);
         assert!(parsed.live_audio);
     }

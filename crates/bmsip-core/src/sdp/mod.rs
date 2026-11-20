@@ -77,6 +77,17 @@ impl RtpCodec {
         }
     }
 
+    /// ITU-T G.722 16 kHz wideband audio codec (static payload type 9, 8000 Hz RTP clock per RFC 3551 §4.5.2).
+    pub fn g722() -> Self {
+        Self {
+            payload_type: 9,
+            encoding_name: "G722".to_string(),
+            clock_rate: 8000,
+            channels: None,
+            fmtp: None,
+        }
+    }
+
     /// Opus audio codec (typical dynamic PT 111, 48000 Hz, 2 channels).
     pub fn opus() -> Self {
         Self {
@@ -529,7 +540,7 @@ mod tests {
             s=Call\r\n\
             c=IN IP4 10.0.0.10\r\n\
             t=0 0\r\n\
-            m=audio 40000 RTP/AVP 96 0 101\r\n\
+            m=audio 40000 RTP/AVP 96 0 9 101\r\n\
             a=rtpmap:96 opus/48000/2\r\n\
             a=fmtp:96 minptime=10;useinbandfec=1\r\n\
             a=rtpmap:101 telephone-event/8000\r\n\
@@ -542,11 +553,12 @@ mod tests {
         assert_eq!(sdp.audio_port, 40000);
         assert_eq!(sdp.direction, Direction::SendOnly);
         assert_eq!(sdp.ptime, Some(20));
-        assert_eq!(sdp.codecs.len(), 3);
+        assert_eq!(sdp.codecs.len(), 4);
         assert_eq!(sdp.codecs[0].payload_type, 96);
         assert_eq!(sdp.codecs[0].encoding_name, "opus");
         assert_eq!(sdp.codecs[1], RtpCodec::pcmu());
-        assert_eq!(sdp.codecs[2].encoding_name, "telephone-event");
+        assert_eq!(sdp.codecs[2], RtpCodec::g722());
+        assert_eq!(sdp.codecs[3].encoding_name, "telephone-event");
 
         let rendered = sdp.to_string();
         let reparsed = SdpSession::parse(&rendered).unwrap();

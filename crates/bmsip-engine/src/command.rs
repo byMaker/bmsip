@@ -3,10 +3,11 @@
 //! RFC_REFS: RFC 3261, RFC 4733.
 
 use std::net::{IpAddr, SocketAddr};
+use std::sync::Arc;
 
 use bmsip_core::dialog::{RegistrationState, UaConfig};
 use bmsip_core::sip::SipUri;
-use bmsip_media::DtmfDigit;
+use bmsip_media::{AudioCodecFactory, CodecRegistry, DtmfDigit};
 
 /// Startup configuration for [`crate::SipEngine`].
 #[derive(Debug, Clone)]
@@ -16,10 +17,11 @@ pub struct EngineConfig {
     pub bind_ip: IpAddr,
     pub sip_port: u16,
     pub telemetry_capacity: usize,
+    pub codec_registry: CodecRegistry,
 }
 
 impl EngineConfig {
-    /// Creates an [`EngineConfig`] with a default telemetry ring capacity of 256 events.
+    /// Creates an [`EngineConfig`] with built-in codecs and a default telemetry ring capacity of 256 events.
     pub fn new(
         ua_config: UaConfig,
         registrar_addr: SocketAddr,
@@ -32,7 +34,26 @@ impl EngineConfig {
             bind_ip,
             sip_port,
             telemetry_capacity: 256,
+            codec_registry: CodecRegistry::with_builtin_codecs(),
         }
+    }
+
+    /// Registers an [`AudioCodecFactory`] in `codec_registry` without changing the advertised SDP order.
+    pub fn register_codec(&mut self, factory: Arc<dyn AudioCodecFactory>) {
+        self.codec_registry.register(factory);
+    }
+
+    /// Registers a custom [`AudioCodecFactory`] and promotes its SDP entry to preferred position.
+    pub fn register_custom_codec(&mut self, factory: Arc<dyn AudioCodecFactory>) {
+        let rtp_codec = factory.descriptor().to_rtp_codec();
+        self.codec_registry.register(factory);
+        self.ua_config.supported_codecs.retain(|c| {
+            !(c.encoding_name
+                .eq_ignore_ascii_case(&rtp_codec.encoding_name)
+                && c.clock_rate == rtp_codec.clock_rate
+                && c.channels.unwrap_or(1) == rtp_codec.channels.unwrap_or(1))
+        });
+        self.ua_config.supported_codecs.insert(0, rtp_codec);
     }
 }
 

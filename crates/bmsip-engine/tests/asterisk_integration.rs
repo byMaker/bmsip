@@ -1,5 +1,5 @@
 use std::net::{IpAddr, Ipv4Addr, SocketAddr, ToSocketAddrs, UdpSocket};
-use std::sync::Mutex;
+use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::{Duration, Instant};
 
@@ -7,7 +7,10 @@ use bmsip_core::dialog::{CallState, RegistrationState, UaConfig, UaEvent, UserAg
 use bmsip_core::sdp::RtpCodec;
 use bmsip_core::sip::SipUri;
 use bmsip_engine::{EngineCommand, EngineConfig, EngineEvent, SipEngine, WavAudioPort};
-use bmsip_media::{DtmfDigit, G711Kind, JitterBufferConfig, MediaSession, PlayoutFrame, WavPcm16};
+use bmsip_media::{
+    AudioCodecDescriptor, AudioCodecPlugin, DtmfDigit, FnCodecFactory, G711Kind,
+    JitterBufferConfig, MediaError, MediaSession, PlayoutFrame, WavPcm16,
+};
 
 static ASTERISK_TEST_MUTEX: Mutex<()> = Mutex::new(());
 
@@ -1131,6 +1134,278 @@ fn live_freeswitch_and_kamailio_multi_server_interop() {
     assert!(
         recorded_1002.rms_energy() > 1000,
         "expected P2P RTP RMS > 1000 through Kamailio proxy, got {}",
+        recorded_1002.rms_energy()
+    );
+}
+
+#[derive(Debug)]
+struct CustomL16Plugin {
+    descriptor: AudioCodecDescriptor,
+}
+
+impl CustomL16Plugin {
+    fn descriptor_spec() -> AudioCodecDescriptor {
+        AudioCodecDescriptor::new(98, "L16", 16_000, 16_000)
+    }
+
+    fn new() -> Self {
+        Self {
+            descriptor: Self::descriptor_spec(),
+        }
+    }
+}
+
+impl AudioCodecPlugin for CustomL16Plugin {
+    fn descriptor(&self) -> &AudioCodecDescriptor {
+        &self.descriptor
+    }
+
+    fn encode_native_20ms(&mut self, pcm: &[i16]) -> Result<Vec<u8>, MediaError> {
+        let mut out = Vec::with_capacity(pcm.len() * 2);
+        for &s in pcm {
+            out.extend_from_slice(&s.to_be_bytes());
+        }
+        Ok(out)
+    }
+
+    fn decode_native_20ms(&mut self, payload: &[u8]) -> Result<Vec<i16>, MediaError> {
+        let mut out = Vec::with_capacity(payload.len() / 2);
+        for chunk in payload.as_chunks::<2>().0 {
+            out.push(i16::from_be_bytes([chunk[0], chunk[1]]));
+        }
+        Ok(out)
+    }
+}
+
+fn run_echo_g722_server_check(server_host: &str) {
+    let server_addr = resolve_server(server_host);
+    let registrar = SipUri::parse(&format!("sip:{server_host}:5060")).unwrap();
+    let mut ua_cfg = UaConfig::new("1001", "secret1001", server_host, registrar, "0.0.0.0", 0);
+    ua_cfg.supported_codecs = vec![
+        RtpCodec::g722(),
+        RtpCodec::pcmu(),
+        RtpCodec::pcma(),
+        RtpCodec::telephone_event(101),
+    ];
+
+    let tone_16k = WavPcm16::generate_sine_wave(16_000, 3_000, 1_200, 12_000);
+    let (port, handle) = WavAudioPort::new(tone_16k, true);
+    let engine = SipEngine::spawn(
+        EngineConfig::new(ua_cfg, server_addr, IpAddr::V4(Ipv4Addr::UNSPECIFIED), 0),
+        Box::new(port),
+    )
+    .unwrap();
+
+    engine.send_command(EngineCommand::Register).unwrap();
+    assert!(
+        wait_for_engine_event(&engine, Duration::from_secs(10), |e| matches!(
+            e,
+            EngineEvent::RegistrationChanged(RegistrationState::Registered { .. })
+        ))
+        .is_some(),
+        "1001 failed G.722 registration on {server_host}"
+    );
+
+    engine
+        .send_command(EngineCommand::Dial {
+            target_uri: SipUri::parse(&format!("sip:601@{server_host}:5060")).unwrap(),
+        })
+        .unwrap();
+
+    let call_id = match wait_for_engine_event(&engine, Duration::from_secs(5), |e| {
+        matches!(e, EngineEvent::OutboundCallStarted { .. })
+    })
+    .expect("OutboundCallStarted")
+    {
+        EngineEvent::OutboundCallStarted { call_id } => call_id,
+        _ => unreachable!(),
+    };
+
+    let established_codec = match wait_for_engine_event(&engine, Duration::from_secs(8), |e| {
+        matches!(e, EngineEvent::CallEstablished { .. })
+    })
+    .unwrap_or_else(|| panic!("G.722 CallEstablished timed out on {server_host}"))
+    {
+        EngineEvent::CallEstablished { codec, .. } => codec,
+        _ => unreachable!(),
+    };
+    assert_eq!(established_codec, "G722");
+
+    thread::sleep(Duration::from_millis(500));
+
+    engine
+        .send_command(EngineCommand::Hangup { call_id })
+        .unwrap();
+    assert!(
+        wait_for_engine_event(&engine, Duration::from_secs(8), |e| matches!(
+            e,
+            EngineEvent::CallTerminated { .. }
+        ))
+        .is_some()
+    );
+    engine.send_command(EngineCommand::Unregister).unwrap();
+    let _ = wait_for_engine_event(&engine, Duration::from_secs(4), |e| {
+        matches!(
+            e,
+            EngineEvent::RegistrationChanged(RegistrationState::Unregistered)
+        )
+    });
+    engine.shutdown().unwrap();
+
+    let recorded = handle.recorded_wav();
+    assert_eq!(recorded.sample_rate, 16_000);
+    assert!(
+        recorded.rms_energy() > 2000,
+        "expected {server_host} echoed 16 kHz G.722 WAV RMS > 2000, got {}",
+        recorded.rms_energy()
+    );
+}
+
+#[test]
+fn live_g722_and_custom_codec_plugin_interop() {
+    let _guard = ASTERISK_TEST_MUTEX
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
+
+    // 1. Live G.722 16 kHz wideband echo against Asterisk and FreeSWITCH.
+    run_echo_g722_server_check("asterisk");
+    run_echo_g722_server_check("freeswitch");
+
+    // 2. External custom pluggable codec (L16/16000) registered via EngineConfig over Kamailio proxy.
+    let kam_addr = resolve_server("kamailio");
+    let registrar = SipUri::parse("sip:kamailio:5060").unwrap();
+    let factory = Arc::new(FnCodecFactory::new(
+        CustomL16Plugin::descriptor_spec(),
+        || Box::new(CustomL16Plugin::new()),
+    ));
+
+    let mut cfg_1001 = EngineConfig::new(
+        UaConfig::new(
+            "1001",
+            "secret1001",
+            "kamailio",
+            registrar.clone(),
+            "0.0.0.0",
+            0,
+        ),
+        kam_addr,
+        IpAddr::V4(Ipv4Addr::UNSPECIFIED),
+        0,
+    );
+    cfg_1001.register_custom_codec(Arc::clone(&factory) as Arc<dyn bmsip_media::AudioCodecFactory>);
+
+    let tone_1001 = WavPcm16::generate_sine_wave(16_000, 1_000, 1_200, 12_000);
+    let (port_1001, _) = WavAudioPort::new(tone_1001, true);
+    let eng_1001 = SipEngine::spawn(cfg_1001, Box::new(port_1001)).unwrap();
+
+    let mut cfg_1002 = EngineConfig::new(
+        UaConfig::new("1002", "secret1002", "kamailio", registrar, "0.0.0.0", 0),
+        kam_addr,
+        IpAddr::V4(Ipv4Addr::UNSPECIFIED),
+        0,
+    );
+    cfg_1002.register_custom_codec(factory);
+
+    let silence_1002 = WavPcm16::new(16_000, vec![0; 320]);
+    let (port_1002, handle_1002) = WavAudioPort::new(silence_1002, true);
+    let eng_1002 = SipEngine::spawn(cfg_1002, Box::new(port_1002)).unwrap();
+
+    eng_1001.send_command(EngineCommand::Register).unwrap();
+    eng_1002.send_command(EngineCommand::Register).unwrap();
+    assert!(
+        wait_for_engine_event(&eng_1001, Duration::from_secs(10), |e| matches!(
+            e,
+            EngineEvent::RegistrationChanged(RegistrationState::Registered { .. })
+        ))
+        .is_some()
+    );
+    assert!(
+        wait_for_engine_event(&eng_1002, Duration::from_secs(10), |e| matches!(
+            e,
+            EngineEvent::RegistrationChanged(RegistrationState::Registered { .. })
+        ))
+        .is_some()
+    );
+
+    eng_1001
+        .send_command(EngineCommand::Dial {
+            target_uri: SipUri::parse("sip:1002@kamailio:5060").unwrap(),
+        })
+        .unwrap();
+
+    let call_1001 = match wait_for_engine_event(&eng_1001, Duration::from_secs(5), |e| {
+        matches!(e, EngineEvent::OutboundCallStarted { .. })
+    })
+    .expect("OutboundCallStarted")
+    {
+        EngineEvent::OutboundCallStarted { call_id } => call_id,
+        _ => unreachable!(),
+    };
+    let call_1002 = match wait_for_engine_event(&eng_1002, Duration::from_secs(8), |e| {
+        matches!(e, EngineEvent::IncomingCall { .. })
+    })
+    .expect("IncomingCall")
+    {
+        EngineEvent::IncomingCall { call_id, .. } => call_id,
+        _ => unreachable!(),
+    };
+    eng_1002
+        .send_command(EngineCommand::Answer { call_id: call_1002 })
+        .unwrap();
+
+    let neg_codec = match wait_for_engine_event(&eng_1001, Duration::from_secs(8), |e| {
+        matches!(e, EngineEvent::CallEstablished { .. })
+    })
+    .expect("CallEstablished")
+    {
+        EngineEvent::CallEstablished { codec, .. } => codec,
+        _ => unreachable!(),
+    };
+    assert_eq!(neg_codec, "L16");
+    assert!(
+        wait_for_engine_event(&eng_1002, Duration::from_secs(8), |e| matches!(
+            e,
+            EngineEvent::CallEstablished { .. }
+        ))
+        .is_some()
+    );
+
+    thread::sleep(Duration::from_millis(450));
+
+    eng_1001
+        .send_command(EngineCommand::Hangup { call_id: call_1001 })
+        .unwrap();
+    assert!(
+        wait_for_engine_event(&eng_1001, Duration::from_secs(8), |e| matches!(
+            e,
+            EngineEvent::CallTerminated { .. }
+        ))
+        .is_some()
+    );
+    assert!(
+        wait_for_engine_event(&eng_1002, Duration::from_secs(8), |e| matches!(
+            e,
+            EngineEvent::CallTerminated { .. }
+        ))
+        .is_some()
+    );
+
+    for eng in [&eng_1001, &eng_1002] {
+        eng.send_command(EngineCommand::Unregister).unwrap();
+        let _ = wait_for_engine_event(eng, Duration::from_secs(4), |e| {
+            matches!(
+                e,
+                EngineEvent::RegistrationChanged(RegistrationState::Unregistered)
+            )
+        });
+    }
+    eng_1001.shutdown().unwrap();
+    eng_1002.shutdown().unwrap();
+
+    let recorded_1002 = handle_1002.recorded_wav();
+    assert!(
+        recorded_1002.rms_energy() > 3000,
+        "expected custom L16 plugin RTP RMS > 3000 over Kamailio proxy, got {}",
         recorded_1002.rms_energy()
     );
 }

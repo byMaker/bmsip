@@ -11,8 +11,9 @@ use std::time::{Duration, Instant};
 use bmsip_core::dialog::{CallState, RegistrationState, UaEvent, UserAgent};
 use bmsip_core::sip::SipMessage;
 use bmsip_media::{
-    BuiltInOpusCodec, G711Kind, JitterBufferConfig, MediaSession, OpusCodecBackend, RtpPacket,
-    SessionCodec, PCM_FRAME_SAMPLES_48KHZ_20MS, PCM_FRAME_SAMPLES_8KHZ_20MS,
+    BuiltInOpusCodec, CodecRegistry, G711Kind, JitterBufferConfig, MediaSession, OpusCodecBackend,
+    RtpPacket, SessionCodec, G722_PAYLOAD_TYPE, PCM_FRAME_SAMPLES_16KHZ_20MS,
+    PCM_FRAME_SAMPLES_48KHZ_20MS, PCM_FRAME_SAMPLES_8KHZ_20MS,
 };
 
 use crate::audio::AudioPort;
@@ -148,6 +149,7 @@ struct WorkerCtx {
     local_sip_addr: SocketAddr,
     sip_socket: UdpSocket,
     ua: UserAgent,
+    codec_registry: CodecRegistry,
     audio_port: Box<dyn AudioPort>,
     recorder: FlightRecorder,
     pending_rtp_sockets: HashMap<String, UdpSocket>,
@@ -305,8 +307,9 @@ impl WorkerCtx {
         };
         let remote_rtp = SocketAddr::new(remote_ip, remote_sdp.audio_port);
 
-        let (session_codec, codec_name) = negotiated_codecs
+        let (session_codec, codec_name, custom_plugin) = negotiated_codecs
             .iter()
+            .filter(|c| !c.encoding_name.eq_ignore_ascii_case("telephone-event"))
             .find_map(|c| {
                 if c.encoding_name.eq_ignore_ascii_case("opus") {
                     Some((
@@ -314,18 +317,35 @@ impl WorkerCtx {
                             payload_type: c.payload_type,
                         },
                         "OPUS".to_string(),
+                        None,
                     ))
+                } else if c.encoding_name.eq_ignore_ascii_case("g722")
+                    || c.payload_type == G722_PAYLOAD_TYPE
+                {
+                    Some((
+                        SessionCodec::G722 {
+                            payload_type: c.payload_type,
+                        },
+                        "G722".to_string(),
+                        None,
+                    ))
+                } else if let Some(k) = G711Kind::from_payload_type(c.payload_type) {
+                    let label = match k {
+                        G711Kind::Pcmu => "PCMU",
+                        G711Kind::Pcma => "PCMA",
+                    };
+                    Some((SessionCodec::G711(k), label.to_string(), None))
                 } else {
-                    G711Kind::from_payload_type(c.payload_type).map(|k| {
-                        let label = match k {
-                            G711Kind::Pcmu => "PCMU",
-                            G711Kind::Pcma => "PCMA",
+                    self.codec_registry.instantiate(c).map(|plugin| {
+                        let sc = SessionCodec::Custom {
+                            payload_type: c.payload_type,
+                            rtp_clock_rate_hz: plugin.descriptor().rtp_clock_rate_hz,
                         };
-                        (SessionCodec::G711(k), label.to_string())
+                        (sc, c.encoding_name.to_ascii_uppercase(), Some(plugin))
                     })
                 }
             })
-            .unwrap_or((SessionCodec::G711(G711Kind::Pcmu), "PCMU".to_string()));
+            .unwrap_or((SessionCodec::G711(G711Kind::Pcmu), "PCMU".to_string(), None));
         let target_clock = session_codec.clock_rate_hz();
         let dtmf_pt = negotiated_codecs
             .iter()
@@ -342,10 +362,10 @@ impl WorkerCtx {
             .unwrap_or(101);
 
         let port_rate = self.audio_port.sample_rate_hz();
-        let frame_samples = if port_rate == 48_000 {
-            PCM_FRAME_SAMPLES_48KHZ_20MS
-        } else {
-            PCM_FRAME_SAMPLES_8KHZ_20MS
+        let frame_samples = match port_rate {
+            48_000 => PCM_FRAME_SAMPLES_48KHZ_20MS,
+            16_000 => PCM_FRAME_SAMPLES_16KHZ_20MS,
+            _ => PCM_FRAME_SAMPLES_8KHZ_20MS,
         };
         self.ssrc_counter = self.ssrc_counter.wrapping_add(1);
         let jb_cfg = JitterBufferConfig {
@@ -356,9 +376,12 @@ impl WorkerCtx {
             Ok(native) => Box::new(native),
             Err(_) => Box::new(BuiltInOpusCodec::new()),
         };
-        let session =
+        let mut session =
             MediaSession::new_with_session_codec(session_codec, dtmf_pt, self.ssrc_counter, jb_cfg)
                 .with_opus_backend(opus_backend);
+        if let Some(plugin) = custom_plugin {
+            session = session.with_codec_plugin(plugin);
+        }
         self.active_media.insert(
             call_id.to_string(),
             CallMediaRuntime {
@@ -782,6 +805,7 @@ fn run_worker(
         local_sip_addr,
         sip_socket,
         ua: UserAgent::new(config.ua_config),
+        codec_registry: config.codec_registry,
         audio_port,
         recorder: FlightRecorder::new(now, config.telemetry_capacity),
         pending_rtp_sockets: HashMap::new(),

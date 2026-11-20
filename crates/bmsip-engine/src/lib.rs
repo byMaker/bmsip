@@ -13,7 +13,7 @@ pub mod telemetry;
 
 pub use audio::{
     AudioPort, NullAudioPort, PcmAudioHandle, PcmQueueAudioPort, WavAudioHandle, WavAudioPort,
-    PCM_FRAME_SAMPLES_48KHZ_20MS, PCM_FRAME_SAMPLES_8KHZ_20MS,
+    PCM_FRAME_SAMPLES_16KHZ_20MS, PCM_FRAME_SAMPLES_48KHZ_20MS, PCM_FRAME_SAMPLES_8KHZ_20MS,
 };
 pub use bmsip_core;
 pub use bmsip_media;
