@@ -2,7 +2,7 @@
 
 Embeddable, cross-platform SIP library written in Rust for **Linux**, **iOS**, and **Android**.
 
-- **Current Version:** `0.1.0` ([CHANGELOG.md](./CHANGELOG.md))
+- **Current Version:** `0.2.0` ([CHANGELOG.md](./CHANGELOG.md))
 - **Architecture Specification:** [ARCHITECTURE.md](./ARCHITECTURE.md)
 - **License:** `AGPL-3.0-only` ([LICENSE](./LICENSE) · [NOTICE](./NOTICE) · commercial licensing: [bymaker.com](https://bymaker.com))
 
@@ -21,10 +21,10 @@ crates/
 
 All Rust tooling (`rustc`, `cargo`, `rustfmt`, `clippy`) runs inside the Docker Compose `dev` container.
 
-Start the dev container:
+Start the dev container and local Asterisk test PBX:
 
 ```bash
-docker compose up -d --build dev
+docker compose up -d --build dev asterisk
 ```
 
 Run formatting check, linter, and all workspace tests:
@@ -34,3 +34,4 @@ docker compose exec -T dev cargo fmt --all -- --check
 docker compose exec -T dev cargo clippy --workspace --all-targets -- -D warnings
 docker compose exec -T dev cargo test --workspace
 ```
+

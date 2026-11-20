@@ -5,6 +5,17 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.2.0] - 2026-11-20
+
+### Added
+- `bmsip-core::dialog` Sans-I/O User Agent (`UserAgent`), Registration FSM (RFC 3261 §10), and Invite Dialog FSM (RFC 3261 §9, §12–15):
+  - `REGISTER` / `unregister` with `401`/`407` Digest challenge retry and automatic 80%-interval registration refresh.
+  - `dial`, `ring`, `answer`, `hangup`, `reinvite`, and `notify_network_changed` (`Wi-Fi <-> LTE` handover triggering registration refresh and in-dialog `re-INVITE`).
+  - RFC 3261 §9.1 deferred `CANCEL` ordering (queues `CANCEL` if called prior to `1xx`) and `200 OK` vs `CANCEL` race handling (`ACK` + `BYE`).
+  - UAS `200 OK` retransmission timer until `ACK` arrives (RFC 3261 §13.3.1.4) and automatic `200 OK` responses to `OPTIONS` keepalives.
+- Deterministic multi-party dialog simulation test suite (`crates/bmsip-core/tests/dialog_simulation.rs`).
+- Docker Compose `asterisk` (Asterisk 22 `chan_pjsip`) test PBX service in `.devcontainer/asterisk/` and live UDP integration test (`crates/bmsip-engine/tests/asterisk_integration.rs`).
+
 ## [0.1.0] - 2026-11-20
 
 ### Added
@@ -15,3 +26,4 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   - Pure-Rust MD5 (RFC 1321) and SHA-256 (FIPS 180-4) Digest Authentication (`MD5`, `MD5-sess`, `SHA-256`, `SHA-256-sess`, `qop=auth` and legacy modes).
   - RFC 3261 Section 17 transaction state machines (`ClientInviteTransaction`, `ClientNonInviteTransaction`, `ServerInviteTransaction`, `ServerNonInviteTransaction`) with Timers A–K and auto-`ACK` on `3xx–6xx`.
   - Deterministic Sans-I/O `VirtualNetwork` simulator and integration tests covering packet loss, duplication, Digest auth, `486 Busy Here`, `200 OK` + SDP negotiation, and timer timeouts.
+

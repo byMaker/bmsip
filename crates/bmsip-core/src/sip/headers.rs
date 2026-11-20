@@ -403,6 +403,15 @@ impl NameAddr {
 
         Ok(addr)
     }
+
+    /// Parses comma-separated address specifications from a single header value.
+    pub fn parse_list(input: &str) -> Result<Vec<Self>, SipError> {
+        split_comma_respecting_quotes_and_angles(input)
+            .into_iter()
+            .filter(|item| !item.trim().is_empty())
+            .map(Self::parse)
+            .collect()
+    }
 }
 
 impl fmt::Display for NameAddr {

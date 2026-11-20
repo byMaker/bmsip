@@ -12,10 +12,17 @@ services:
     networks:
       - bmsip-net
 
+  asterisk:
+    build:
+      context: .devcontainer/asterisk
+      dockerfile: Dockerfile
+    hostname: asterisk
+    networks:
+      - bmsip-net
+
 volumes:
   bmsip-cargo-cache:
 
 networks:
   bmsip-net:
     driver: bridge
-

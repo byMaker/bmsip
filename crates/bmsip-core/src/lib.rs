@@ -5,6 +5,7 @@
 //! RFC_REFS: RFC 3261, RFC 3264, RFC 3581, RFC 4566, RFC 2617, RFC 7616.
 
 pub mod auth;
+pub mod dialog;
 pub mod error;
 pub mod sdp;
 pub mod sim;
