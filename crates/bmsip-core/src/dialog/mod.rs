@@ -854,7 +854,7 @@ impl UserAgent {
         req.headers.set("Expires", expires.to_string());
         req.headers
             .set("Allow", "INVITE, ACK, CANCEL, BYE, OPTIONS");
-        req.headers.set("User-Agent", "bmsip/0.3.0");
+        req.headers.set("User-Agent", "bmsip/0.4.0");
         if let Some((hdr_name, hdr_val)) = auth_header {
             req.headers.set(hdr_name, hdr_val);
         }
@@ -899,7 +899,7 @@ impl UserAgent {
             .set("Contact", NameAddr::new(config.contact_uri()).to_string());
         req.headers
             .set("Allow", "INVITE, ACK, CANCEL, BYE, OPTIONS");
-        req.headers.set("User-Agent", "bmsip/0.3.0");
+        req.headers.set("User-Agent", "bmsip/0.4.0");
         if let Some((hdr_name, hdr_val)) = auth_header {
             req.headers.set(hdr_name, hdr_val);
         }

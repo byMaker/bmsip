@@ -5,6 +5,17 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.4.0] - 2026-11-20
+
+### Added
+- `bmsip-engine` lock-safe, multi-instance SIP runtime (`#![forbid(unsafe_code)]`):
+  - Non-blocking `EngineCommand` / `EngineEvent` runtime (`SipEngine`) wiring `bmsip-core::dialog::UserAgent` and `bmsip-media::MediaSession` over UDP SIP and RTP sockets with 20 ms audio pacing.
+  - Hardware-agnostic `AudioPort` trait with `NullAudioPort`, `WavAudioPort`/`WavAudioHandle`, and `PcmQueueAudioPort`/`PcmAudioHandle`.
+  - Mobile lifecycle primitives (`NetworkChanged`, `Suspend`, `Resume`).
+  - Bounded `FlightRecorder` ("black box") capturing sanitized SIP wire summaries, FSM transitions, DTMF digits, and RTP statistics with dependency-free JSON export on call termination or `ExportTelemetry`.
+- `bmsip-cli` Linux CLI SIP softphone supporting `call` execution with tone/WAV TX, RX WAV recording, DTMF sending, and black-box JSON telemetry output.
+- Live Asterisk multi-engine integration test (`live_asterisk_two_engines_call_audio_dtmf_lifecycle_and_blackbox`).
+
 ## [0.3.0] - 2026-11-20
 
 ### Added

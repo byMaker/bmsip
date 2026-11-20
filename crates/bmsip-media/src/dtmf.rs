@@ -97,6 +97,28 @@ impl DtmfDigit {
             _ => Err(MediaError::InvalidDtmf(format!("invalid DTMF char '{ch}'"))),
         }
     }
+
+    /// Formats the digit as a single character (`'0'..='9'`, `'*'`, `'#'`, `'A'..='D'`).
+    pub fn to_char(self) -> char {
+        match self {
+            Self::D0 => '0',
+            Self::D1 => '1',
+            Self::D2 => '2',
+            Self::D3 => '3',
+            Self::D4 => '4',
+            Self::D5 => '5',
+            Self::D6 => '6',
+            Self::D7 => '7',
+            Self::D8 => '8',
+            Self::D9 => '9',
+            Self::Star => '*',
+            Self::Pound => '#',
+            Self::A => 'A',
+            Self::B => 'B',
+            Self::C => 'C',
+            Self::D => 'D',
+        }
+    }
 }
 
 /// 4-byte RFC 4733 RTP payload for `telephone-event`.

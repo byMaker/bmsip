@@ -1,11 +1,12 @@
-use std::net::{IpAddr, SocketAddr, ToSocketAddrs, UdpSocket};
+use std::net::{IpAddr, Ipv4Addr, SocketAddr, ToSocketAddrs, UdpSocket};
 use std::sync::Mutex;
 use std::thread;
 use std::time::{Duration, Instant};
 
 use bmsip_core::dialog::{CallState, RegistrationState, UaConfig, UaEvent, UserAgent};
 use bmsip_core::sip::SipUri;
-use bmsip_media::{G711Kind, JitterBufferConfig, MediaSession, PlayoutFrame, WavPcm16};
+use bmsip_engine::{EngineCommand, EngineConfig, EngineEvent, SipEngine, WavAudioPort};
+use bmsip_media::{DtmfDigit, G711Kind, JitterBufferConfig, MediaSession, PlayoutFrame, WavPcm16};
 
 static ASTERISK_TEST_MUTEX: Mutex<()> = Mutex::new(());
 
@@ -557,4 +558,247 @@ fn live_asterisk_rtp_g711_audio_echo_and_wav_roundtrip() {
         thread::sleep(Duration::from_millis(10));
     }
     assert_eq!(ua.registration_state(), &RegistrationState::Unregistered);
+}
+
+fn wait_for_engine_event<F>(
+    engine: &SipEngine,
+    timeout: Duration,
+    mut pred: F,
+) -> Option<EngineEvent>
+where
+    F: FnMut(&EngineEvent) -> bool,
+{
+    let deadline = Instant::now() + timeout;
+    while Instant::now() < deadline {
+        if let Some(ev) = engine.recv_event_timeout(Duration::from_millis(50)) {
+            if pred(&ev) {
+                return Some(ev);
+            }
+        }
+    }
+    None
+}
+
+#[test]
+fn live_asterisk_two_engines_call_audio_dtmf_lifecycle_and_blackbox() {
+    let _guard = ASTERISK_TEST_MUTEX
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
+    let asterisk_addr = resolve_asterisk();
+    let registrar = SipUri::parse("sip:asterisk:5060").unwrap();
+
+    // Engine 1001 streams a 400 Hz tone via WavAudioPort.
+    let tone_1001 = WavPcm16::generate_sine_wave(8000, 400, 1200, 12000);
+    let (port_1001, _handle_1001) = WavAudioPort::new(tone_1001, true);
+    let eng_1001 = SipEngine::spawn(
+        EngineConfig::new(
+            UaConfig::new(
+                "1001",
+                "secret1001",
+                "asterisk",
+                registrar.clone(),
+                "0.0.0.0",
+                0,
+            ),
+            asterisk_addr,
+            IpAddr::V4(Ipv4Addr::UNSPECIFIED),
+            0,
+        ),
+        Box::new(port_1001),
+    )
+    .unwrap();
+
+    // Engine 1002 records incoming audio from 1001 via WavAudioPort.
+    let silence_1002 = WavPcm16::new(8000, vec![0; 160]);
+    let (port_1002, handle_1002) = WavAudioPort::new(silence_1002, true);
+    let eng_1002 = SipEngine::spawn(
+        EngineConfig::new(
+            UaConfig::new("1002", "secret1002", "asterisk", registrar, "0.0.0.0", 0),
+            asterisk_addr,
+            IpAddr::V4(Ipv4Addr::UNSPECIFIED),
+            0,
+        ),
+        Box::new(port_1002),
+    )
+    .unwrap();
+
+    // 1. Register both independent SipEngine instances.
+    eng_1001.send_command(EngineCommand::Register).unwrap();
+    eng_1002.send_command(EngineCommand::Register).unwrap();
+
+    assert!(
+        wait_for_engine_event(&eng_1001, Duration::from_secs(10), |e| matches!(
+            e,
+            EngineEvent::RegistrationChanged(RegistrationState::Registered { .. })
+        ))
+        .is_some()
+    );
+    assert!(
+        wait_for_engine_event(&eng_1002, Duration::from_secs(10), |e| matches!(
+            e,
+            EngineEvent::RegistrationChanged(RegistrationState::Registered { .. })
+        ))
+        .is_some()
+    );
+
+    // 2. 1001 dials 1002 through Asterisk.
+    eng_1001
+        .send_command(EngineCommand::Dial {
+            target_uri: SipUri::parse("sip:1002@asterisk:5060").unwrap(),
+        })
+        .unwrap();
+
+    let call_id_1001 = match wait_for_engine_event(&eng_1001, Duration::from_secs(5), |e| {
+        matches!(e, EngineEvent::OutboundCallStarted { .. })
+    })
+    .expect("OutboundCallStarted")
+    {
+        EngineEvent::OutboundCallStarted { call_id } => call_id,
+        _ => unreachable!(),
+    };
+
+    let call_id_1002 = match wait_for_engine_event(&eng_1002, Duration::from_secs(8), |e| {
+        matches!(e, EngineEvent::IncomingCall { .. })
+    })
+    .expect("IncomingCall on 1002")
+    {
+        EngineEvent::IncomingCall { call_id, .. } => call_id,
+        _ => unreachable!(),
+    };
+
+    eng_1002
+        .send_command(EngineCommand::Ring {
+            call_id: call_id_1002.clone(),
+        })
+        .unwrap();
+    eng_1002
+        .send_command(EngineCommand::Answer {
+            call_id: call_id_1002.clone(),
+        })
+        .unwrap();
+
+    assert!(
+        wait_for_engine_event(&eng_1001, Duration::from_secs(8), |e| matches!(
+            e,
+            EngineEvent::CallEstablished { .. }
+        ))
+        .is_some()
+    );
+    assert!(
+        wait_for_engine_event(&eng_1002, Duration::from_secs(8), |e| matches!(
+            e,
+            EngineEvent::CallEstablished { .. }
+        ))
+        .is_some()
+    );
+
+    // 3. Exchange live RTP audio for ~350 ms and transmit DTMF '5'.
+    eng_1001
+        .send_command(EngineCommand::SendDtmf {
+            call_id: call_id_1001.clone(),
+            digit: DtmfDigit::D5,
+        })
+        .unwrap();
+    thread::sleep(Duration::from_millis(380));
+
+    // 4. Hang up and inspect black-box telemetry JSON + recorded audio.
+    eng_1001
+        .send_command(EngineCommand::Hangup {
+            call_id: call_id_1001.clone(),
+        })
+        .unwrap();
+
+    let bb_1001 = match wait_for_engine_event(&eng_1001, Duration::from_secs(8), |e| {
+        matches!(e, EngineEvent::CallTerminated { .. })
+    })
+    .expect("CallTerminated 1001")
+    {
+        EngineEvent::CallTerminated { black_box_json, .. } => black_box_json,
+        _ => unreachable!(),
+    };
+
+    let bb_1002 = match wait_for_engine_event(&eng_1002, Duration::from_secs(8), |e| {
+        matches!(e, EngineEvent::CallTerminated { .. })
+    })
+    .expect("CallTerminated 1002")
+    {
+        EngineEvent::CallTerminated { black_box_json, .. } => black_box_json,
+        _ => unreachable!(),
+    };
+
+    for json in [&bb_1001, &bb_1002] {
+        assert!(json.contains("\"call_id\""));
+        assert!(json.contains("\"rtp_packets_sent\""));
+        assert!(json.contains("\"rtp_packets_received\""));
+        assert!(json.contains("\"events\""));
+    }
+
+    let recorded_1002 = handle_1002.recorded_wav();
+    assert!(
+        recorded_1002.rms_energy() > 1000,
+        "expected recorded RMS > 1000 on 1002, got {}",
+        recorded_1002.rms_energy()
+    );
+
+    // 5. Exercise Suspend / Resume lifecycle on 1001.
+    eng_1001.send_command(EngineCommand::Suspend).unwrap();
+    assert!(
+        wait_for_engine_event(&eng_1001, Duration::from_secs(3), |e| matches!(
+            e,
+            EngineEvent::Suspended
+        ))
+        .is_some()
+    );
+
+    eng_1001.send_command(EngineCommand::Resume).unwrap();
+    assert!(
+        wait_for_engine_event(&eng_1001, Duration::from_secs(3), |e| matches!(
+            e,
+            EngineEvent::Resumed { .. }
+        ))
+        .is_some()
+    );
+    assert!(
+        wait_for_engine_event(&eng_1001, Duration::from_secs(6), |e| matches!(
+            e,
+            EngineEvent::RegistrationChanged(RegistrationState::Registered { .. })
+        ))
+        .is_some()
+    );
+
+    // 6. Cleanly unregister and shut down both engines.
+    eng_1001.send_command(EngineCommand::Unregister).unwrap();
+    eng_1002.send_command(EngineCommand::Unregister).unwrap();
+    let _ = wait_for_engine_event(&eng_1001, Duration::from_secs(4), |e| {
+        matches!(
+            e,
+            EngineEvent::RegistrationChanged(RegistrationState::Unregistered)
+        )
+    });
+    let _ = wait_for_engine_event(&eng_1002, Duration::from_secs(4), |e| {
+        matches!(
+            e,
+            EngineEvent::RegistrationChanged(RegistrationState::Unregistered)
+        )
+    });
+
+    eng_1001.send_command(EngineCommand::Shutdown).unwrap();
+    eng_1002.send_command(EngineCommand::Shutdown).unwrap();
+    assert!(
+        wait_for_engine_event(&eng_1001, Duration::from_secs(3), |e| matches!(
+            e,
+            EngineEvent::Stopped
+        ))
+        .is_some()
+    );
+    assert!(
+        wait_for_engine_event(&eng_1002, Duration::from_secs(3), |e| matches!(
+            e,
+            EngineEvent::Stopped
+        ))
+        .is_some()
+    );
+
+    eng_1001.shutdown().unwrap();
+    eng_1002.shutdown().unwrap();
 }
