@@ -1,0 +1,10 @@
+[package]
+name = "bmsip-cli"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Console SIP phone and Linux test harness for bmsip"
+
+[dependencies]
+bmsip-engine = { path = "../bmsip-engine" }
+

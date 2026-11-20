@@ -1,0 +1,9 @@
+[package]
+name = "bmsip-core"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Sans-I/O SIP, SDP, Digest Auth, and RFC 3261 transaction core"
+
+[dependencies]
+

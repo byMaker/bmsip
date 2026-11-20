@@ -1,0 +1,10 @@
+[package]
+name = "bmsip-ffi"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Cross-platform FFI facade (iOS, Android, Linux) for bmsip"
+
+[dependencies]
+bmsip-engine = { path = "../bmsip-engine" }
+

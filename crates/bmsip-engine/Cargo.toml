@@ -1,0 +1,11 @@
+[package]
+name = "bmsip-engine"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Lock-safe SIP runtime connecting bmsip-core and bmsip-media with OS I/O"
+
+[dependencies]
+bmsip-core = { path = "../bmsip-core" }
+bmsip-media = { path = "../bmsip-media" }
+

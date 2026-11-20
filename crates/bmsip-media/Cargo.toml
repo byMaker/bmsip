@@ -1,0 +1,10 @@
+[package]
+name = "bmsip-media"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Hardware-independent RTP/RTCP, jitter buffer, and codec layer"
+
+[dependencies]
+bmsip-core = { path = "../bmsip-core" }
+
