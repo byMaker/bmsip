@@ -33,10 +33,10 @@ This document describes `bmsip`'s audio pipeline (`bmsip-media` and `bmsip-engin
 
 ## 2. RFC 4733 DTMF Telephone-Event Handling
 
-- **Dual Clock Rates:** `RtpCodec::telephone_event(101)` (`8000 Hz`, paired with G.711/G.722) and `RtpCodec::telephone_event_48k(102)` (`48000 Hz`, paired with Opus for strict servers like FreeSWITCH `mod_sofia`).
-- `SipEngine::on_call_established` automatically selects the negotiated `telephone-event` payload type matching the active codec's RTP clock rate.
+- **Dual Clock Rates & Duration Scaling:** `RtpCodec::telephone_event(101)` (`8000 Hz`, paired with G.711/G.722) and `RtpCodec::telephone_event_48k(102)` (`48000 Hz`, paired with Opus for strict servers like FreeSWITCH `mod_sofia`).
+- `SipEngine::on_call_established` (and `CallMediaUpdated` on `re-INVITE`) automatically selects both the matching payload type and exact RTP clock rate (`MediaSession::with_dtmf_clock_rate`), scaling 100 ms RFC 4733 tone durations to `800` ticks at `8000 Hz` or `4800` ticks at `48000 Hz`.
 - **Paced Transmission:** `DtmfSender` generates the 20 ms RFC 4733 event progression + 3 redundant end (`E=1`) packets, which `SipEngine::pump_media_tick` paces at 1 packet per 20 ms frame after the initial audio packets establish SSRC/clock baseline.
-- **Deduplicating Reception:** `DtmfDetector` emits `EngineEvent::DtmfReceived { call_id, digit }` once per key press even when multiple end packets arrive.
+- **Deduplicating Reception:** `DtmfDetector` emits `EngineEvent::DtmfReceived { call_id, digit }` once per key press and resets automatically if the remote RTP SSRC changes mid-call.
 
 ---
 
@@ -50,11 +50,11 @@ This document describes `bmsip`'s audio pipeline (`bmsip-media` and `bmsip-engin
 - `capture_frame_20ms(&mut self) -> Vec<i16>`: non-blocking mic/WAV frame supply.
 - `playout_20ms(&mut self, samples: &[i16])`: non-blocking decoded speaker/WAV frame sink.
 
-Built-in adapters: `NullAudioPort`, `WavAudioPort`/`WavAudioHandle` (supports `8`/`16`/`48` kHz WAV clips), `PcmQueueAudioPort`/`PcmAudioHandle`, and `LiveLinuxAudioPort` (`bmsip-cli`).
+Built-in adapters: `NullAudioPort`, `WavAudioPort`/`WavAudioHandle` (supports `8`/`16`/`48` kHz WAV clips with optional/capped RX recording via `new_with_recording` and `with_max_recorded_samples`), `PcmQueueAudioPort`/`PcmAudioHandle` (configurable `8`/`16`/`48` kHz via `new_with_sample_rate`), and `LiveLinuxAudioPort` (`bmsip-cli`).
 
 ### 3.2 `AdaptiveJitterBuffer` (`bmsip-media::jitter`)
 
-- **Out-of-Order Reordering:** Handles 16-bit RTP sequence rollover (RFC 3550 §5.1).
+- **Out-of-Order Reordering & Mid-Call SSRC Changes:** Handles 16-bit RTP sequence rollover (RFC 3550 §5.1) and automatically resets sequence/jitter state when the remote RTP SSRC changes mid-call (e.g., PBX bridge or transfer).
 - **Dynamic Depth Adaptation:** Scales buffered target depth between `[min_depth_frames, max_depth_frames]` using RFC 3550 jitter estimates (`scaled_jitter` adjusted when `AudioPort` sample rate differs from RTP clock rate).
 - **Decayed PLC & Boundary Crossfade:** Missing frames replay an attenuated copy (`7/8` exponential decay) of the last good frame; normal and concealed boundaries crossfade smoothly over up to 24 samples from `last_emitted_sample` to prevent audible phase clicks.
 

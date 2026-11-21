@@ -3,17 +3,19 @@
 //! RFC_REFS: RFC 3261, RFC 3550, RFC 4733.
 
 use std::collections::{HashMap, VecDeque};
-use std::net::{IpAddr, SocketAddr, UdpSocket};
+use std::net::{IpAddr, SocketAddr, ToSocketAddrs, UdpSocket};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Condvar, Mutex};
 use std::thread::{self, JoinHandle};
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use bmsip_core::dialog::{CallState, RegistrationState, UaEvent, UserAgent};
-use bmsip_core::sip::SipMessage;
+use bmsip_core::sdp::RtpCodec;
+use bmsip_core::sip::{Method, NameAddr, SipMessage, SipUri};
 use bmsip_media::{
-    BuiltInOpusCodec, CodecRegistry, G711Kind, JitterBufferConfig, MediaSession, OpusCodecBackend,
-    SessionCodec, G722_PAYLOAD_TYPE, PCM_FRAME_SAMPLES_16KHZ_20MS, PCM_FRAME_SAMPLES_48KHZ_20MS,
-    PCM_FRAME_SAMPLES_8KHZ_20MS,
+    AudioCodecPlugin, BuiltInOpusCodec, CodecRegistry, G711Kind, JitterBufferConfig, MediaSession,
+    OpusCodecBackend, SessionCodec, G722_PAYLOAD_TYPE, PCM_FRAME_SAMPLES_16KHZ_20MS,
+    PCM_FRAME_SAMPLES_48KHZ_20MS, PCM_FRAME_SAMPLES_8KHZ_20MS,
 };
 
 use crate::audio::AudioPort;
@@ -26,6 +28,29 @@ const MEDIA_TICK_MS: u64 = 20;
 const WORKER_ACTIVE_POLL_MS: u64 = 5;
 const WORKER_IDLE_POLL_MS: u64 = 20;
 const RTCP_REPORT_INTERVAL_MS: u64 = 5_000;
+const MAX_TRACKED_SIP_ROUTES: usize = 512;
+
+fn generate_instance_seed(local_port: u16) -> u64 {
+    static INSTANCE_SEQ: AtomicU64 = AtomicU64::new(1);
+    let seq = INSTANCE_SEQ.fetch_add(1, Ordering::Relaxed);
+    let nanos = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_nanos() as u64)
+        .unwrap_or(0);
+    let pid = u64::from(std::process::id());
+    let mut z = nanos
+        .wrapping_add(pid << 32)
+        .wrapping_add(u64::from(local_port) << 16)
+        .wrapping_add(seq.wrapping_mul(0x9e37_79b9_7f4a_7c15));
+    z = (z ^ (z >> 30)).wrapping_mul(0xbf58_476d_1ce4_e5b9);
+    z = (z ^ (z >> 27)).wrapping_mul(0x94d0_49bb_1331_11eb);
+    let mixed = z ^ (z >> 31);
+    if mixed == 0 {
+        1
+    } else {
+        mixed
+    }
+}
 
 struct CallMediaRuntime {
     rtp_socket: UdpSocket,
@@ -66,6 +91,9 @@ impl SipEngine {
 
         config.ua_config.local_host = reachable_ip.to_string();
         config.ua_config.local_sip_port = actual_port;
+        if config.ua_config.instance_seed == 0 {
+            config.ua_config.instance_seed = generate_instance_seed(actual_port);
+        }
 
         let shared = Arc::new(SharedState {
             commands: Mutex::new(VecDeque::new()),
@@ -163,6 +191,10 @@ struct WorkerCtx {
     recorder: FlightRecorder,
     pending_rtp_sockets: HashMap<String, (UdpSocket, Option<UdpSocket>)>,
     active_media: HashMap<String, CallMediaRuntime>,
+    call_order: Vec<String>,
+    inbound_tx_sources: HashMap<(String, String), SocketAddr>,
+    inbound_call_sources: HashMap<String, SocketAddr>,
+    outbound_tx_targets: HashMap<String, SocketAddr>,
     suspended: bool,
     was_registered_before_suspend: bool,
     ssrc_counter: u32,
@@ -177,8 +209,117 @@ impl WorkerCtx {
         }
     }
 
+    fn resolve_sip_destination(&mut self, pkt: &[u8]) -> SocketAddr {
+        let Ok(msg) = SipMessage::parse(pkt) else {
+            return self.registrar_addr;
+        };
+        match msg {
+            SipMessage::Response(resp) => {
+                // RFC 3581 / RFC 3261 §18.2.2: route server responses back to the exact UDP source.
+                if let (Ok(via), Ok(cseq)) = (resp.top_via(), resp.cseq()) {
+                    if let Some(branch) = via.branch.as_deref() {
+                        if let Some(&src) = self
+                            .inbound_tx_sources
+                            .get(&(branch.to_string(), cseq.method.as_str().to_string()))
+                        {
+                            return src;
+                        }
+                    }
+                    if let Ok(cid) = resp.call_id() {
+                        if let Some(&src) = self.inbound_call_sources.get(cid) {
+                            return src;
+                        }
+                    }
+                    if let Some(addr) = resolve_via_response_addr(&via) {
+                        return addr;
+                    }
+                }
+                self.registrar_addr
+            }
+            SipMessage::Request(req) => {
+                if req.method == Method::Register {
+                    return self.registrar_addr;
+                }
+                let via_branch = req.top_via().ok().and_then(|v| v.branch);
+
+                // RFC 3261 §9.1 & §17.1.1.3: CANCEL and hop-by-hop non-2xx ACK reuse the INVITE's Via branch
+                // and MUST go to the exact same next-hop target as that INVITE.
+                if matches!(req.method, Method::Cancel | Method::Ack) {
+                    if let Some(branch) = via_branch.as_deref() {
+                        if let Some(&target) = self.outbound_tx_targets.get(branch) {
+                            return target;
+                        }
+                    }
+                }
+
+                // RFC 3261 §12.2.1.1: if a Route header is present, forward to the topmost Route URI.
+                if let Some(raw_route) = req.headers.get("Route") {
+                    if let Ok(routes) = NameAddr::parse_list(raw_route) {
+                        if let Some(first) = routes.first() {
+                            if let Some(addr) = resolve_sip_uri_addr(&first.uri) {
+                                if req.method == Method::Invite {
+                                    self.record_outbound_tx_target(via_branch, addr);
+                                }
+                                return addr;
+                            }
+                        }
+                    }
+                }
+
+                // In-dialog requests without a Route set (To tag present: 2xx ACK, BYE, re-INVITE)
+                // route directly to the remote Contact (Request-URI) when it carries a concrete IP.
+                let is_in_dialog = req.to().ok().and_then(|t| t.tag).is_some();
+                if is_in_dialog {
+                    if let Some(addr) = resolve_sip_uri_literal_ip(&req.uri) {
+                        if req.method == Method::Invite {
+                            self.record_outbound_tx_target(via_branch, addr);
+                        }
+                        return addr;
+                    }
+                }
+
+                if req.method == Method::Invite {
+                    self.record_outbound_tx_target(via_branch, self.registrar_addr);
+                }
+                self.registrar_addr
+            }
+        }
+    }
+
+    fn record_outbound_tx_target(&mut self, branch: Option<String>, target: SocketAddr) {
+        if let Some(b) = branch {
+            if self.outbound_tx_targets.len() >= MAX_TRACKED_SIP_ROUTES {
+                self.outbound_tx_targets.clear();
+            }
+            self.outbound_tx_targets.insert(b, target);
+        }
+    }
+
+    fn record_inbound_source(&mut self, raw: &[u8], src_addr: SocketAddr) {
+        if let Ok(SipMessage::Request(req)) = SipMessage::parse(raw) {
+            if let Ok(via) = req.top_via() {
+                if let Some(branch) = via.branch {
+                    if self.inbound_tx_sources.len() >= MAX_TRACKED_SIP_ROUTES {
+                        self.inbound_tx_sources.clear();
+                    }
+                    self.inbound_tx_sources
+                        .insert((branch, req.method.as_str().to_string()), src_addr);
+                }
+            }
+            if req.method == Method::Invite {
+                if let Ok(cid) = req.call_id() {
+                    if self.inbound_call_sources.len() >= MAX_TRACKED_SIP_ROUTES {
+                        self.inbound_call_sources.clear();
+                    }
+                    self.inbound_call_sources.insert(cid.to_string(), src_addr);
+                }
+            }
+        }
+    }
+
     fn flush_sip_outbound(&mut self, now: Instant) {
         for pkt in self.ua.poll_transmit() {
+            let dest = self.resolve_sip_destination(&pkt);
             if let Some(summary) = summarize_sip_datagram(&pkt) {
                 self.recorder.record(
                     now,
@@ -187,8 +328,8 @@ impl WorkerCtx {
                     summary.1,
                 );
             }
-            if let Err(err) = self.sip_socket.send_to(&pkt, self.registrar_addr) {
-                let msg = format!("SIP UDP send failed: {err}");
+            if let Err(err) = self.sip_socket.send_to(&pkt, dest) {
+                let msg = format!("SIP UDP send to {dest} failed: {err}");
                 self.recorder
                     .record(now, TelemetryCategory::Warning, None, msg.clone());
                 self.push_event(EngineEvent::Warning(msg));
@@ -251,20 +392,46 @@ impl WorkerCtx {
                 UaEvent::CallMediaUpdated {
                     call_id,
                     remote_sdp,
+                    negotiated_codecs,
                     ..
                 } => {
                     if let Ok(ip) = remote_sdp.connection_ip.parse::<IpAddr>() {
                         let remote_rtp = SocketAddr::new(ip, remote_sdp.audio_port);
-                        if let Some(media) = self.active_media.get_mut(&call_id) {
+                        let mut updated_codec_label: Option<String> = None;
+                        if !negotiated_codecs.is_empty() {
+                            let (session_codec, codec_name, custom_plugin, dtmf_pt, dtmf_clock) =
+                                self.select_media_codecs(&negotiated_codecs);
+                            if let Some(media) = self.active_media.get_mut(&call_id) {
+                                media.remote_rtp = remote_rtp;
+                                media.remote_rtcp =
+                                    SocketAddr::new(ip, remote_sdp.audio_port.saturating_add(1));
+                                if media.session.codec() != session_codec
+                                    || media.session.dtmf_payload_type() != dtmf_pt
+                                    || media.session.dtmf_clock_rate_hz() != dtmf_clock
+                                {
+                                    media.session.reconfigure_codec(
+                                        session_codec,
+                                        dtmf_pt,
+                                        dtmf_clock,
+                                        custom_plugin,
+                                    );
+                                    updated_codec_label = Some(codec_name);
+                                }
+                            }
+                        } else if let Some(media) = self.active_media.get_mut(&call_id) {
                             media.remote_rtp = remote_rtp;
                             media.remote_rtcp =
                                 SocketAddr::new(ip, remote_sdp.audio_port.saturating_add(1));
                         }
+                        let detail = match updated_codec_label {
+                            Some(c) => format!("media updated codec={c} remote_rtp={remote_rtp}"),
+                            None => format!("media updated remote_rtp={remote_rtp}"),
+                        };
                         self.recorder.record(
                             now,
                             TelemetryCategory::DialogFsm,
                             Some(&call_id),
-                            format!("media updated remote_rtp={remote_rtp}"),
+                            detail,
                         );
                         self.push_event(EngineEvent::CallMediaUpdated {
                             call_id,
@@ -288,36 +455,16 @@ impl WorkerCtx {
         }
     }
 
-    fn on_call_established(
-        &mut self,
-        call_id: &str,
-        remote_sdp: &bmsip_core::sdp::SdpSession,
-        negotiated_codecs: &[bmsip_core::sdp::RtpCodec],
-        now: Instant,
+    fn select_media_codecs(
+        &self,
+        negotiated_codecs: &[RtpCodec],
+    ) -> (
+        SessionCodec,
+        String,
+        Option<Box<dyn AudioCodecPlugin>>,
+        u8,
+        u32,
     ) {
-        let Some((rtp_socket, rtcp_socket)) = self.pending_rtp_sockets.remove(call_id) else {
-            let msg = format!("missing bound RTP socket for established call {call_id}");
-            self.recorder
-                .record(now, TelemetryCategory::Warning, Some(call_id), msg.clone());
-            self.push_event(EngineEvent::Warning(msg));
-            return;
-        };
-
-        let remote_ip: IpAddr = match remote_sdp.connection_ip.parse() {
-            Ok(ip) => ip,
-            Err(err) => {
-                let msg = format!(
-                    "invalid remote SDP IP '{}': {err}",
-                    remote_sdp.connection_ip
-                );
-                self.recorder
-                    .record(now, TelemetryCategory::Warning, Some(call_id), msg.clone());
-                self.push_event(EngineEvent::Warning(msg));
-                return;
-            }
-        };
-        let remote_rtp = SocketAddr::new(remote_ip, remote_sdp.audio_port);
-
         let (session_codec, codec_name, custom_plugin) = negotiated_codecs
             .iter()
             .filter(|c| !c.encoding_name.eq_ignore_ascii_case("telephone-event"))
@@ -357,8 +504,9 @@ impl WorkerCtx {
                 }
             })
             .unwrap_or((SessionCodec::G711(G711Kind::Pcmu), "PCMU".to_string(), None));
+
         let target_clock = session_codec.clock_rate_hz();
-        let dtmf_pt = negotiated_codecs
+        let (dtmf_pt, dtmf_clock_rate_hz) = negotiated_codecs
             .iter()
             .find(|c| {
                 c.encoding_name.eq_ignore_ascii_case("telephone-event")
@@ -369,8 +517,50 @@ impl WorkerCtx {
                     .iter()
                     .find(|c| c.encoding_name.eq_ignore_ascii_case("telephone-event"))
             })
-            .map(|c| c.payload_type)
-            .unwrap_or(101);
+            .map(|c| (c.payload_type, c.clock_rate.max(8_000)))
+            .unwrap_or((101, 8_000));
+
+        (
+            session_codec,
+            codec_name,
+            custom_plugin,
+            dtmf_pt,
+            dtmf_clock_rate_hz,
+        )
+    }
+
+    fn on_call_established(
+        &mut self,
+        call_id: &str,
+        remote_sdp: &bmsip_core::sdp::SdpSession,
+        negotiated_codecs: &[RtpCodec],
+        now: Instant,
+    ) {
+        let Some((rtp_socket, rtcp_socket)) = self.pending_rtp_sockets.remove(call_id) else {
+            let msg = format!("missing bound RTP socket for established call {call_id}");
+            self.recorder
+                .record(now, TelemetryCategory::Warning, Some(call_id), msg.clone());
+            self.push_event(EngineEvent::Warning(msg));
+            return;
+        };
+
+        let remote_ip: IpAddr = match remote_sdp.connection_ip.parse() {
+            Ok(ip) => ip,
+            Err(err) => {
+                let msg = format!(
+                    "invalid remote SDP IP '{}': {err}",
+                    remote_sdp.connection_ip
+                );
+                self.recorder
+                    .record(now, TelemetryCategory::Warning, Some(call_id), msg.clone());
+                self.push_event(EngineEvent::Warning(msg));
+                return;
+            }
+        };
+        let remote_rtp = SocketAddr::new(remote_ip, remote_sdp.audio_port);
+
+        let (session_codec, codec_name, custom_plugin, dtmf_pt, dtmf_clock_rate_hz) =
+            self.select_media_codecs(negotiated_codecs);
 
         let port_rate = self.audio_port.sample_rate_hz();
         let frame_samples = match port_rate {
@@ -389,6 +579,7 @@ impl WorkerCtx {
         };
         let mut session =
             MediaSession::new_with_session_codec(session_codec, dtmf_pt, self.ssrc_counter, jb_cfg)
+                .with_dtmf_clock_rate(dtmf_clock_rate_hz)
                 .with_opus_backend(opus_backend);
         if let Some(plugin) = custom_plugin {
             session = session.with_codec_plugin(plugin);
@@ -408,6 +599,9 @@ impl WorkerCtx {
                 next_rtcp_at: now + Duration::from_millis(RTCP_REPORT_INTERVAL_MS),
             },
         );
+        if !self.call_order.iter().any(|id| id == call_id) {
+            self.call_order.push(call_id.to_string());
+        }
         self.recorder.record(
             now,
             TelemetryCategory::DialogFsm,
@@ -429,6 +623,8 @@ impl WorkerCtx {
         now: Instant,
     ) {
         self.pending_rtp_sockets.remove(call_id);
+        self.inbound_call_sources.remove(call_id);
+        self.call_order.retain(|id| id != call_id);
         let (sent, rx, lost, jitter) = match self.active_media.remove(call_id) {
             Some(media) => {
                 let stats = media.session.stats();
@@ -568,10 +764,26 @@ impl WorkerCtx {
                     if let Ok(mut g) = self.shared.local_sip_addr.lock() {
                         *g = self.local_sip_addr;
                     }
-                    if let Err(err) =
-                        self.ua
-                            .notify_network_changed(reachable_ip.to_string(), actual_port, now)
-                    {
+                    // Rebind active RTP/RTCP sockets onto the new interface so media survives IP handover.
+                    let mut rebound_rtp_ports = HashMap::new();
+                    let active_ids: Vec<String> = self.active_media.keys().cloned().collect();
+                    for cid in active_ids {
+                        if let Ok((new_rtp, new_rtcp, new_port)) =
+                            bind_rtp_socket(new_bind_ip, reachable_ip)
+                        {
+                            if let Some(media) = self.active_media.get_mut(&cid) {
+                                media.rtp_socket = new_rtp;
+                                media.rtcp_socket = new_rtcp;
+                                rebound_rtp_ports.insert(cid, new_port);
+                            }
+                        }
+                    }
+                    if let Err(err) = self.ua.notify_network_changed_with_rtp_ports(
+                        reachable_ip.to_string(),
+                        actual_port,
+                        &rebound_rtp_ports,
+                        now,
+                    ) {
                         self.emit_cmd_error("network_changed", err);
                     } else {
                         self.recorder.record(
@@ -647,7 +859,8 @@ impl WorkerCtx {
         let mut buf = [0u8; 8192];
         loop {
             match self.sip_socket.recv_from(&mut buf) {
-                Ok((len, _)) => {
+                Ok((len, src_addr)) => {
+                    self.record_inbound_source(&buf[..len], src_addr);
                     if let Some(summary) = summarize_sip_datagram(&buf[..len]) {
                         self.recorder.record(
                             now,
@@ -777,11 +990,12 @@ impl WorkerCtx {
 
         self.pump_rtp_rx(now);
 
-        let call_ids: Vec<String> = self.active_media.keys().cloned().collect();
+        let call_ids = self.call_order.clone();
         let mut stats_updates: Vec<(String, u32, u32, i32, u32)> = Vec::new();
         let mut rtcp_sent_calls: Vec<String> = Vec::new();
+        let mut primary_served = false;
 
-        for (idx, call_id) in call_ids.iter().enumerate() {
+        for call_id in &call_ids {
             let Some(media) = self.active_media.get_mut(call_id) else {
                 continue;
             };
@@ -789,8 +1003,9 @@ impl WorkerCtx {
                 continue;
             }
 
-            // Capture and play out audio frames on the primary active call.
-            if idx == 0 {
+            if !primary_served {
+                primary_served = true;
+                // Capture and play out audio frames on the deterministic primary active call.
                 let tx_pcm = self.audio_port.capture_frame_20ms();
                 if let Ok(pkt) = media.session.encode_pcm_frame(&tx_pcm) {
                     if media.rtp_socket.send_to(&pkt, media.remote_rtp).is_ok() {
@@ -810,6 +1025,18 @@ impl WorkerCtx {
                 }
                 let playout = media.session.pop_playout_frame();
                 self.audio_port.playout_20ms(playout.samples());
+            } else {
+                // Keep secondary active calls synchronized by draining their jitter buffers and DTMF queue.
+                if let Some(dtmf_pkt) = media.session.pop_dtmf_packet() {
+                    if media
+                        .rtp_socket
+                        .send_to(&dtmf_pkt, media.remote_rtp)
+                        .is_ok()
+                    {
+                        media.rtp_packets_sent = media.rtp_packets_sent.saturating_add(1);
+                    }
+                }
+                let _ = media.session.pop_playout_frame();
             }
 
             if let Some(rtcp_sock) = media.rtcp_socket.as_ref() {
@@ -868,6 +1095,10 @@ fn run_worker(
         recorder: FlightRecorder::new(now, config.telemetry_capacity),
         pending_rtp_sockets: HashMap::new(),
         active_media: HashMap::new(),
+        call_order: Vec::new(),
+        inbound_tx_sources: HashMap::new(),
+        inbound_call_sources: HashMap::new(),
+        outbound_tx_targets: HashMap::new(),
         suspended: false,
         was_registered_before_suspend: false,
         ssrc_counter: 0x2000_0000u32.wrapping_add(u32::from(local_sip_addr.port())),
@@ -987,6 +1218,57 @@ fn bind_rtp_socket(
         .and_then(|rtcp_port| UdpSocket::bind((target_ip, rtcp_port)).ok())
         .and_then(|sock| sock.set_nonblocking(true).ok().map(|()| sock));
     Ok((rtp_sock, rtcp_sock, port))
+}
+
+fn resolve_sip_uri_literal_ip(uri: &SipUri) -> Option<SocketAddr> {
+    let host = uri.host.trim_matches(['[', ']']);
+    let ip = host.parse::<IpAddr>().ok()?;
+    if ip.is_unspecified() {
+        return None;
+    }
+    Some(SocketAddr::new(ip, uri.port.unwrap_or(5060)))
+}
+
+fn resolve_sip_uri_addr(uri: &SipUri) -> Option<SocketAddr> {
+    if let Some(addr) = resolve_sip_uri_literal_ip(uri) {
+        return Some(addr);
+    }
+    let port = uri.port.unwrap_or(5060);
+    (uri.host.as_str(), port)
+        .to_socket_addrs()
+        .ok()?
+        .find(|addr| !addr.ip().is_unspecified())
+}
+
+fn resolve_via_response_addr(via: &bmsip_core::sip::Via) -> Option<SocketAddr> {
+    let sent_host_port = via.sent_by.trim();
+    let (sent_host, sent_port) = if let Some(rest) = sent_host_port.strip_prefix('[') {
+        if let Some((ip_part, tail)) = rest.split_once(']') {
+            let port = tail
+                .strip_prefix(':')
+                .and_then(|p| p.parse::<u16>().ok())
+                .unwrap_or(5060);
+            (ip_part, port)
+        } else {
+            (sent_host_port, 5060)
+        }
+    } else if let Some((h, p)) = sent_host_port.rsplit_once(':') {
+        if let Ok(port) = p.parse::<u16>() {
+            (h, port)
+        } else {
+            (sent_host_port, 5060)
+        }
+    } else {
+        (sent_host_port, 5060)
+    };
+
+    let ip_str = via.received.as_deref().unwrap_or(sent_host);
+    let ip = ip_str.trim_matches(['[', ']']).parse::<IpAddr>().ok()?;
+    if ip.is_unspecified() {
+        return None;
+    }
+    let port = via.rport.flatten().unwrap_or(sent_port);
+    Some(SocketAddr::new(ip, port))
 }
 
 fn summarize_sip_datagram(raw: &[u8]) -> Option<(Option<String>, String)> {

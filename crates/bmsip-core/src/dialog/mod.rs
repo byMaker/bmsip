@@ -12,6 +12,7 @@ use crate::sip::{CSeq, Method, NameAddr, SipMessage, SipRequest, SipResponse, Si
 use crate::transaction::{RfcTimers, TransactionEvent, TransactionId, TransactionManager};
 
 const DEFAULT_USER_AGENT: &str = concat!("bmsip/", env!("CARGO_PKG_VERSION"));
+const MAX_STALE_AUTH_RETRIES: u8 = 3;
 
 /// SIP account registration lifecycle state (RFC 3261 Section 10).
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -71,6 +72,9 @@ pub struct UaConfig {
     pub expires_secs: u32,
     pub supported_codecs: Vec<RtpCodec>,
     pub timers: RfcTimers,
+    /// Optional per-instance entropy seed mixed into Call-IDs, tags, branches, and cnonces
+    /// to prevent collisions across process restarts on fixed ports while keeping Sans-I/O determinism (`0` = deterministic default).
+    pub instance_seed: u64,
 }
 
 impl UaConfig {
@@ -98,7 +102,14 @@ impl UaConfig {
                 RtpCodec::telephone_event(101),
             ],
             timers: RfcTimers::default(),
+            instance_seed: 0,
         }
+    }
+
+    /// Sets an explicit instance seed for unique Call-ID, tag, branch, and Digest `cnonce` generation across restarts.
+    pub fn with_instance_seed(mut self, seed: u64) -> Self {
+        self.instance_seed = seed;
+        self
     }
 
     fn aor_uri(&self) -> SipUri {
@@ -163,7 +174,7 @@ struct RegisterSession {
     local_tag: String,
     cseq: u32,
     active_tx: Option<TransactionId>,
-    auth_retried: bool,
+    auth_attempts: u8,
     pending_expires: u32,
 }
 
@@ -195,6 +206,7 @@ struct CallSession {
     remote_target: SipUri,
     route_set: Vec<SipUri>,
     local_cseq: u32,
+    remote_cseq: Option<u32>,
     local_rtp_port: u16,
     sdp_session_id: String,
     sdp_version: u64,
@@ -208,8 +220,8 @@ struct CallSession {
     inbound_invite_req: Option<SipRequest>,
     inbound_invite_branch: Option<String>,
     pending_cancel: bool,
-    invite_auth_retried: bool,
-    bye_auth_retried: bool,
+    invite_auth_attempts: u8,
+    bye_auth_attempts: u8,
     last_ack_for_2xx: Option<SipRequest>,
     awaiting_ack: Option<Pending2xxAck>,
 }
@@ -256,8 +268,16 @@ pub struct UserAgent {
 impl UserAgent {
     /// Creates a new [`UserAgent`] initialized in [`RegistrationState::Unregistered`].
     pub fn new(config: UaConfig) -> Self {
-        let reg_call_id = format!("bm-reg-{}@{}", config.local_sip_port, config.local_host);
-        let reg_tag = format!("bm-rtag-{}", config.local_sip_port);
+        let seed_part = if config.instance_seed == 0 {
+            String::new()
+        } else {
+            format!("-{:08x}", (config.instance_seed & 0xffff_ffff) as u32)
+        };
+        let reg_call_id = format!(
+            "bm-reg-{}{seed_part}@{}",
+            config.local_sip_port, config.local_host
+        );
+        let reg_tag = format!("bm-rtag-{}{seed_part}", config.local_sip_port);
         let timers = config.timers;
         Self {
             config,
@@ -268,7 +288,7 @@ impl UserAgent {
                 local_tag: reg_tag,
                 cseq: 0,
                 active_tx: None,
-                auth_retried: false,
+                auth_attempts: 0,
                 pending_expires: 0,
             },
             calls: HashMap::new(),
@@ -305,14 +325,14 @@ impl UserAgent {
 
     /// Initiates or refreshes SIP account `REGISTER` with `config.expires_secs`.
     pub fn register(&mut self, now: Instant) -> Result<(), SipError> {
-        self.start_register_with_expires(self.config.expires_secs, None, false, now)?;
+        self.start_register_with_expires(self.config.expires_secs, None, 0, now)?;
         self.set_registration_state(RegistrationState::Registering);
         Ok(())
     }
 
     /// Initiates SIP de-registration (`REGISTER` with `Expires: 0`).
     pub fn unregister(&mut self, now: Instant) -> Result<(), SipError> {
-        self.start_register_with_expires(0, None, false, now)?;
+        self.start_register_with_expires(0, None, 0, now)?;
         self.set_registration_state(RegistrationState::Unregistering);
         Ok(())
     }
@@ -351,6 +371,7 @@ impl UserAgent {
             remote_target: target_uri,
             route_set: Vec::new(),
             local_cseq: 1,
+            remote_cseq: None,
             local_rtp_port,
             sdp_session_id: sdp_sid,
             sdp_version,
@@ -364,8 +385,8 @@ impl UserAgent {
             inbound_invite_req: None,
             inbound_invite_branch: None,
             pending_cancel: false,
-            invite_auth_retried: false,
-            bye_auth_retried: false,
+            invite_auth_attempts: 0,
+            bye_auth_attempts: 0,
             last_ack_for_2xx: None,
             awaiting_ack: None,
         };
@@ -435,7 +456,7 @@ impl UserAgent {
         local_rtp_port: u16,
         now: Instant,
     ) -> Result<(), SipError> {
-        let (tx_id, req, remote_sdp, local_tag, sdp_sid) = {
+        let (tx_id, req, remote_sdp_opt, local_tag, sdp_sid) = {
             let call = self
                 .calls
                 .get(call_id)
@@ -454,28 +475,39 @@ impl UserAgent {
             let req = call.inbound_invite_req.clone().ok_or_else(|| {
                 SipError::TransactionError("missing inbound INVITE req".to_string())
             })?;
-            let remote_sdp = call.remote_sdp.clone().ok_or_else(|| {
-                SipError::InvalidSdp("inbound INVITE lacked SDP offer".to_string())
-            })?;
             (
                 tx_id,
                 req,
-                remote_sdp,
+                call.remote_sdp.clone(),
                 call.local_tag.clone(),
                 call.sdp_session_id.clone(),
             )
         };
 
-        let (mut answer_sdp, negotiated) = negotiate_offer_answer(
+        let Some(remote_sdp) = remote_sdp_opt else {
+            self.reject_inbound_invite_488(call_id, &tx_id, &req, &local_tag, now);
+            return Err(SipError::InvalidSdp(
+                "inbound INVITE lacked SDP offer".to_string(),
+            ));
+        };
+
+        let (mut answer_sdp, negotiated) = match negotiate_offer_answer(
             &remote_sdp,
             &self.config.supported_codecs,
             &self.config.local_host,
             local_rtp_port,
-        )?;
+        ) {
+            Ok(pair) => pair,
+            Err(err) => {
+                self.reject_inbound_invite_488(call_id, &tx_id, &req, &local_tag, now);
+                return Err(err);
+            }
+        };
         answer_sdp.origin_username = self.config.username.clone();
         answer_sdp.session_id = sdp_sid;
         answer_sdp.session_version = "1".to_string();
 
+        // Note: `SipRequest::create_response` already copies all `Record-Route` headers per RFC 3261 §12.1.1.
         let mut resp = req
             .create_response(200, "OK")?
             .with_body("application/sdp", answer_sdp.to_string().into_bytes());
@@ -489,9 +521,6 @@ impl UserAgent {
         );
         resp.headers
             .set("Allow", "INVITE, ACK, CANCEL, BYE, OPTIONS");
-        for rr in req.headers.get_all("Record-Route") {
-            resp.headers.add("Record-Route", rr);
-        }
 
         let tx_events = self
             .transactions
@@ -603,7 +632,7 @@ impl UserAgent {
             call.local_rtp_port = new_local_rtp_port;
             call.sdp_version += 1;
             call.state = CallState::ReInviting;
-            call.invite_auth_retried = false;
+            call.invite_auth_attempts = 0;
 
             let codecs = if call.negotiated_codecs.is_empty() {
                 self.config.supported_codecs.clone()
@@ -646,6 +675,22 @@ impl UserAgent {
         new_local_sip_port: u16,
         now: Instant,
     ) -> Result<(), SipError> {
+        self.notify_network_changed_with_rtp_ports(
+            new_local_ip,
+            new_local_sip_port,
+            &HashMap::new(),
+            now,
+        )
+    }
+
+    /// Handles a network handover while allowing callers to supply rebound per-call local RTP ports for `re-INVITE` SDP offers.
+    pub fn notify_network_changed_with_rtp_ports(
+        &mut self,
+        new_local_ip: impl Into<String>,
+        new_local_sip_port: u16,
+        rebound_rtp_ports: &HashMap<String, u16>,
+        now: Instant,
+    ) -> Result<(), SipError> {
         let new_ip = new_local_ip.into();
         self.config.local_host = new_ip.clone();
         self.config.local_sip_port = new_local_sip_port;
@@ -661,7 +706,13 @@ impl UserAgent {
             .calls
             .iter()
             .filter(|(_, call)| call.state == CallState::Established)
-            .map(|(id, call)| (id.clone(), call.local_rtp_port))
+            .map(|(id, call)| {
+                let port = rebound_rtp_ports
+                    .get(id)
+                    .copied()
+                    .unwrap_or(call.local_rtp_port);
+                (id.clone(), port)
+            })
             .collect();
 
         for (call_id, rtp_port) in established_calls {
@@ -781,43 +832,92 @@ impl UserAgent {
         val
     }
 
+    fn seed_suffix(&self) -> String {
+        if self.config.instance_seed == 0 {
+            String::new()
+        } else {
+            format!("-{:08x}", (self.config.instance_seed & 0xffff_ffff) as u32)
+        }
+    }
+
     fn next_numeric_id(&mut self) -> String {
         let seq = self.next_seq();
-        format!("{}{}", self.config.local_sip_port, seq)
+        if self.config.instance_seed == 0 {
+            format!("{}{}", self.config.local_sip_port, seq)
+        } else {
+            format!(
+                "{}{}{}",
+                (self.config.instance_seed % 1_000_000),
+                self.config.local_sip_port,
+                seq
+            )
+        }
     }
 
     fn next_call_id(&mut self) -> String {
         let seq = self.next_seq();
+        let suffix = self.seed_suffix();
         format!(
-            "bm-{}-{}@{}",
+            "bm-{}{suffix}-{}@{}",
             self.config.local_sip_port, seq, self.config.local_host
         )
     }
 
     fn next_tag(&mut self) -> String {
         let seq = self.next_seq();
-        format!("bm-tag-{}-{}", self.config.local_sip_port, seq)
+        let suffix = self.seed_suffix();
+        format!("bm-tag-{}{suffix}-{}", self.config.local_sip_port, seq)
     }
 
     fn next_branch(&mut self) -> String {
         let seq = self.next_seq();
-        format!("z9hG4bK-bm-{}-{}", self.config.local_sip_port, seq)
+        let suffix = self.seed_suffix();
+        format!("z9hG4bK-bm-{}{suffix}-{}", self.config.local_sip_port, seq)
     }
 
     fn next_cnonce(&mut self) -> String {
         let seq = self.next_seq();
-        format!("bmcnonce{:04x}{:08x}", self.config.local_sip_port, seq)
+        if self.config.instance_seed == 0 {
+            format!("bmcnonce{:04x}{:08x}", self.config.local_sip_port, seq)
+        } else {
+            format!(
+                "bmcnonce{:08x}{:04x}{:08x}",
+                (self.config.instance_seed & 0xffff_ffff) as u32,
+                self.config.local_sip_port,
+                seq
+            )
+        }
+    }
+
+    fn reject_inbound_invite_488(
+        &mut self,
+        call_id: &str,
+        tx_id: &TransactionId,
+        req: &SipRequest,
+        local_tag: &str,
+        now: Instant,
+    ) {
+        if let Ok(mut resp) = req.create_response(488, "Not Acceptable Here") {
+            if let Ok(mut to) = resp.to() {
+                to.tag = Some(local_tag.to_string());
+                resp.headers.set("To", to.to_string());
+            }
+            if let Ok(events) = self.transactions.send_server_response(tx_id, resp, now) {
+                self.process_transaction_events(events, now);
+            }
+        }
+        self.terminate_call(call_id, Some(488), "Not Acceptable Here".to_string());
     }
 
     fn start_register_with_expires(
         &mut self,
         expires: u32,
         auth_header: Option<(&'static str, String)>,
-        auth_retried: bool,
+        auth_attempts: u8,
         now: Instant,
     ) -> Result<(), SipError> {
         self.reg_session.cseq += 1;
-        self.reg_session.auth_retried = auth_retried;
+        self.reg_session.auth_attempts = auth_attempts;
         self.reg_session.pending_expires = expires;
 
         if let Some(old_tx) = self.reg_session.active_tx.take() {
@@ -1035,7 +1135,11 @@ impl UserAgent {
                 .ok_or_else(|| SipError::TransactionError(format!("unknown call {call_id}")))?;
             call.local_cseq += 1;
             call.state = CallState::Terminating;
-            call.bye_auth_retried = auth_header.is_some();
+            if auth_header.is_some() {
+                call.bye_auth_attempts = call.bye_auth_attempts.saturating_add(1);
+            } else {
+                call.bye_auth_attempts = 0;
+            }
 
             let mut bye = SipRequest::new(Method::Bye, call.remote_target.clone());
             bye.headers.add(
@@ -1157,23 +1261,95 @@ impl UserAgent {
             }
         };
 
-        // Check for in-dialog re-INVITE matching an established call.
+        // Check for in-dialog re-INVITE matching an active call (RFC 3261 §12.2.2 & §14.2).
         if let Some(to_tag) = to.tag.as_deref() {
-            if let Some(existing) = self.calls.get(&call_id) {
-                if existing.local_tag == to_tag && existing.state == CallState::Established {
-                    self.handle_inbound_reinvite(&call_id, tx_id, request, now);
-                    return;
-                }
+            let from_tag = request.from().ok().and_then(|f| f.tag);
+            let req_cseq = request.cseq().ok().map(|c| c.seq);
+
+            enum ReInviteAction {
+                Process,
+                Glare491,
+                OutOfOrder500,
+                NotFound481,
             }
-            if let Ok(resp) = request.create_response(481, "Call/Transaction Does Not Exist") {
-                let _ = self.transactions.send_server_response(&tx_id, resp, now);
+
+            let action = if let Some(existing) = self.calls.get_mut(&call_id) {
+                let remote_tag_matches = match (&existing.remote_tag, &from_tag) {
+                    (Some(expected), Some(actual)) => expected == actual,
+                    (None, _) => true,
+                    (Some(_), None) => false,
+                };
+                if existing.local_tag == to_tag && remote_tag_matches {
+                    if let (Some(rc), Some(prev)) = (req_cseq, existing.remote_cseq) {
+                        if rc <= prev {
+                            ReInviteAction::OutOfOrder500
+                        } else {
+                            existing.remote_cseq = Some(rc);
+                            match existing.state {
+                                CallState::Established => ReInviteAction::Process,
+                                CallState::ReInviting => ReInviteAction::Glare491,
+                                _ => ReInviteAction::NotFound481,
+                            }
+                        }
+                    } else {
+                        if let Some(rc) = req_cseq {
+                            existing.remote_cseq = Some(rc);
+                        }
+                        match existing.state {
+                            CallState::Established => ReInviteAction::Process,
+                            CallState::ReInviting => ReInviteAction::Glare491,
+                            _ => ReInviteAction::NotFound481,
+                        }
+                    }
+                } else {
+                    ReInviteAction::NotFound481
+                }
+            } else {
+                ReInviteAction::NotFound481
+            };
+
+            match action {
+                ReInviteAction::Process => {
+                    self.handle_inbound_reinvite(&call_id, tx_id, request, now);
+                }
+                ReInviteAction::Glare491 => {
+                    if let Ok(resp) = request.create_response(491, "Request Pending") {
+                        if let Ok(events) =
+                            self.transactions.send_server_response(&tx_id, resp, now)
+                        {
+                            self.process_transaction_events(events, now);
+                        }
+                    }
+                }
+                ReInviteAction::OutOfOrder500 => {
+                    if let Ok(resp) = request.create_response(500, "Server Internal Error") {
+                        if let Ok(events) =
+                            self.transactions.send_server_response(&tx_id, resp, now)
+                        {
+                            self.process_transaction_events(events, now);
+                        }
+                    }
+                }
+                ReInviteAction::NotFound481 => {
+                    if let Ok(resp) =
+                        request.create_response(481, "Call/Transaction Does Not Exist")
+                    {
+                        if let Ok(events) =
+                            self.transactions.send_server_response(&tx_id, resp, now)
+                        {
+                            self.process_transaction_events(events, now);
+                        }
+                    }
+                }
             }
             return;
         }
 
         if self.calls.contains_key(&call_id) {
             if let Ok(resp) = request.create_response(482, "Loop Detected") {
-                let _ = self.transactions.send_server_response(&tx_id, resp, now);
+                if let Ok(events) = self.transactions.send_server_response(&tx_id, resp, now) {
+                    self.process_transaction_events(events, now);
+                }
             }
             return;
         }
@@ -1194,6 +1370,7 @@ impl UserAgent {
             }
         };
         let remote_sdp = parse_optional_sdp(&request.body);
+        let remote_cseq = request.cseq().ok().map(|c| c.seq);
         let remote_target = match request.contact() {
             Ok(Some(c)) => c.uri,
             _ => from.uri.clone(),
@@ -1219,6 +1396,7 @@ impl UserAgent {
             remote_target,
             route_set,
             local_cseq: 1,
+            remote_cseq,
             local_rtp_port: 0,
             sdp_session_id: sdp_sid,
             sdp_version: 1,
@@ -1232,8 +1410,8 @@ impl UserAgent {
             inbound_invite_req: Some(request),
             inbound_invite_branch: Some(branch),
             pending_cancel: false,
-            invite_auth_retried: false,
-            bye_auth_retried: false,
+            invite_auth_attempts: 0,
+            bye_auth_attempts: 0,
             last_ack_for_2xx: None,
             awaiting_ack: None,
         };
@@ -1376,20 +1554,69 @@ impl UserAgent {
     fn on_inbound_bye(&mut self, tx_id: TransactionId, request: SipRequest, now: Instant) {
         let call_id = request.call_id().ok().map(str::to_string);
         let to_tag = request.to().ok().and_then(|t| t.tag);
+        let from_tag = request.from().ok().and_then(|f| f.tag);
+        let req_cseq = request.cseq().ok().map(|c| c.seq);
 
-        let matched = call_id.filter(|cid| {
-            self.calls
-                .get(cid)
-                .is_some_and(|c| to_tag.as_deref().is_none_or(|tt| tt == c.local_tag))
-        });
+        enum ByeAction {
+            Accept(String),
+            OutOfOrder500,
+            NotFound481,
+        }
 
-        if let Some(cid) = matched {
-            if let Ok(resp) = request.create_response(200, "OK") {
-                let _ = self.transactions.send_server_response(&tx_id, resp, now);
+        let action = if let Some(cid) = call_id {
+            if let Some(call) = self.calls.get_mut(&cid) {
+                let to_ok = to_tag.as_deref().is_none_or(|tt| tt == call.local_tag);
+                let from_ok = match (&call.remote_tag, &from_tag) {
+                    (Some(expected), Some(actual)) => expected == actual,
+                    _ => true,
+                };
+                if to_ok && from_ok {
+                    if let (Some(rc), Some(prev)) = (req_cseq, call.remote_cseq) {
+                        if rc <= prev {
+                            ByeAction::OutOfOrder500
+                        } else {
+                            call.remote_cseq = Some(rc);
+                            ByeAction::Accept(cid)
+                        }
+                    } else {
+                        if let Some(rc) = req_cseq {
+                            call.remote_cseq = Some(rc);
+                        }
+                        ByeAction::Accept(cid)
+                    }
+                } else {
+                    ByeAction::NotFound481
+                }
+            } else {
+                ByeAction::NotFound481
             }
-            self.terminate_call(&cid, Some(200), "Remote hangup".to_string());
-        } else if let Ok(resp) = request.create_response(481, "Call/Transaction Does Not Exist") {
-            let _ = self.transactions.send_server_response(&tx_id, resp, now);
+        } else {
+            ByeAction::NotFound481
+        };
+
+        match action {
+            ByeAction::Accept(cid) => {
+                if let Ok(resp) = request.create_response(200, "OK") {
+                    if let Ok(events) = self.transactions.send_server_response(&tx_id, resp, now) {
+                        self.process_transaction_events(events, now);
+                    }
+                }
+                self.terminate_call(&cid, Some(200), "Remote hangup".to_string());
+            }
+            ByeAction::OutOfOrder500 => {
+                if let Ok(resp) = request.create_response(500, "Server Internal Error") {
+                    if let Ok(events) = self.transactions.send_server_response(&tx_id, resp, now) {
+                        self.process_transaction_events(events, now);
+                    }
+                }
+            }
+            ByeAction::NotFound481 => {
+                if let Ok(resp) = request.create_response(481, "Call/Transaction Does Not Exist") {
+                    if let Ok(events) = self.transactions.send_server_response(&tx_id, resp, now) {
+                        self.process_transaction_events(events, now);
+                    }
+                }
+            }
         }
     }
 
@@ -1475,17 +1702,18 @@ impl UserAgent {
 
         if (200..300).contains(&code) {
             if self.reg_session.pending_expires == 0 {
-                self.reg_session.auth_retried = false;
+                self.reg_session.auth_attempts = 0;
                 self.set_registration_state(RegistrationState::Unregistered);
                 return;
             }
-            let expires = extract_register_expires(&response)
+            let local_contact = self.config.contact_uri();
+            let expires = extract_register_expires(&response, &local_contact)
                 .unwrap_or(self.reg_session.pending_expires)
                 .max(1);
             let refresh_secs = ((expires as u64) * 4 / 5).max(1);
             let refresh_at = now + Duration::from_secs(refresh_secs);
             let expires_at = now + Duration::from_secs(expires as u64);
-            self.reg_session.auth_retried = false;
+            self.reg_session.auth_attempts = 0;
             self.set_registration_state(RegistrationState::Registered {
                 expires_secs: expires,
                 refresh_at,
@@ -1494,20 +1722,29 @@ impl UserAgent {
             return;
         }
 
-        if (code == 401 || code == 407) && !self.reg_session.auth_retried {
-            if let Ok(auth_hdr) = self.compute_auth_header(
+        if code == 401 || code == 407 {
+            let attempts = self.reg_session.auth_attempts;
+            if let Ok((hdr_name, hdr_val, stale)) = self.compute_auth_header(
                 &response,
                 &Method::Register,
                 &self.config.registrar_uri.to_string(),
             ) {
-                let exp = self.reg_session.pending_expires;
-                if let Err(err) = self.start_register_with_expires(exp, Some(auth_hdr), true, now) {
-                    self.set_registration_state(RegistrationState::Failed {
-                        status_code: Some(code),
-                        reason: err.to_string(),
-                    });
+                let can_retry = attempts == 0 || (stale && attempts < MAX_STALE_AUTH_RETRIES);
+                if can_retry {
+                    let exp = self.reg_session.pending_expires;
+                    if let Err(err) = self.start_register_with_expires(
+                        exp,
+                        Some((hdr_name, hdr_val)),
+                        attempts.saturating_add(1),
+                        now,
+                    ) {
+                        self.set_registration_state(RegistrationState::Failed {
+                            status_code: Some(code),
+                            reason: err.to_string(),
+                        });
+                    }
+                    return;
                 }
-                return;
             }
         }
 
@@ -1545,6 +1782,7 @@ impl UserAgent {
                 call.active_invite_tx = None;
                 call.active_invite_req = None;
                 call.pending_cancel = false;
+                call.invite_auth_attempts = 0;
 
                 if let Ok(to) = response.to() {
                     if let Some(tag) = to.tag {
@@ -1607,71 +1845,73 @@ impl UserAgent {
         }
 
         if code == 401 || code == 407 {
-            let should_retry = self.calls.get(call_id).is_some_and(|c| {
-                !c.invite_auth_retried && !c.pending_cancel && c.state != CallState::Cancelling
+            let retry_state = self.calls.get(call_id).and_then(|c| {
+                if !c.pending_cancel && c.state != CallState::Cancelling {
+                    let target_uri = if is_reinvite {
+                        c.remote_target.to_string()
+                    } else {
+                        c.remote_uri.to_string()
+                    };
+                    Some((c.invite_auth_attempts, target_uri))
+                } else {
+                    None
+                }
             });
-            if should_retry {
-                let target_uri = self
-                    .calls
-                    .get(call_id)
-                    .map(|c| {
-                        if is_reinvite {
-                            c.remote_target.to_string()
-                        } else {
-                            c.remote_uri.to_string()
-                        }
-                    })
-                    .unwrap_or_default();
-                if let Ok(auth_hdr) =
+            if let Some((attempts, target_uri)) = retry_state {
+                if let Ok((hdr_name, hdr_val, stale)) =
                     self.compute_auth_header(&response, &Method::Invite, &target_uri)
                 {
-                    let branch = self.next_branch();
-                    let config_ref = &self.config;
-                    let next_req = if let Some(call) = self.calls.get_mut(call_id) {
-                        call.invite_auth_retried = true;
-                        call.local_cseq += 1;
-                        call.local_sdp.clone().map(|sdp| {
-                            if is_reinvite {
-                                Self::build_in_dialog_invite(
-                                    config_ref,
-                                    call,
-                                    &branch,
-                                    &sdp,
-                                    Some(auth_hdr),
-                                )
-                            } else {
-                                Self::build_invite_request(
-                                    config_ref,
-                                    call,
-                                    &branch,
-                                    &sdp,
-                                    Some(auth_hdr),
-                                )
+                    let can_retry = attempts == 0 || (stale && attempts < MAX_STALE_AUTH_RETRIES);
+                    if can_retry {
+                        let branch = self.next_branch();
+                        let config_ref = &self.config;
+                        let auth_hdr = (hdr_name, hdr_val);
+                        let next_req = if let Some(call) = self.calls.get_mut(call_id) {
+                            call.invite_auth_attempts = attempts.saturating_add(1);
+                            call.local_cseq += 1;
+                            call.local_sdp.clone().map(|sdp| {
+                                if is_reinvite {
+                                    Self::build_in_dialog_invite(
+                                        config_ref,
+                                        call,
+                                        &branch,
+                                        &sdp,
+                                        Some(auth_hdr),
+                                    )
+                                } else {
+                                    Self::build_invite_request(
+                                        config_ref,
+                                        call,
+                                        &branch,
+                                        &sdp,
+                                        Some(auth_hdr),
+                                    )
+                                }
+                            })
+                        } else {
+                            None
+                        };
+                        if let Some(req) = next_req {
+                            if let Ok(new_tx) =
+                                self.transactions.start_client_transaction(req.clone(), now)
+                            {
+                                if let Some(call) = self.calls.get_mut(call_id) {
+                                    call.active_invite_tx = Some(new_tx.clone());
+                                    call.active_invite_req = Some(req);
+                                }
+                                self.tx_to_call.insert(
+                                    new_tx,
+                                    (
+                                        call_id.to_string(),
+                                        if is_reinvite {
+                                            CallTxKind::ReInvite
+                                        } else {
+                                            CallTxKind::Invite
+                                        },
+                                    ),
+                                );
+                                return;
                             }
-                        })
-                    } else {
-                        None
-                    };
-                    if let Some(req) = next_req {
-                        if let Ok(new_tx) =
-                            self.transactions.start_client_transaction(req.clone(), now)
-                        {
-                            if let Some(call) = self.calls.get_mut(call_id) {
-                                call.active_invite_tx = Some(new_tx.clone());
-                                call.active_invite_req = Some(req);
-                            }
-                            self.tx_to_call.insert(
-                                new_tx,
-                                (
-                                    call_id.to_string(),
-                                    if is_reinvite {
-                                        CallTxKind::ReInvite
-                                    } else {
-                                        CallTxKind::Invite
-                                    },
-                                ),
-                            );
-                            return;
                         }
                     }
                 }
@@ -1712,17 +1952,23 @@ impl UserAgent {
         }
 
         let code = response.status_code;
-        if (code == 401 || code == 407)
-            && self.calls.get(call_id).is_some_and(|c| !c.bye_auth_retried)
-        {
-            let target_uri = self
+        if code == 401 || code == 407 {
+            let retry_state = self
                 .calls
                 .get(call_id)
-                .map(|c| c.remote_target.to_string())
-                .unwrap_or_default();
-            if let Ok(auth_hdr) = self.compute_auth_header(&response, &Method::Bye, &target_uri) {
-                if self.send_bye_for_call(call_id, Some(auth_hdr), now).is_ok() {
-                    return;
+                .map(|c| (c.bye_auth_attempts, c.remote_target.to_string()));
+            if let Some((attempts, target_uri)) = retry_state {
+                if let Ok((hdr_name, hdr_val, stale)) =
+                    self.compute_auth_header(&response, &Method::Bye, &target_uri)
+                {
+                    let can_retry = attempts == 0 || (stale && attempts < MAX_STALE_AUTH_RETRIES);
+                    if can_retry
+                        && self
+                            .send_bye_for_call(call_id, Some((hdr_name, hdr_val)), now)
+                            .is_ok()
+                    {
+                        return;
+                    }
                 }
             }
         }
@@ -1787,7 +2033,7 @@ impl UserAgent {
         response: &SipResponse,
         method: &Method,
         digest_uri: &str,
-    ) -> Result<(&'static str, String), SipError> {
+    ) -> Result<(&'static str, String, bool), SipError> {
         let (challenge_str, auth_header_name) = if response.status_code == 407 {
             (
                 response
@@ -1807,6 +2053,7 @@ impl UserAgent {
         };
 
         let challenge = DigestChallenge::parse(challenge_str)?;
+        let stale = challenge.stale;
         let cnonce = self.next_cnonce();
         let creds = DigestCredentials::new(
             self.config.username.clone(),
@@ -1814,7 +2061,7 @@ impl UserAgent {
             Some(cnonce),
         );
         let value = creds.authorize(&challenge, method, digest_uri)?;
-        Ok((auth_header_name, value))
+        Ok((auth_header_name, value, stale))
     }
 }
 
@@ -1826,10 +2073,27 @@ fn parse_optional_sdp(body: &[u8]) -> Option<SdpSession> {
     SdpSession::parse(text).ok()
 }
 
-fn extract_register_expires(resp: &SipResponse) -> Option<u32> {
-    if let Ok(Some(contact)) = resp.contact() {
-        if let Some(exp) = contact.expires {
-            return Some(exp);
+fn contact_matches_local(contact: &SipUri, local: &SipUri) -> bool {
+    contact.user == local.user
+        && contact.host.eq_ignore_ascii_case(&local.host)
+        && contact.port.unwrap_or(5060) == local.port.unwrap_or(5060)
+}
+
+fn extract_register_expires(resp: &SipResponse, local_contact: &SipUri) -> Option<u32> {
+    if let Ok(contacts) = resp.contacts() {
+        if let Some(matched) = contacts
+            .iter()
+            .find(|c| contact_matches_local(&c.uri, local_contact))
+        {
+            if let Some(exp) = matched.expires {
+                return Some(exp);
+            }
+        }
+        // Fallback for NAT-rewritten single-binding responses where the registrar replaced host/port.
+        if contacts.len() == 1 {
+            if let Some(exp) = contacts[0].expires {
+                return Some(exp);
+            }
         }
     }
     resp.headers

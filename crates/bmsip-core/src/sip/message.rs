@@ -130,13 +130,22 @@ impl SipRequest {
         parse_required_addr(&self.headers, "To")
     }
 
-    /// Returns the parsed `Contact` header, if present.
-    pub fn contact(&self) -> Result<Option<NameAddr>, SipError> {
-        match self.headers.get("Contact") {
-            Some(v) if v.trim() == "*" => Ok(None),
-            Some(v) => NameAddr::parse(v).map(Some),
-            None => Ok(None),
+    /// Returns all parsed `Contact` header entries across all `Contact` headers (skipping `*`).
+    pub fn contacts(&self) -> Result<Vec<NameAddr>, SipError> {
+        let mut out = Vec::new();
+        for raw in self.headers.get_all("Contact") {
+            let trimmed = raw.trim();
+            if trimmed == "*" || trimmed.is_empty() {
+                continue;
+            }
+            out.extend(NameAddr::parse_list(trimmed)?);
         }
+        Ok(out)
+    }
+
+    /// Returns the first parsed `Contact` header entry, if present.
+    pub fn contact(&self) -> Result<Option<NameAddr>, SipError> {
+        Ok(self.contacts()?.into_iter().next())
     }
 
     /// Returns the parsed `CSeq` header.
@@ -194,12 +203,22 @@ impl SipResponse {
         parse_required_addr(&self.headers, "To")
     }
 
-    /// Returns the parsed `Contact` header, if present.
-    pub fn contact(&self) -> Result<Option<NameAddr>, SipError> {
-        match self.headers.get("Contact") {
-            Some(v) => NameAddr::parse(v).map(Some),
-            None => Ok(None),
+    /// Returns all parsed `Contact` header entries across all `Contact` headers (skipping `*`).
+    pub fn contacts(&self) -> Result<Vec<NameAddr>, SipError> {
+        let mut out = Vec::new();
+        for raw in self.headers.get_all("Contact") {
+            let trimmed = raw.trim();
+            if trimmed == "*" || trimmed.is_empty() {
+                continue;
+            }
+            out.extend(NameAddr::parse_list(trimmed)?);
         }
+        Ok(out)
+    }
+
+    /// Returns the first parsed `Contact` header entry, if present.
+    pub fn contact(&self) -> Result<Option<NameAddr>, SipError> {
+        Ok(self.contacts()?.into_iter().next())
     }
 
     /// Returns the parsed `CSeq` header.

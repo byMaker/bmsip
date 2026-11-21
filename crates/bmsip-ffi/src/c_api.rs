@@ -33,7 +33,7 @@ unsafe fn client_ref<'a>(handle: *const BmsipClientHandle) -> Option<&'a BmsipCl
     Some(&unsafe { &*handle }.inner)
 }
 
-/// Allocates and starts a new SIP client handle; returns null on invalid arguments or bind failure.
+/// Allocates and starts a new SIP client handle with an 8 kHz PCM bridge; returns null on invalid arguments or bind failure.
 ///
 /// # Safety
 /// All string pointers must be valid null-terminated UTF-8 C strings.
@@ -45,6 +45,35 @@ pub unsafe extern "C" fn bmsip_client_new(
     registrar_addr: *const c_char,
     bind_ip: *const c_char,
     sip_port: u16,
+) -> *mut BmsipClientHandle {
+    unsafe {
+        bmsip_client_new_ex(
+            username,
+            password,
+            domain,
+            registrar_addr,
+            bind_ip,
+            sip_port,
+            0,
+            8_000,
+        )
+    }
+}
+
+/// Allocates and starts a new SIP client handle with explicit Opus toggle and PCM bridge sample rate (`8000`, `16000`, or `48000` Hz).
+///
+/// # Safety
+/// All string pointers must be valid null-terminated UTF-8 C strings.
+#[no_mangle]
+pub unsafe extern "C" fn bmsip_client_new_ex(
+    username: *const c_char,
+    password: *const c_char,
+    domain: *const c_char,
+    registrar_addr: *const c_char,
+    bind_ip: *const c_char,
+    sip_port: u16,
+    enable_opus: i32,
+    sample_rate_hz: u32,
 ) -> *mut BmsipClientHandle {
     let (Some(u), Some(p), Some(d), Some(r), Some(b)) = (
         unsafe { cstr_to_string(username) },
@@ -63,13 +92,27 @@ pub unsafe extern "C" fn bmsip_client_new(
         registrar_addr: r,
         bind_ip: b,
         sip_port,
-        enable_opus: false,
+        enable_opus: enable_opus != 0,
     };
 
-    match BmsipClient::new(cfg) {
+    match BmsipClient::new_with_sample_rate(cfg, sample_rate_hz) {
         Ok(client) => Box::into_raw(Box::new(BmsipClientHandle { inner: client })),
         Err(_) => ptr::null_mut(),
     }
+}
+
+/// Returns the configured mono PCM bridge sample rate in Hz (`8000`, `16000`, or `48000`), or `0` if `client` is null.
+///
+/// # Safety
+/// `client` must be null or a valid handle created by `bmsip_client_new` / `bmsip_client_new_ex`.
+#[no_mangle]
+pub unsafe extern "C" fn bmsip_client_audio_sample_rate_hz(
+    client: *const BmsipClientHandle,
+) -> u32 {
+    let Some(c) = (unsafe { client_ref(client) }) else {
+        return 0;
+    };
+    c.audio_sample_rate_hz()
 }
 
 /// Triggers account registration (`0` on success, `-1` on error).

@@ -15,7 +15,6 @@ use bmsip_engine::bmsip_core::sip::SipUri;
 use bmsip_engine::bmsip_media::DtmfDigit;
 use bmsip_engine::{
     EngineCommand, EngineConfig, EngineEvent, PcmAudioHandle, PcmQueueAudioPort, SipEngine,
-    PCM_FRAME_SAMPLES_8KHZ_20MS,
 };
 
 /// Cross-platform FFI error surfaced to Swift, Kotlin, and C callers.
@@ -127,8 +126,18 @@ pub struct BmsipClient {
 }
 
 impl BmsipClient {
-    /// Creates and starts a new [`BmsipClient`] instance.
+    /// Creates and starts a new [`BmsipClient`] instance with an 8 kHz (160-sample/20 ms) PCM bridge.
     pub fn new(config: FfiConfig) -> Result<Self, FfiError> {
+        Self::new_with_sample_rate(config, 8_000)
+    }
+
+    /// Creates and starts a new [`BmsipClient`] with an explicit PCM bridge rate (`8000`, `16000`, or `48000` Hz).
+    pub fn new_with_sample_rate(config: FfiConfig, sample_rate_hz: u32) -> Result<Self, FfiError> {
+        if !matches!(sample_rate_hz, 8_000 | 16_000 | 48_000) {
+            return Err(FfiError::InvalidArgument(format!(
+                "unsupported audio sample_rate_hz {sample_rate_hz} (expected 8000, 16000, or 48000)"
+            )));
+        }
         let registrar_addr = resolve_socket_addr(&config.registrar_addr)?;
         let bind_ip: IpAddr = config.bind_ip.parse().map_err(|_| {
             FfiError::InvalidArgument(format!("invalid bind_ip '{}'", config.bind_ip))
@@ -148,6 +157,15 @@ impl BmsipClient {
         if config.enable_opus {
             ua_cfg.supported_codecs = vec![
                 RtpCodec::opus(),
+                RtpCodec::g722(),
+                RtpCodec::pcmu(),
+                RtpCodec::pcma(),
+                RtpCodec::telephone_event_48k(102),
+                RtpCodec::telephone_event(101),
+            ];
+        } else {
+            ua_cfg.supported_codecs = vec![
+                RtpCodec::g722(),
                 RtpCodec::pcmu(),
                 RtpCodec::pcma(),
                 RtpCodec::telephone_event(101),
@@ -155,7 +173,8 @@ impl BmsipClient {
         }
 
         let eng_cfg = EngineConfig::new(ua_cfg, registrar_addr, bind_ip, config.sip_port);
-        let (audio_port, audio_handle) = PcmQueueAudioPort::new(64);
+        let (audio_port, audio_handle) =
+            PcmQueueAudioPort::new_with_sample_rate(sample_rate_hz, 64);
         let engine = SipEngine::spawn(eng_cfg, Box::new(audio_port))
             .map_err(|e| FfiError::RuntimeError(e.to_string()))?;
 
@@ -163,6 +182,11 @@ impl BmsipClient {
             engine: Mutex::new(Some(engine)),
             audio: audio_handle,
         })
+    }
+
+    /// Returns the configured mono PCM sample rate (`8000`, `16000`, or `48000` Hz) of the audio bridge.
+    pub fn audio_sample_rate_hz(&self) -> u32 {
+        self.audio.sample_rate_hz()
     }
 
     pub fn register_account(&self) -> Result<(), FfiError> {
@@ -223,15 +247,12 @@ impl BmsipClient {
     }
 
     pub fn push_captured_pcm(&self, samples: Vec<i16>) -> Result<(), FfiError> {
-        let frame: [i16; PCM_FRAME_SAMPLES_8KHZ_20MS] =
-            samples.try_into().map_err(|v: Vec<i16>| {
-                FfiError::InvalidArgument(format!(
-                    "expected {PCM_FRAME_SAMPLES_8KHZ_20MS} PCM samples, got {}",
-                    v.len()
-                ))
-            })?;
-        self.audio.push_captured_frame(frame);
-        Ok(())
+        let got = samples.len();
+        self.audio
+            .push_captured_samples(samples)
+            .map_err(|expected| {
+                FfiError::InvalidArgument(format!("expected {expected} PCM samples, got {got}"))
+            })
     }
 
     pub fn pop_playout_pcm(&self) -> Option<Vec<i16>> {

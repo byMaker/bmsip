@@ -10,9 +10,12 @@ use std::sync::{Arc, Condvar, Mutex};
 use std::thread::{self, JoinHandle};
 
 use bmsip_engine::bmsip_media::{
-    condition_mic_frame, downsample_48k_to_8k, upsample_8k_to_48k, WavPcm16,
+    condition_mic_frame, downsample_48k_to_8k, upsample_16k_to_48k, upsample_8k_to_48k, WavPcm16,
 };
-use bmsip_engine::{AudioPort, PCM_FRAME_SAMPLES_48KHZ_20MS, PCM_FRAME_SAMPLES_8KHZ_20MS};
+use bmsip_engine::{
+    AudioPort, PCM_FRAME_SAMPLES_16KHZ_20MS, PCM_FRAME_SAMPLES_48KHZ_20MS,
+    PCM_FRAME_SAMPLES_8KHZ_20MS,
+};
 
 const LIVE_SAMPLE_RATE_HZ: u32 = 48_000;
 const MAX_QUEUED_FRAMES: usize = 16;
@@ -46,6 +49,7 @@ pub struct LiveLinuxAudioPort {
         Mutex<VecDeque<[i16; PCM_FRAME_SAMPLES_48KHZ_20MS]>>,
         Condvar,
     )>,
+    record_rx: bool,
     recorded: Arc<Mutex<Vec<i16>>>,
     rec_child: Option<Child>,
     play_child: Option<Child>,
@@ -54,8 +58,14 @@ pub struct LiveLinuxAudioPort {
 }
 
 impl LiveLinuxAudioPort {
-    /// Spawns live Linux 48 kHz audio capture/playback subprocesses with custom linear mic gain.
+    /// Spawns live Linux 48 kHz audio capture/playback subprocesses with custom linear mic gain and RX WAV recording enabled.
+    #[allow(dead_code)]
     pub fn spawn_with_gain(mic_gain: f32) -> (Self, LiveAudioHandle) {
+        Self::spawn_with_options(mic_gain, true)
+    }
+
+    /// Spawns live Linux 48 kHz audio capture/playback subprocesses with explicit RX WAV recording toggle.
+    pub fn spawn_with_options(mic_gain: f32, record_rx: bool) -> (Self, LiveAudioHandle) {
         let stop = Arc::new(AtomicBool::new(false));
         let tx_queue = Arc::new(Mutex::new(
             VecDeque::<[i16; PCM_FRAME_SAMPLES_48KHZ_20MS]>::new(),
@@ -151,6 +161,7 @@ impl LiveLinuxAudioPort {
             tx_primed: false,
             last_tx_sample: 0,
             rx_queue,
+            record_rx,
             recorded,
             rec_child,
             play_child,
@@ -217,13 +228,19 @@ impl AudioPort for LiveLinuxAudioPort {
             let up = upsample_8k_to_48k(samples);
             let n = up.len().min(PCM_FRAME_SAMPLES_48KHZ_20MS);
             frame[..n].copy_from_slice(&up[..n]);
+        } else if samples.len() == PCM_FRAME_SAMPLES_16KHZ_20MS {
+            let up = upsample_16k_to_48k(samples);
+            let n = up.len().min(PCM_FRAME_SAMPLES_48KHZ_20MS);
+            frame[..n].copy_from_slice(&up[..n]);
         } else {
             let copy_len = samples.len().min(PCM_FRAME_SAMPLES_48KHZ_20MS);
             frame[..copy_len].copy_from_slice(&samples[..copy_len]);
         }
 
-        if let Ok(mut rec) = self.recorded.lock() {
-            rec.extend_from_slice(&frame);
+        if self.record_rx {
+            if let Ok(mut rec) = self.recorded.lock() {
+                rec.extend_from_slice(&frame);
+            }
         }
 
         if let Ok(mut guard) = self.rx_queue.0.lock() {

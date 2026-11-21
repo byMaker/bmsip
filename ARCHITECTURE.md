@@ -86,10 +86,27 @@ All workspace crates share a synchronized **SemVer 2.0.0** version in root `Carg
 - **`0.7.0` — Stage 7:** Native `libopus` 48 kHz VoIP backend (`LibOpusCodec`), Asterisk Opus negotiation, soft noise-gate/gain mic DSP (`condition_mic_frame`), and glitch-free 48 kHz live Linux audio pre-roll buffering.
 - **`0.8.0` — Stage 8:** RFC 3261 `Record-Route` response copying, multi-server Docker testbed (**Asterisk** `PJSIP` + **FreeSWITCH** `Sofia-SIP` + **Kamailio** `SIP Proxy`), unified `bmsip-cli interop` benchmark, and DSP audio analyzer / jitter PLC crossfade.
 - **`0.9.0` — Stage 9:** Universal pluggable audio codec registry (`AudioCodecPlugin`, `AudioCodecFactory`, `CodecRegistry`, `EngineConfig::register_custom_codec`) and built-in pure-Rust **ITU-T G.722** (16 kHz wideband HD Voice, PT `9`) verified across Asterisk, FreeSWITCH (`mod_spandsp`), and Kamailio.
-- **`0.9.1` — Stage 9 Polish (Current):** Symmetric low-pass FIR downsamplers + stateful `StreamResampler`, zero-copy `RtpPacketRef` hot path, `Condvar` instant command wakeup & adaptive idle polling, live companion RTCP (`rtp_port + 1`) reporting, and deterministic parser mutation fuzz tests.
+- **`0.9.1` — Stage 9 Polish:** Symmetric low-pass FIR downsamplers + stateful `StreamResampler`, zero-copy `RtpPacketRef` hot path, `Condvar` instant command wakeup & adaptive idle polling, live companion RTCP (`rtp_port + 1`) reporting, and deterministic parser mutation fuzz tests.
+- **`0.9.2` — Protocol, Media & FFI Hardening (Current):** RFC 3261 `491` glare / `remote_cseq` / `stale=true` / multi-`Contact` / `488` fixes, restart-safe `instance_seed`, 48 kHz-scaled RFC 4733 DTMF durations, mid-call SSRC reset & RTCP interval loss tracking, symmetric/Route SIP routing, RTP rebind on `NetworkChanged`, deterministic multi-call focus, bounded WAV recording, and native `8`/`16`/`48` kHz FFI/C99 HD audio bridges.
 
 ---
 
 ## 6. Future Roadmap / TODO
 
-- **TODO 1 — SIP over TCP/TLS (`rustls`) & Media Encryption (`SRTP` / `DTLS-SRTP`):** Add stream framing for TCP/TLS 1.3 signalling and RFC 3711 SRTP media protection for public internet traversal.
+- **TODO 1 — Transport Security & Media Encryption:**
+  - SIP over TCP and TLS 1.2–1.3 (`rustls`, RFC 5922) with stream framing and persistent NAT keep-alive (RFC 5626).
+  - Media encryption: **SRTP** (RFC 3711) with **SDES** key exchange (RFC 4568) and **DTLS-SRTP** for public internet traversal.
+- **TODO 2 — Core Call Control (Softphone Essentials):**
+  - Call Hold / Resume (`re-INVITE` with `a=sendonly` / `a=sendrecv`).
+  - Blind & attended call transfer (`REFER` RFC 3515, `Replaces` RFC 3891) and early dialog updates (`UPDATE` RFC 3311).
+  - `Session-Timers` (RFC 4028) for dead-peer detection, `PRACK` (RFC 3262) for reliable `180`/`183` responses, `Reason` header (RFC 3326), and Caller-ID headers (`Privacy` RFC 3323, `P-Asserted-Identity` RFC 3325).
+- **TODO 3 — Early Media, Legacy DTMF & Comfort Noise:**
+  - Early media (`183 Session Progress` with SDP) — activate RTP playout prior to `200 OK`.
+  - Legacy SIP `INFO` DTMF (`application/dtmf-relay`, RFC 2976) alongside RFC 4733.
+  - Comfort Noise Generation (`CN`, PT 13, RFC 3389) for VAD/DTX interoperability.
+- **TODO 4 — DNS Discovery & Public Internet NAT Traversal:**
+  - SIP DNS server discovery (`NAPTR` / `SRV`, RFC 3263).
+  - **STUN** (RFC 5389), **TURN** (RFC 8656), and **ICE** (RFC 8445) for symmetric NAT and firewall traversal.
+- **Optional / Enterprise Backlog (On Demand):**
+  - Event subscriptions (`SUBSCRIBE`/`NOTIFY` RFC 6665) for office BLF / Call Pickup (RFC 4235) and Voicemail MWI (RFC 3842).
+  - Call barge-in (`Join` RFC 3911) and SIP conferencing event package (RFC 4575 / RFC 4353) — deferred unless explicitly needed.

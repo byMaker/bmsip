@@ -202,6 +202,11 @@ impl StreamResampler {
         Self::default()
     }
 
+    /// Clears cross-frame boundary state (e.g., after a mid-call codec change).
+    pub fn reset(&mut self) {
+        self.prev_last = None;
+    }
+
     /// Resamples one 20 ms frame to `target_samples`, interpolating smoothly across the previous frame tail.
     pub fn resample_20ms(
         &mut self,

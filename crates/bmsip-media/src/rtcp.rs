@@ -325,6 +325,11 @@ impl RtpStreamStats {
         Self::default()
     }
 
+    /// Resets all per-SSRC sequence, jitter, and RTCP interval counters.
+    pub fn reset(&mut self) {
+        *self = Self::new();
+    }
+
     /// Records a received RTP packet and updates loss/jitter estimates per RFC 3550 Appendix A.1/A.8.
     pub fn record_packet(&mut self, seq: u16, rtp_timestamp: u32, arrival_timestamp_samples: u32) {
         if !self.initialized {

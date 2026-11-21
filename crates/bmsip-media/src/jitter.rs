@@ -193,6 +193,24 @@ impl AdaptiveJitterBuffer {
         (self.late_drops, self.duplicate_drops, self.concealed_frames)
     }
 
+    /// Resets sequence tracking and buffered frames while preserving lifetime diagnostic counters.
+    ///
+    /// Used when the remote RTP stream changes SSRC mid-call (e.g., PBX bridge or transfer).
+    pub fn reset(&mut self) {
+        self.frames.clear();
+        self.primed = false;
+        self.initialized = false;
+        self.highest_ext_seq = 0;
+        self.next_playout_seq = 0;
+        self.target_depth_frames = self.config.initial_depth_frames.clamp(
+            self.config.min_depth_frames,
+            self.config.max_depth_frames.max(1),
+        );
+        self.last_good_frame.fill(0);
+        self.last_emitted_sample = 0;
+        self.consecutive_concealed = 0;
+    }
+
     fn update_target_depth(&mut self, jitter_samples: u32) {
         let frame_samples = self.config.frame_samples.max(1);
         let jitter_frames = (jitter_samples as usize).div_ceil(frame_samples);

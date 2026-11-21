@@ -178,9 +178,23 @@ impl DtmfSender {
         Self::default()
     }
 
-    /// Enqueues a 100 ms DTMF tone starting at `event_timestamp` (5 packets + 3 E-bit repeats).
+    /// Enqueues a 100 ms DTMF tone starting at `event_timestamp` at the default 8 kHz RTP clock rate.
     pub fn queue_digit(&mut self, digit: DtmfDigit, event_timestamp: u32) {
+        self.queue_digit_with_clock_rate(digit, event_timestamp, 8_000);
+    }
+
+    /// Enqueues a 100 ms DTMF tone starting at `event_timestamp`, scaling RFC 4733 duration ticks by `clock_rate_hz`.
+    ///
+    /// At `8000` Hz each 20 ms step is `160` ticks (`800` total); at `48000` Hz each 20 ms step is `960` ticks (`4800` total).
+    pub fn queue_digit_with_clock_rate(
+        &mut self,
+        digit: DtmfDigit,
+        event_timestamp: u32,
+        clock_rate_hz: u32,
+    ) {
         let volume = 10;
+        let step_ticks = (clock_rate_hz.max(8_000) / 50).clamp(1, u32::from(u16::MAX) / 5) as u16;
+        let total_ticks = step_ticks.saturating_mul(5);
         for step in 1..=4u16 {
             self.queue.push_back(QueuedDtmfPacket {
                 marker: step == 1,
@@ -189,7 +203,7 @@ impl DtmfSender {
                     digit,
                     end_of_event: false,
                     volume,
-                    duration: step * 160,
+                    duration: step.saturating_mul(step_ticks),
                 },
             });
         }
@@ -202,7 +216,7 @@ impl DtmfSender {
                     digit,
                     end_of_event: true,
                     volume,
-                    duration: 800,
+                    duration: total_ticks,
                 },
             });
         }
@@ -233,6 +247,11 @@ impl DtmfDetector {
         }
         self.last_event_timestamp = Some(rtp_timestamp);
         Some(event.digit)
+    }
+
+    /// Resets deduplication state (e.g., after a mid-call remote SSRC change).
+    pub fn reset(&mut self) {
+        self.last_event_timestamp = None;
     }
 }
 

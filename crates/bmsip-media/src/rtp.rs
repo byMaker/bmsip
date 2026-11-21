@@ -246,6 +246,11 @@ impl RtpPacketizer {
         self.payload_type
     }
 
+    /// Updates the outbound RTP payload type (e.g., after a mid-call `re-INVITE` codec renegotiation).
+    pub fn set_payload_type(&mut self, payload_type: u8) {
+        self.payload_type = payload_type;
+    }
+
     /// Returns the next timestamp to be stamped.
     pub fn current_timestamp(&self) -> u32 {
         self.timestamp

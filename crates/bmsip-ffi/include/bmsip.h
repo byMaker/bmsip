@@ -19,6 +19,19 @@ BmsipClientHandle *bmsip_client_new(
     uint16_t sip_port
 );
 
+BmsipClientHandle *bmsip_client_new_ex(
+    const char *username,
+    const char *password,
+    const char *domain,
+    const char *registrar_addr,
+    const char *bind_ip,
+    uint16_t sip_port,
+    int32_t enable_opus,
+    uint32_t sample_rate_hz
+);
+
+uint32_t bmsip_client_audio_sample_rate_hz(const BmsipClientHandle *client);
+
 int32_t bmsip_client_register(const BmsipClientHandle *client);
 int32_t bmsip_client_unregister(const BmsipClientHandle *client);
 int32_t bmsip_client_dial(const BmsipClientHandle *client, const char *target_uri);

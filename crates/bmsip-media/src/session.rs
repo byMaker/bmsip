@@ -75,6 +75,7 @@ pub struct MediaSession {
     tx_resampler: StreamResampler,
     rx_resampler: StreamResampler,
     dtmf_payload_type: u8,
+    dtmf_clock_rate_hz: u32,
     frame_samples: usize,
     packetizer: RtpPacketizer,
     jitter: AdaptiveJitterBuffer,
@@ -108,6 +109,7 @@ impl MediaSession {
         jitter_config: JitterBufferConfig,
     ) -> Self {
         let frame_samples = jitter_config.frame_samples.max(1);
+        let dtmf_clock_rate_hz = codec.clock_rate_hz().max(8_000);
         Self {
             codec,
             opus: Box::new(BuiltInOpusCodec::new()),
@@ -116,6 +118,7 @@ impl MediaSession {
             tx_resampler: StreamResampler::new(),
             rx_resampler: StreamResampler::new(),
             dtmf_payload_type,
+            dtmf_clock_rate_hz,
             frame_samples,
             packetizer: RtpPacketizer::new(local_ssrc, codec.payload_type(), 1, 0),
             jitter: AdaptiveJitterBuffer::new(jitter_config),
@@ -154,9 +157,54 @@ impl MediaSession {
         self
     }
 
+    /// Sets the RTP clock rate in Hz for RFC 4733 `telephone-event` DTMF duration scaling.
+    pub fn with_dtmf_clock_rate(mut self, clock_rate_hz: u32) -> Self {
+        self.dtmf_clock_rate_hz = clock_rate_hz.max(8_000);
+        self
+    }
+
     /// Replaces the active [`OpusCodecBackend`].
     pub fn set_opus_backend(&mut self, backend: Box<dyn OpusCodecBackend>) {
         self.opus = backend;
+    }
+
+    /// Returns the currently active [`SessionCodec`].
+    pub fn codec(&self) -> SessionCodec {
+        self.codec
+    }
+
+    /// Returns the configured RFC 4733 DTMF payload type.
+    pub fn dtmf_payload_type(&self) -> u8 {
+        self.dtmf_payload_type
+    }
+
+    /// Returns the configured RFC 4733 DTMF RTP clock rate in Hz.
+    pub fn dtmf_clock_rate_hz(&self) -> u32 {
+        self.dtmf_clock_rate_hz
+    }
+
+    /// Returns the last observed remote RTP SSRC, if any packet has been received.
+    pub fn remote_ssrc(&self) -> Option<u32> {
+        self.remote_ssrc
+    }
+
+    /// Reconfigures the active media codec and DTMF parameters mid-call (e.g., after `re-INVITE`).
+    pub fn reconfigure_codec(
+        &mut self,
+        codec: SessionCodec,
+        dtmf_payload_type: u8,
+        dtmf_clock_rate_hz: u32,
+        custom_plugin: Option<Box<dyn AudioCodecPlugin>>,
+    ) {
+        if self.codec != codec {
+            self.tx_resampler.reset();
+            self.rx_resampler.reset();
+        }
+        self.codec = codec;
+        self.dtmf_payload_type = dtmf_payload_type;
+        self.dtmf_clock_rate_hz = dtmf_clock_rate_hz.max(8_000);
+        self.custom_plugin = custom_plugin;
+        self.packetizer.set_payload_type(codec.payload_type());
     }
 
     /// Returns the RTP clock rate in Hz for the active [`SessionCodec`].
@@ -223,10 +271,11 @@ impl MediaSession {
             .next_packet_bytes(&encoded, ts_advance, false))
     }
 
-    /// Queues an outbound RFC 4733 DTMF tone at the current media timestamp.
+    /// Queues an outbound RFC 4733 DTMF tone at the current media timestamp scaled by `dtmf_clock_rate_hz`.
     pub fn queue_dtmf(&mut self, digit: DtmfDigit) {
         let ts = self.packetizer.current_timestamp();
-        self.dtmf_sender.queue_digit(digit, ts);
+        self.dtmf_sender
+            .queue_digit_with_clock_rate(digit, ts, self.dtmf_clock_rate_hz);
     }
 
     /// Pops the next queued RFC 4733 DTMF RTP datagram for paced 20 ms transmission.
@@ -258,6 +307,14 @@ impl MediaSession {
         arrival_timestamp_samples: u32,
     ) -> Result<Option<DtmfDigit>, MediaError> {
         let pkt = RtpPacketRef::parse(raw)?;
+        // RFC 3550: a mid-call SSRC change (e.g., PBX bridge/transfer) starts a fresh sequence/timestamp domain.
+        if let Some(prev_ssrc) = self.remote_ssrc {
+            if prev_ssrc != pkt.ssrc {
+                self.stats.reset();
+                self.jitter.reset();
+                self.dtmf_detector.reset();
+            }
+        }
         self.remote_ssrc = Some(pkt.ssrc);
         self.stats.record_packet(
             pkt.sequence_number,
@@ -343,8 +400,21 @@ impl MediaSession {
         self.jitter.pop()
     }
 
-    /// Builds an RTCP Receiver Report (`RR`) packet from current stream statistics.
-    pub fn build_rtcp_receiver_report(&self) -> Vec<u8> {
+    /// Builds an RTCP Receiver Report (`RR`) packet and advances RFC 3550 §6.4.1 interval loss counters.
+    pub fn build_rtcp_receiver_report(&mut self) -> Vec<u8> {
+        let reports = match self.remote_ssrc {
+            Some(rssrc) => vec![self.stats.build_reception_report(rssrc)],
+            None => Vec::new(),
+        };
+        RtcpPacket::ReceiverReport {
+            ssrc: self.packetizer.ssrc(),
+            reports,
+        }
+        .to_bytes()
+    }
+
+    /// Builds a non-mutating snapshot RTCP Receiver Report (`RR`) packet without advancing interval counters.
+    pub fn snapshot_rtcp_receiver_report(&self) -> Vec<u8> {
         let reports = match self.remote_ssrc {
             Some(rssrc) => vec![self.stats.snapshot_reception_report(rssrc)],
             None => Vec::new(),
@@ -589,5 +659,127 @@ mod tests {
         }
         let _ = session_pcmu.pop_playout_frame();
         let _ = session_g722.pop_playout_frame();
+    }
+
+    #[test]
+    fn dtmf_48khz_opus_scales_duration_ticks_to_100ms() {
+        let cfg = JitterBufferConfig {
+            frame_samples: PCM_FRAME_SAMPLES_48KHZ_20MS,
+            ..JitterBufferConfig::default()
+        };
+        let mut tx = MediaSession::new_with_session_codec(
+            SessionCodec::Opus { payload_type: 111 },
+            102,
+            0x1234_5678,
+            cfg,
+        )
+        .with_dtmf_clock_rate(48_000);
+        tx.queue_dtmf(DtmfDigit::D5);
+        let pkts = tx.poll_dtmf_packets();
+        assert_eq!(pkts.len(), 7);
+        let durations: Vec<u16> = pkts
+            .iter()
+            .map(|raw| {
+                let parsed = RtpPacket::parse(raw).unwrap();
+                assert_eq!(parsed.header.payload_type, 102);
+                DtmfEventPayload::parse(&parsed.payload).unwrap().duration
+            })
+            .collect();
+        assert_eq!(durations, vec![960, 1920, 2880, 3840, 4800, 4800, 4800]);
+    }
+
+    #[test]
+    fn mid_call_remote_ssrc_change_resets_jitter_and_stats_seamlessly() {
+        let cfg = JitterBufferConfig {
+            min_depth_frames: 2,
+            max_depth_frames: 8,
+            initial_depth_frames: 2,
+            frame_samples: 160,
+        };
+        let mut rx = MediaSession::new(G711Kind::Pcmu, 101, 0xbbbb_0002, cfg);
+
+        // Stream 1 from SSRC A at high sequence numbers (500..505).
+        let mut pkt_a = RtpPacketizer::new(0x1111_0001, 0, 500, 80_000);
+        let tone_a = WavPcm16::generate_sine_wave(8000, 440, 100, 12000);
+        for (i, frame) in tone_a.samples.as_chunks::<160>().0.iter().enumerate() {
+            let wire = pkt_a.next_packet_bytes(&G711Kind::Pcmu.encode(frame), 160, false);
+            rx.receive_rtp(&wire, i as u32 * 160).unwrap();
+        }
+        assert_eq!(rx.remote_ssrc(), Some(0x1111_0001));
+        assert!(matches!(rx.pop_playout_frame(), PlayoutFrame::Normal(_)));
+
+        // Mid-call bridge switches to SSRC B at low unrelated sequence numbers (10..15).
+        let mut pkt_b = RtpPacketizer::new(0x2222_0002, 0, 10, 1_600);
+        let tone_b = WavPcm16::generate_sine_wave(8000, 880, 120, 12000);
+        for (i, frame) in tone_b.samples.as_chunks::<160>().0.iter().enumerate() {
+            let wire = pkt_b.next_packet_bytes(&G711Kind::Pcmu.encode(frame), 160, false);
+            rx.receive_rtp(&wire, 1000 + i as u32 * 160).unwrap();
+        }
+        assert_eq!(rx.remote_ssrc(), Some(0x2222_0002));
+        assert_eq!(rx.stats().received_count(), 6);
+        assert_eq!(rx.stats().cumulative_lost(), 0);
+        assert!(rx.stats().jitter() < 50);
+
+        let mut normal_count = 0usize;
+        for _ in 0..6 {
+            if matches!(rx.pop_playout_frame(), PlayoutFrame::Normal(_)) {
+                normal_count += 1;
+            }
+        }
+        assert_eq!(normal_count, 6);
+    }
+
+    #[test]
+    fn rtcp_receiver_report_advances_interval_fraction_lost() {
+        let cfg = JitterBufferConfig::default();
+        let mut rx = MediaSession::new(G711Kind::Pcmu, 101, 0xaaaa_1111, cfg);
+        let mut pkt = RtpPacketizer::new(0x9999_2222, 0, 1, 0);
+        let payload = G711Kind::Pcmu.encode(&[0i16; 160]);
+
+        // Interval 1: deliver seq 1, 3, 5, 7, 9, 10 (40% loss ending cleanly at seq 10).
+        for i in 0..10u32 {
+            let wire = pkt.next_packet_bytes(&payload, 160, false);
+            if i % 2 == 0 || i == 9 {
+                rx.receive_rtp(&wire, i * 160).unwrap();
+            }
+        }
+        let rr1 = RtcpPacket::parse_compound(&rx.build_rtcp_receiver_report()).unwrap();
+        let RtcpPacket::ReceiverReport { reports, .. } = &rr1[0] else {
+            panic!("expected ReceiverReport");
+        };
+        assert!(
+            reports[0].fraction_lost >= 100,
+            "expected ~40% loss in interval 1, got {}",
+            reports[0].fraction_lost
+        );
+
+        // Interval 2: deliver 10 clean consecutive packets -> fraction_lost must drop to 0.
+        for i in 10..20u32 {
+            let wire = pkt.next_packet_bytes(&payload, 160, false);
+            rx.receive_rtp(&wire, i * 160).unwrap();
+        }
+        let rr2 = RtcpPacket::parse_compound(&rx.build_rtcp_receiver_report()).unwrap();
+        let RtcpPacket::ReceiverReport { reports, .. } = &rr2[0] else {
+            panic!("expected ReceiverReport");
+        };
+        assert_eq!(reports[0].fraction_lost, 0);
+    }
+
+    #[test]
+    fn reconfigure_codec_updates_payload_type_and_dtmf_clock_rate() {
+        let cfg = JitterBufferConfig {
+            frame_samples: PCM_FRAME_SAMPLES_48KHZ_20MS,
+            ..JitterBufferConfig::default()
+        };
+        let mut session = MediaSession::new(G711Kind::Pcmu, 101, 0x3333_4444, cfg);
+        let frame = vec![0i16; PCM_FRAME_SAMPLES_48KHZ_20MS];
+        let p0 = RtpPacket::parse(&session.encode_pcm_frame(&frame).unwrap()).unwrap();
+        assert_eq!(p0.header.payload_type, 0);
+
+        session.reconfigure_codec(SessionCodec::Opus { payload_type: 111 }, 102, 48_000, None);
+        let p1 = RtpPacket::parse(&session.encode_pcm_frame(&frame).unwrap()).unwrap();
+        assert_eq!(p1.header.payload_type, 111);
+        assert_eq!(session.dtmf_payload_type(), 102);
+        assert_eq!(session.dtmf_clock_rate_hz(), 48_000);
     }
 }

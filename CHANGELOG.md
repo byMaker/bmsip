@@ -5,6 +5,30 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.9.2] - 2026-11-21
+
+### Fixed
+- **SIP Dialog & Auth RFC Compliance (`bmsip-core`):**
+  - Removed duplicate `Record-Route` header emission in `UserAgent::answer` (`SipRequest::create_response` already copies `Record-Route` per RFC 3261 §12.1.1).
+  - Handled inbound `re-INVITE` glare with `491 Request Pending` (RFC 3261 §14.2) instead of `481`, and added in-dialog `remote_cseq` ordering validation returning `500 Server Internal Error` for stale/reordered `re-INVITE` and `BYE` requests (RFC 3261 §12.2.2).
+  - Added injected `UaConfig::instance_seed` (auto-seeded in `SipEngine::spawn`) so Call-IDs, tags, branches, and Digest `cnonce` values never collide across process restarts on fixed SIP ports while keeping `bmsip-core` 100% deterministic.
+  - Honored Digest `stale=true` nonce rotation challenges up to 3 bounded retries across `REGISTER`, `INVITE`/`re-INVITE`, and `BYE` while failing immediately on non-stale credential rejections.
+  - Sent `488 Not Acceptable Here` and cleared call state cleanly when `UserAgent::answer` fails due to a missing SDP offer or incompatible codecs instead of stranding the server transaction.
+  - Added multi-`Contact` parsing (`SipRequest::contacts`, `SipResponse::contacts`) and matched the local contact binding when extracting `REGISTER` `200 OK` expiry.
+- **Media DTMF, SSRC Rollover & RTCP Intervals (`bmsip-media`):**
+  - Scaled RFC 4733 DTMF packet durations by the negotiated `telephone-event` RTP clock rate (`DtmfSender::queue_digit_with_clock_rate`, `MediaSession::with_dtmf_clock_rate`) so 48 kHz Opus DTMF tones last a full 100 ms (`4800` ticks) instead of `16.7 ms` (`800` ticks).
+  - Detected mid-call remote `SSRC` changes in `MediaSession::receive_rtp` and seamlessly reset `RtpStreamStats`, `AdaptiveJitterBuffer`, and `DtmfDetector` to avoid sequence lockups or jitter spikes after PBX bridges/transfers.
+  - Advanced RFC 3550 §6.4.1 interval loss counters (`expected_prior`/`received_prior`) in `MediaSession::build_rtcp_receiver_report(&mut self)` (preserving non-mutating `snapshot_rtcp_receiver_report(&self)`).
+  - Added `MediaSession::reconfigure_codec` and `RtpPacketizer::set_payload_type` for mid-call `re-INVITE` codec updates.
+- **Engine Routing, Handover & Multi-Call Determinism (`bmsip-engine`):**
+  - Implemented RFC 3581 / RFC 3261 §12.2.1.1 SIP UDP destination routing (symmetric response routing to the inbound packet source, topmost `Route` proxy resolution, and direct in-dialog `Contact` routing) instead of sending every datagram exclusively to `registrar_addr`.
+  - Applied negotiated codec/DTMF changes on `UaEvent::CallMediaUpdated` (`re-INVITE`) and rebound active RTP/RTCP sockets onto the new interface during `EngineCommand::NetworkChanged` (`UserAgent::notify_network_changed_with_rtp_ports`).
+  - Replaced non-deterministic `HashMap` call ordering with explicit FIFO `call_order` tracking and drained secondary call jitter buffers/DTMF queues on every 20 ms tick.
+  - Added opt-in/bounded RX WAV recording (`WavAudioPort::new_with_recording`, `.with_max_recorded_samples`) and multi-rate `PcmQueueAudioPort::new_with_sample_rate` (`8`/`16`/`48` kHz).
+- **FFI Wideband/Fullband HD Audio & CLI Live Playout (`bmsip-ffi`, `bmsip-cli`):**
+  - Added `BmsipClient::new_with_sample_rate` / `audio_sample_rate_hz` (`bmsip.udl` `[Name=with_sample_rate]`) and C99 `bmsip_client_new_ex` / `bmsip_client_audio_sample_rate_hz` (`bmsip.h`) supporting native `8`/`16`/`48` kHz PCM bridges alongside `G.722` and `telephone-event/48000` SDP negotiation.
+  - Added 16 kHz -> 48 kHz playout upsampling and opt-in RX recording (`spawn_with_options`) in `LiveLinuxAudioPort` so `--live-audio` runs in constant memory when `--wav-out` is not requested.
+
 ## [0.9.1] - 2026-11-21
 
 ### Changed

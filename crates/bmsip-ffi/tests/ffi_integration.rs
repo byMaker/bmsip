@@ -7,10 +7,10 @@ use std::time::{Duration, Instant};
 
 use bmsip_ffi::bmsip_engine::bmsip_media::WavPcm16;
 use bmsip_ffi::{
-    bmsip_client_dial, bmsip_client_free, bmsip_client_hangup, bmsip_client_new,
-    bmsip_client_poll_event_json, bmsip_client_pop_pcm, bmsip_client_push_pcm,
-    bmsip_client_register, bmsip_client_unregister, bmsip_string_free, BmsipClient, FfiConfig,
-    FfiEvent, FfiEventKind,
+    bmsip_client_audio_sample_rate_hz, bmsip_client_dial, bmsip_client_free, bmsip_client_hangup,
+    bmsip_client_new, bmsip_client_new_ex, bmsip_client_poll_event_json, bmsip_client_pop_pcm,
+    bmsip_client_push_pcm, bmsip_client_register, bmsip_client_unregister, bmsip_string_free,
+    BmsipClient, FfiConfig, FfiEvent, FfiEventKind,
 };
 
 #[test]
@@ -23,6 +23,8 @@ fn udl_schema_matches_rust_sdk_surface() {
         "enum FfiEventKind",
         "dictionary FfiEvent",
         "interface BmsipClient",
+        "with_sample_rate",
+        "audio_sample_rate_hz()",
         "register_account()",
         "unregister_account()",
         "dial(string target_uri)",
@@ -316,6 +318,122 @@ fn sdk_and_c_api_live_asterisk_call_pcm_bridge_and_telemetry() {
         thread::sleep(Duration::from_millis(150));
         assert_eq!(bmsip_client_unregister(handle), 0);
         thread::sleep(Duration::from_millis(150));
+        bmsip_client_free(handle);
+    }
+}
+
+#[test]
+fn ffi_and_c_api_wideband_48khz_opus_live_asterisk_call() {
+    // 1. Safe Rust / UniFFI BmsipClient running natively at 48 kHz (960 samples/20 ms) with Opus.
+    let client = BmsipClient::new_with_sample_rate(
+        FfiConfig {
+            username: "1003".to_string(),
+            password: "secret1003".to_string(),
+            domain: "asterisk".to_string(),
+            registrar_addr: "asterisk:5060".to_string(),
+            bind_ip: "0.0.0.0".to_string(),
+            sip_port: 0,
+            enable_opus: true,
+        },
+        48_000,
+    )
+    .unwrap();
+    assert_eq!(client.audio_sample_rate_hz(), 48_000);
+    // Narrowband 160-sample frame must be rejected on a 48 kHz bridge.
+    assert!(client.push_captured_pcm(vec![0; 160]).is_err());
+
+    client.register_account().unwrap();
+    let mut registered = false;
+    let reg_dl = Instant::now() + Duration::from_secs(10);
+    while Instant::now() < reg_dl {
+        if let Some(ev) = client.poll_event(50) {
+            if ev.kind == FfiEventKind::RegistrationChanged
+                && ev
+                    .detail
+                    .as_deref()
+                    .is_some_and(|d| d.starts_with("Registered"))
+            {
+                registered = true;
+                break;
+            }
+        }
+    }
+    assert!(registered, "48 kHz BmsipClient failed to register");
+
+    client.dial("sip:601@asterisk:5060".to_string()).unwrap();
+    let mut call_id: Option<String> = None;
+    let mut established_detail: Option<String> = None;
+    let call_dl = Instant::now() + Duration::from_secs(10);
+    while Instant::now() < call_dl {
+        if let Some(ev) = client.poll_event(50) {
+            match ev.kind {
+                FfiEventKind::OutboundCallStarted => call_id = ev.call_id,
+                FfiEventKind::CallEstablished => {
+                    established_detail = ev.detail;
+                    break;
+                }
+                _ => {}
+            }
+        }
+    }
+    assert!(
+        established_detail
+            .as_deref()
+            .is_some_and(|d| d.contains("codec=OPUS")),
+        "expected OPUS codec on 48 kHz FFI call, got {:?}",
+        established_detail
+    );
+
+    let tone_48k = WavPcm16::generate_sine_wave(48_000, 1_000, 500, 12_000);
+    for frame in tone_48k.samples.as_chunks::<960>().0 {
+        client.push_captured_pcm(frame.to_vec()).unwrap();
+        thread::sleep(Duration::from_millis(18));
+    }
+    thread::sleep(Duration::from_millis(120));
+
+    let mut rx_pcm = Vec::new();
+    let mut frame_lens = Vec::new();
+    while let Some(frame) = client.pop_playout_pcm() {
+        frame_lens.push(frame.len());
+        rx_pcm.extend_from_slice(&frame);
+    }
+    assert!(
+        !frame_lens.is_empty() && frame_lens.iter().all(|&n| n == 960),
+        "expected 960-sample 48 kHz playout frames, got {:?}",
+        frame_lens
+    );
+    assert!(WavPcm16::new(48_000, rx_pcm).rms_energy() > 1000);
+
+    client.hangup(call_id.unwrap()).unwrap();
+    thread::sleep(Duration::from_millis(150));
+    client.unregister_account().unwrap();
+    thread::sleep(Duration::from_millis(100));
+    client.shutdown();
+
+    // 2. C99 extended constructor `bmsip_client_new_ex` with Opus enabled at 16 kHz.
+    unsafe {
+        let u = CString::new("1003").unwrap();
+        let p = CString::new("secret1003").unwrap();
+        let d = CString::new("asterisk").unwrap();
+        let r = CString::new("asterisk:5060").unwrap();
+        let b = CString::new("0.0.0.0").unwrap();
+        let handle = bmsip_client_new_ex(
+            u.as_ptr(),
+            p.as_ptr(),
+            d.as_ptr(),
+            r.as_ptr(),
+            b.as_ptr(),
+            0,
+            1,
+            16_000,
+        );
+        assert!(!handle.is_null());
+        assert_eq!(bmsip_client_audio_sample_rate_hz(handle), 16_000);
+        let frame_16k = [0i16; 320];
+        assert_eq!(
+            bmsip_client_push_pcm(handle, frame_16k.as_ptr(), frame_16k.len()),
+            0
+        );
         bmsip_client_free(handle);
     }
 }

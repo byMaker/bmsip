@@ -1409,3 +1409,77 @@ fn live_g722_and_custom_codec_plugin_interop() {
         recorded_1002.rms_energy()
     );
 }
+
+#[test]
+fn engine_routes_direct_peer_responses_and_supports_bounded_audio_ports() {
+    use bmsip_engine::{AudioPort, PcmQueueAudioPort};
+
+    // 1. Verify WavAudioPort opt-out and bounded RX recording prevent unbounded memory growth.
+    let (mut silent_rec_port, silent_handle) =
+        WavAudioPort::new_with_recording(WavPcm16::new(48_000, vec![0; 960]), true, false);
+    silent_rec_port.playout_20ms(&[1000i16; 960]);
+    assert!(silent_handle.recorded_wav().samples.is_empty());
+
+    let (capped_port, capped_handle) = WavAudioPort::new(WavPcm16::new(8_000, vec![0; 160]), true);
+    let mut capped_port = capped_port.with_max_recorded_samples(Some(240));
+    capped_port.playout_20ms(&[500i16; 160]);
+    capped_port.playout_20ms(&[500i16; 160]);
+    assert_eq!(capped_handle.recorded_wav().samples.len(), 240);
+
+    // 2. Verify PcmQueueAudioPort supports native 48 kHz 960-sample HD frames.
+    let (mut pcm48_port, pcm48_handle) = PcmQueueAudioPort::new_with_sample_rate(48_000, 8);
+    assert_eq!(pcm48_port.sample_rate_hz(), 48_000);
+    assert_eq!(pcm48_handle.frame_samples(), 960);
+    assert!(pcm48_handle.push_captured_samples(vec![0; 160]).is_err());
+    pcm48_handle
+        .push_captured_samples(vec![1234; 960])
+        .expect("960-sample 48 kHz frame accepted");
+    assert_eq!(pcm48_port.capture_frame_20ms(), vec![1234; 960]);
+
+    // 3. Verify SipEngine routes server responses back to the exact UDP peer source (RFC 3581),
+    //    even when the peer address differs from `registrar_addr`.
+    let dummy_registrar = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 1);
+    let ua_cfg = UaConfig::new(
+        "peer1",
+        "pw",
+        "127.0.0.1",
+        SipUri::parse("sip:127.0.0.1:1").unwrap(),
+        "127.0.0.1",
+        0,
+    );
+    let eng_cfg = EngineConfig::new(ua_cfg, dummy_registrar, IpAddr::V4(Ipv4Addr::LOCALHOST), 0);
+    let (audio_port, _) =
+        WavAudioPort::new_with_recording(WavPcm16::new(8_000, vec![0; 160]), true, false);
+    let engine = SipEngine::spawn(eng_cfg, Box::new(audio_port)).unwrap();
+    let eng_addr = engine.local_sip_addr();
+
+    let peer_sock = UdpSocket::bind("127.0.0.1:0").unwrap();
+    peer_sock
+        .set_read_timeout(Some(Duration::from_secs(3)))
+        .unwrap();
+    let peer_addr = peer_sock.local_addr().unwrap();
+
+    let options = format!(
+        "OPTIONS sip:peer1@{eng_addr} SIP/2.0\r\n\
+         Via: SIP/2.0/UDP {peer_addr};branch=z9hG4bK-direct-opt-1;rport\r\n\
+         From: <sip:tester@127.0.0.1>;tag=t1\r\n\
+         To: <sip:peer1@127.0.0.1>\r\n\
+         Call-ID: direct-opt-1\r\n\
+         CSeq: 1 OPTIONS\r\n\
+         Content-Length: 0\r\n\r\n"
+    );
+    peer_sock.send_to(options.as_bytes(), eng_addr).unwrap();
+
+    let mut buf = [0u8; 2048];
+    let (len, from_addr) = peer_sock
+        .recv_from(&mut buf)
+        .expect("expected 200 OK routed directly to peer_sock");
+    assert_eq!(from_addr, eng_addr);
+    let text = std::str::from_utf8(&buf[..len]).unwrap();
+    assert!(
+        text.starts_with("SIP/2.0 200 OK"),
+        "unexpected response: {text}"
+    );
+
+    engine.shutdown().unwrap();
+}

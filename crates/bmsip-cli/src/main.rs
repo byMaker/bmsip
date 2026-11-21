@@ -409,12 +409,13 @@ fn build_audio_port(
     live_audio: bool,
     mic_gain: f32,
     tx_wav: WavPcm16,
+    record_rx: bool,
 ) -> (Box<dyn AudioPort>, AudioInspector) {
     if live_audio {
-        let (port, handle) = LiveLinuxAudioPort::spawn_with_gain(mic_gain);
+        let (port, handle) = LiveLinuxAudioPort::spawn_with_options(mic_gain, record_rx);
         (Box::new(port), AudioInspector::Live(handle))
     } else {
-        let (port, handle) = WavAudioPort::new(tx_wav, true);
+        let (port, handle) = WavAudioPort::new_with_recording(tx_wav, true, record_rx);
         (Box::new(port), AudioInspector::Wav(handle))
     }
 }
@@ -464,13 +465,17 @@ fn unregister_and_shutdown(
 
     let rx_wav = inspector.recorded_wav();
     if !quiet {
-        println!(
-            "Recorded RX samples: {} (RMS energy: {})",
-            rx_wav.samples.len(),
-            rx_wav.rms_energy()
-        );
-        let report = analyzer::analyze_wav(&rx_wav, target_tone_hz);
-        println!("{}", report.format_oneliner());
+        if rx_wav.samples.is_empty() && wav_out.is_none() {
+            println!("RX WAV recording disabled for live audio (pass --wav-out to record)");
+        } else {
+            println!(
+                "Recorded RX samples: {} (RMS energy: {})",
+                rx_wav.samples.len(),
+                rx_wav.rms_energy()
+            );
+            let report = analyzer::analyze_wav(&rx_wav, target_tone_hz);
+            println!("{}", report.format_oneliner());
+        }
     }
 
     if let Some(path) = wav_out {
@@ -510,7 +515,8 @@ fn execute_outbound_session(
     ua_cfg.supported_codecs = codec.supported_codecs();
     let eng_cfg = EngineConfig::new(ua_cfg, registrar_addr, IpAddr::V4(Ipv4Addr::UNSPECIFIED), 0);
 
-    let (audio_port, inspector) = build_audio_port(live_audio, mic_gain, tx_wav);
+    let record_rx = !live_audio || wav_out.is_some();
+    let (audio_port, inspector) = build_audio_port(live_audio, mic_gain, tx_wav, record_rx);
     let engine = SipEngine::spawn(eng_cfg, audio_port).map_err(|e| e.to_string())?;
     register_and_wait(&engine)?;
 
@@ -671,10 +677,12 @@ fn run_listen(cli: ListenCliArgs) -> Result<(), String> {
         cli.codec.default_wav_sample_rate_hz()
     };
     let silence_len = (silence_rate / 50) as usize;
+    let record_rx = !cli.live_audio || cli.wav_out.is_some();
     let (audio_port, inspector) = build_audio_port(
         cli.live_audio,
         cli.mic_gain,
         WavPcm16::new(silence_rate, vec![0; silence_len]),
+        record_rx,
     );
     let engine = SipEngine::spawn(eng_cfg, audio_port).map_err(|e| e.to_string())?;
     register_and_wait(&engine)?;

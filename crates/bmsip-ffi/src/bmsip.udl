@@ -46,6 +46,11 @@ interface BmsipClient {
     [Throws=FfiError]
     constructor(FfiConfig config);
 
+    [Name=with_sample_rate, Throws=FfiError]
+    constructor(FfiConfig config, u32 sample_rate_hz);
+
+    u32 audio_sample_rate_hz();
+
     [Throws=FfiError]
     void register_account();
 

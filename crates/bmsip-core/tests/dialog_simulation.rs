@@ -687,3 +687,329 @@ fn handles_inbound_options_keepalive() {
         Some("ast1")
     );
 }
+
+#[test]
+fn answer_does_not_duplicate_record_route_headers() {
+    let t0 = Instant::now();
+    let mut bob = UserAgent::new(UaConfig::new(
+        "bob",
+        "pw",
+        "pbx.local",
+        SipUri::parse("sip:pbx.local:5060").unwrap(),
+        "10.0.0.2",
+        5062,
+    ));
+
+    let sdp = "v=0\r\n\
+        o=alice 1 1 IN IP4 10.0.0.1\r\n\
+        s=test\r\n\
+        c=IN IP4 10.0.0.1\r\n\
+        t=0 0\r\n\
+        m=audio 40000 RTP/AVP 0\r\n\
+        a=rtpmap:0 PCMU/8000\r\n";
+    let invite = format!(
+        "INVITE sip:bob@10.0.0.2:5062 SIP/2.0\r\n\
+         Via: SIP/2.0/UDP 10.0.0.5:5060;branch=z9hG4bK-rr-1\r\n\
+         Record-Route: <sip:10.0.0.5:5060;lr>\r\n\
+         Record-Route: <sip:10.0.0.6:5060;lr>\r\n\
+         From: <sip:alice@pbx.local>;tag=a1\r\n\
+         To: <sip:bob@pbx.local>\r\n\
+         Call-ID: rr-test-1@10.0.0.1\r\n\
+         CSeq: 1 INVITE\r\n\
+         Contact: <sip:alice@10.0.0.1:5060>\r\n\
+         Content-Type: application/sdp\r\n\
+         Content-Length: {}\r\n\r\n{sdp}",
+        sdp.len()
+    );
+
+    let evs = bob.receive_datagram(invite.as_bytes(), t0);
+    assert!(evs.iter().any(
+        |e| matches!(e, UaEvent::IncomingCall { call_id, .. } if call_id == "rr-test-1@10.0.0.1")
+    ));
+    let _ = bob.poll_transmit(); // drain 100 Trying
+
+    bob.answer("rr-test-1@10.0.0.1", 50000, t0).unwrap();
+    let out = bob.poll_transmit();
+    assert_eq!(out.len(), 1);
+    let resp = match SipMessage::parse(&out[0]).unwrap() {
+        SipMessage::Response(r) => r,
+        SipMessage::Request(_) => panic!("expected 200 OK"),
+    };
+    assert_eq!(resp.status_code, 200);
+    assert_eq!(resp.headers.get_all("Record-Route").len(), 2);
+}
+
+#[test]
+fn reinvite_glare_returns_491_and_out_of_order_cseq_returns_500() {
+    let t0 = Instant::now();
+    let mut cluster = MiniSipCluster::new(t0, NetworkPolicy::default(), 99);
+
+    let cid = cluster
+        .alice
+        .dial(
+            SipUri::parse("sip:bob@10.0.0.2:5062").unwrap(),
+            40040,
+            cluster.now,
+        )
+        .unwrap();
+
+    for _ in 0..30 {
+        let (_, b_ev) = cluster.step_until(1, None);
+        for ev in b_ev {
+            if let UaEvent::IncomingCall { call_id, .. } = ev {
+                cluster.bob.answer(&call_id, 50040, cluster.now).unwrap();
+            }
+        }
+        if cluster.alice.call_state(&cid) == Some(CallState::Established)
+            && cluster.bob.call_state(&cid) == Some(CallState::Established)
+        {
+            break;
+        }
+    }
+    assert_eq!(cluster.alice.call_state(&cid), Some(CallState::Established));
+    let dialog = cluster.alice.dialog_id(&cid).unwrap();
+
+    // Put Alice into ReInviting state (outbound re-INVITE pending).
+    cluster
+        .alice
+        .reinvite(&cid, "10.0.0.1", 40042, cluster.now)
+        .unwrap();
+    let _ = cluster.alice.poll_transmit();
+    assert_eq!(cluster.alice.call_state(&cid), Some(CallState::ReInviting));
+
+    // Inject simultaneous inbound re-INVITE (glare) from Bob -> RFC 3261 §14.2 requires 491 Request Pending.
+    let sdp = "v=0\r\n\
+        o=bob 1 2 IN IP4 10.0.0.2\r\n\
+        s=bmsip\r\n\
+        c=IN IP4 10.0.0.2\r\n\
+        t=0 0\r\n\
+        m=audio 50042 RTP/AVP 0\r\n\
+        a=rtpmap:0 PCMU/8000\r\n";
+    let glare_reinvite = format!(
+        "INVITE sip:alice@10.0.0.1:5060 SIP/2.0\r\n\
+         Via: SIP/2.0/UDP 10.0.0.2:5062;branch=z9hG4bK-glare-1\r\n\
+         From: <sip:bob@10.0.0.2:5062>;tag={}\r\n\
+         To: <sip:alice@pbx.local>;tag={}\r\n\
+         Call-ID: {cid}\r\n\
+         CSeq: 10 INVITE\r\n\
+         Contact: <sip:bob@10.0.0.2:5062>\r\n\
+         Content-Type: application/sdp\r\n\
+         Content-Length: {}\r\n\r\n{sdp}",
+        dialog.remote_tag,
+        dialog.local_tag,
+        sdp.len()
+    );
+    let _ = cluster
+        .alice
+        .receive_datagram(glare_reinvite.as_bytes(), cluster.now);
+    let glare_out = cluster.alice.poll_transmit();
+    assert_eq!(glare_out.len(), 1);
+    let glare_resp = match SipMessage::parse(&glare_out[0]).unwrap() {
+        SipMessage::Response(r) => r,
+        SipMessage::Request(_) => panic!("expected 491 response"),
+    };
+    assert_eq!(glare_resp.status_code, 491);
+    // Call must remain alive in ReInviting state (not torn down).
+    assert_eq!(cluster.alice.call_state(&cid), Some(CallState::ReInviting));
+
+    // Inject an out-of-order BYE with lower CSeq (9 <= 10) -> RFC 3261 §12.2.2 requires 500 and keeps call alive.
+    let stale_bye = format!(
+        "BYE sip:alice@10.0.0.1:5060 SIP/2.0\r\n\
+         Via: SIP/2.0/UDP 10.0.0.2:5062;branch=z9hG4bK-old-bye\r\n\
+         From: <sip:bob@10.0.0.2:5062>;tag={}\r\n\
+         To: <sip:alice@pbx.local>;tag={}\r\n\
+         Call-ID: {cid}\r\n\
+         CSeq: 9 BYE\r\n\
+         Content-Length: 0\r\n\r\n",
+        dialog.remote_tag, dialog.local_tag
+    );
+    let _ = cluster
+        .alice
+        .receive_datagram(stale_bye.as_bytes(), cluster.now);
+    let bye_out = cluster.alice.poll_transmit();
+    assert_eq!(bye_out.len(), 1);
+    let bye_resp = match SipMessage::parse(&bye_out[0]).unwrap() {
+        SipMessage::Response(r) => r,
+        SipMessage::Request(_) => panic!("expected 500 response"),
+    };
+    assert_eq!(bye_resp.status_code, 500);
+    assert_eq!(cluster.alice.call_state(&cid), Some(CallState::ReInviting));
+}
+
+#[test]
+fn instance_seed_prevents_call_id_and_tag_collisions_on_same_port() {
+    let t0 = Instant::now();
+    let registrar = SipUri::parse("sip:pbx.local:5060").unwrap();
+    let mut ua1 = UserAgent::new(
+        UaConfig::new(
+            "alice",
+            "pw",
+            "pbx.local",
+            registrar.clone(),
+            "10.0.0.1",
+            5060,
+        )
+        .with_instance_seed(0x1111_2222),
+    );
+    let mut ua2 = UserAgent::new(
+        UaConfig::new("alice", "pw", "pbx.local", registrar, "10.0.0.1", 5060)
+            .with_instance_seed(0x3333_4444),
+    );
+
+    ua1.register(t0).unwrap();
+    ua2.register(t0).unwrap();
+    let reg1 = match SipMessage::parse(&ua1.poll_transmit()[0]).unwrap() {
+        SipMessage::Request(r) => r,
+        _ => panic!("expected REGISTER"),
+    };
+    let reg2 = match SipMessage::parse(&ua2.poll_transmit()[0]).unwrap() {
+        SipMessage::Request(r) => r,
+        _ => panic!("expected REGISTER"),
+    };
+    assert_ne!(reg1.call_id().unwrap(), reg2.call_id().unwrap());
+    assert_ne!(reg1.from().unwrap().tag, reg2.from().unwrap().tag);
+    assert_ne!(
+        reg1.top_via().unwrap().branch,
+        reg2.top_via().unwrap().branch
+    );
+
+    let c1 = ua1
+        .dial(SipUri::parse("sip:bob@pbx.local").unwrap(), 40000, t0)
+        .unwrap();
+    let c2 = ua2
+        .dial(SipUri::parse("sip:bob@pbx.local").unwrap(), 40000, t0)
+        .unwrap();
+    assert_ne!(c1, c2);
+}
+
+#[test]
+fn digest_auth_retries_on_stale_nonce_rotation_and_stops_on_bad_password() {
+    let t0 = Instant::now();
+    let mut ua = UserAgent::new(UaConfig::new(
+        "alice",
+        "alice-pw",
+        "pbx.local",
+        SipUri::parse("sip:pbx.local:5060").unwrap(),
+        "10.0.0.1",
+        5060,
+    ));
+
+    ua.register(t0).unwrap();
+    let req1 = match SipMessage::parse(&ua.poll_transmit()[0]).unwrap() {
+        SipMessage::Request(r) => r,
+        _ => panic!("expected REGISTER 1"),
+    };
+
+    // First 401 challenge (stale=false).
+    let mut c1 = req1.create_response(401, "Unauthorized").unwrap();
+    c1.headers.set(
+        "WWW-Authenticate",
+        "Digest realm=\"pbx.local\", nonce=\"nonce-old\", algorithm=MD5, qop=\"auth\"",
+    );
+    let _ = ua.receive_datagram(&c1.to_bytes(), t0);
+    let req2 = match SipMessage::parse(&ua.poll_transmit()[0]).unwrap() {
+        SipMessage::Request(r) => r,
+        _ => panic!("expected REGISTER 2"),
+    };
+    assert!(req2.headers.get("Authorization").is_some());
+
+    // Second 401 challenge with stale=true (nonce rotated) -> UA must retry with fresh nonce.
+    let mut c2 = req2.create_response(401, "Unauthorized").unwrap();
+    c2.headers.set(
+        "WWW-Authenticate",
+        "Digest realm=\"pbx.local\", nonce=\"nonce-fresh\", algorithm=MD5, qop=\"auth\", stale=true",
+    );
+    let _ = ua.receive_datagram(&c2.to_bytes(), t0);
+    let out3 = ua.poll_transmit();
+    assert_eq!(out3.len(), 1, "expected retry after stale=true challenge");
+    let req3 = match SipMessage::parse(&out3[0]).unwrap() {
+        SipMessage::Request(r) => r,
+        _ => panic!("expected REGISTER 3"),
+    };
+    assert!(req3
+        .headers
+        .get("Authorization")
+        .unwrap()
+        .contains("nonce=\"nonce-fresh\""));
+
+    // Multi-Contact 200 OK -> must match our local contact's expires (180), not another device's (60).
+    let mut ok = req3.create_response(200, "OK").unwrap();
+    ok.headers.add(
+        "Contact",
+        "<sip:alice@10.9.9.9:5060;transport=udp>;expires=60, <sip:alice@10.0.0.1:5060;transport=udp>;expires=180",
+    );
+    ok.headers.set("Expires", "300");
+    let _ = ua.receive_datagram(&ok.to_bytes(), t0);
+    assert!(matches!(
+        ua.registration_state(),
+        RegistrationState::Registered {
+            expires_secs: 180,
+            ..
+        }
+    ));
+
+    // Verify non-stale second 401 fails immediately without retrying.
+    ua.register(t0 + Duration::from_secs(1)).unwrap();
+    let r_a = match SipMessage::parse(&ua.poll_transmit()[0]).unwrap() {
+        SipMessage::Request(r) => r,
+        _ => panic!("expected REGISTER"),
+    };
+    let mut bad1 = r_a.create_response(401, "Unauthorized").unwrap();
+    bad1.headers.set(
+        "WWW-Authenticate",
+        "Digest realm=\"pbx.local\", nonce=\"n1\", algorithm=MD5, qop=\"auth\"",
+    );
+    let _ = ua.receive_datagram(&bad1.to_bytes(), t0 + Duration::from_secs(1));
+    let r_b = match SipMessage::parse(&ua.poll_transmit()[0]).unwrap() {
+        SipMessage::Request(r) => r,
+        _ => panic!("expected retried REGISTER"),
+    };
+    let mut bad2 = r_b.create_response(401, "Unauthorized").unwrap();
+    bad2.headers.set(
+        "WWW-Authenticate",
+        "Digest realm=\"pbx.local\", nonce=\"n2\", algorithm=MD5, qop=\"auth\", stale=false",
+    );
+    let _ = ua.receive_datagram(&bad2.to_bytes(), t0 + Duration::from_secs(1));
+    assert!(ua.poll_transmit().is_empty());
+    assert!(matches!(
+        ua.registration_state(),
+        RegistrationState::Failed {
+            status_code: Some(401),
+            ..
+        }
+    ));
+}
+
+#[test]
+fn answer_without_sdp_sends_488_and_clears_call() {
+    let t0 = Instant::now();
+    let mut bob = UserAgent::new(UaConfig::new(
+        "bob",
+        "pw",
+        "pbx.local",
+        SipUri::parse("sip:pbx.local:5060").unwrap(),
+        "10.0.0.2",
+        5062,
+    ));
+    let invite_no_sdp = b"INVITE sip:bob@10.0.0.2:5062 SIP/2.0\r\n\
+        Via: SIP/2.0/UDP 10.0.0.1:5060;branch=z9hG4bK-nosdp-1\r\n\
+        From: <sip:alice@pbx.local>;tag=a9\r\n\
+        To: <sip:bob@pbx.local>\r\n\
+        Call-ID: nosdp-call-1\r\n\
+        CSeq: 1 INVITE\r\n\
+        Contact: <sip:alice@10.0.0.1:5060>\r\n\
+        Content-Length: 0\r\n\r\n";
+
+    let _ = bob.receive_datagram(invite_no_sdp, t0);
+    let _ = bob.poll_transmit(); // drain 100 Trying
+
+    assert!(bob.answer("nosdp-call-1", 50000, t0).is_err());
+    assert_eq!(bob.call_state("nosdp-call-1"), None);
+    let out = bob.poll_transmit();
+    assert_eq!(out.len(), 1);
+    let resp = match SipMessage::parse(&out[0]).unwrap() {
+        SipMessage::Response(r) => r,
+        SipMessage::Request(_) => panic!("expected 488 response"),
+    };
+    assert_eq!(resp.status_code, 488);
+}
