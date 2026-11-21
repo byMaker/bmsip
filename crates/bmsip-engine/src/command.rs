@@ -74,6 +74,20 @@ pub enum EngineCommand {
     Hangup {
         call_id: String,
     },
+    Hold {
+        call_id: String,
+    },
+    ResumeCall {
+        call_id: String,
+    },
+    Transfer {
+        call_id: String,
+        target_uri: SipUri,
+    },
+    AttendedTransfer {
+        call_id: String,
+        target_call_id: String,
+    },
     SendDtmf {
         call_id: String,
         digit: DtmfDigit,
@@ -114,6 +128,21 @@ pub enum EngineEvent {
     CallMediaUpdated {
         call_id: String,
         remote_rtp: SocketAddr,
+    },
+    CallHoldChanged {
+        call_id: String,
+        local_hold: bool,
+        remote_hold: bool,
+    },
+    CallTransferRequested {
+        call_id: String,
+        refer_to: String,
+    },
+    TransferStatus {
+        call_id: String,
+        status_code: u16,
+        reason: String,
+        terminated: bool,
     },
     DtmfReceived {
         call_id: String,

@@ -5,6 +5,20 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.10.0] - 2026-11-21
+
+### Added
+- **Core Call Control, Session Timers & Identity (`bmsip-core`):**
+  - Implemented **Call Hold / Resume** (`UserAgent::hold`, `UserAgent::resume_call`, `UserAgent::hold_state`, `UaEvent::CallHoldChanged`) via RFC 3264 / RFC 6337 `re-INVITE` SDP direction negotiation (`a=sendonly`, `a=recvonly`, `a=inactive`, `a=sendrecv`).
+  - Implemented **Blind & Attended Call Transfer** (`UserAgent::refer`, `UserAgent::attended_transfer`, `UserAgent::dial_with_replaces`, `UserAgent::notify_refer_status`) supporting RFC 3515 `REFER`, RFC 3891 `Replaces` header / `?Replaces=` URI promotion and target dialog replacement, `Referred-By`, and `NOTIFY` `message/sipfrag` progress events (`UaEvent::CallTransferRequested`, `UaEvent::TransferNotify`).
+  - Implemented early/in-dialog **`UPDATE`** (RFC 3311, `UserAgent::send_update`) and **Reliable Provisional `1xx` / `PRACK`** (RFC 3262, `UserAgent::ring_reliable`, automatic `RSeq`/`RAck` `PRACK` generation and server validation).
+  - Implemented **RFC 4028 Session Timers** (`UaConfig::with_session_timers`, `SessionExpires`, `Min-SE` negotiation, `422 Session Interval Too Small` automatic retry, periodic `UPDATE` refresh at half the negotiated interval, and automatic `408`-style `BYE` cleanup upon timeout expiry).
+  - Added **RFC 3326 `Reason`** headers (`UserAgent::hangup_with_reason`, `ReasonHeader`, `UaEvent::CallTerminated::reason_header`) and **RFC 3323 / RFC 3325 Caller Identity** (`UaConfig::with_caller_identity`, `P-Asserted-Identity`, `P-Preferred-Identity`, `Remote-Party-ID`, `Privacy`, `CallerIdentity`, `UaEvent::IncomingCall::caller_identity`).
+- **Engine, FFI & CLI Call Control (`bmsip-engine`, `bmsip-ffi`, `bmsip-cli`):**
+  - Added `EngineCommand::{Hold, ResumeCall, Transfer, AttendedTransfer}` and `EngineEvent::{CallHoldChanged, CallTransferRequested, TransferStatus}`, muting outbound RTP/DTMF TX while locally held and draining mic capture cleanly.
+  - Exposed `hold`, `resume_call`, `transfer`, and `attended_transfer` on `BmsipClient` (`bmsip.udl`) and `bmsip_client_{hold,resume_call,transfer,attended_transfer}` in `include/bmsip.h` alongside `FfiEventKind::{CallHoldChanged, CallTransferRequested, TransferStatus}`.
+  - Added `--hold-ms <ms>` and `--transfer <sip_uri>` flags to `bmsip-cli call`.
+
 ## [0.9.2] - 2026-11-21
 
 ### Fixed

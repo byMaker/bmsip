@@ -62,6 +62,8 @@ struct CallMediaRuntime {
     rtp_packets_sent: u32,
     initial_rtcp_sent: bool,
     next_rtcp_at: Instant,
+    local_hold: bool,
+    remote_hold: bool,
 }
 
 struct SharedState {
@@ -443,8 +445,65 @@ impl WorkerCtx {
                     call_id,
                     status_code,
                     reason,
+                    ..
                 } => {
                     self.on_call_terminated(&call_id, status_code, reason, now);
+                }
+                UaEvent::CallHoldChanged {
+                    call_id,
+                    local_hold,
+                    remote_hold,
+                } => {
+                    if let Some(media) = self.active_media.get_mut(&call_id) {
+                        media.local_hold = local_hold;
+                        media.remote_hold = remote_hold;
+                    }
+                    self.recorder.record(
+                        now,
+                        TelemetryCategory::DialogFsm,
+                        Some(&call_id),
+                        format!("hold changed local={local_hold} remote={remote_hold}"),
+                    );
+                    self.push_event(EngineEvent::CallHoldChanged {
+                        call_id,
+                        local_hold,
+                        remote_hold,
+                    });
+                }
+                UaEvent::CallTransferRequested {
+                    call_id, refer_to, ..
+                } => {
+                    let target_str = refer_to.to_string();
+                    let _ = self.ua.notify_refer_status(&call_id, 200, "OK", true, now);
+                    self.recorder.record(
+                        now,
+                        TelemetryCategory::DialogFsm,
+                        Some(&call_id),
+                        format!("transfer requested -> {target_str}"),
+                    );
+                    self.push_event(EngineEvent::CallTransferRequested {
+                        call_id,
+                        refer_to: target_str,
+                    });
+                }
+                UaEvent::TransferNotify {
+                    call_id,
+                    status_code,
+                    reason,
+                    terminated,
+                } => {
+                    self.recorder.record(
+                        now,
+                        TelemetryCategory::DialogFsm,
+                        Some(&call_id),
+                        format!("transfer notify {status_code} {reason} terminated={terminated}"),
+                    );
+                    self.push_event(EngineEvent::TransferStatus {
+                        call_id,
+                        status_code,
+                        reason,
+                        terminated,
+                    });
                 }
                 UaEvent::ProtocolWarning(msg) => {
                     self.recorder
@@ -584,6 +643,7 @@ impl WorkerCtx {
         if let Some(plugin) = custom_plugin {
             session = session.with_codec_plugin(plugin);
         }
+        let (local_hold, remote_hold) = self.ua.hold_state(call_id).unwrap_or((false, false));
         let remote_rtcp = SocketAddr::new(remote_ip, remote_sdp.audio_port.saturating_add(1));
         self.active_media.insert(
             call_id.to_string(),
@@ -597,6 +657,8 @@ impl WorkerCtx {
                 rtp_packets_sent: 0,
                 initial_rtcp_sent: false,
                 next_rtcp_at: now + Duration::from_millis(RTCP_REPORT_INTERVAL_MS),
+                local_hold,
+                remote_hold,
             },
         );
         if !self.call_order.iter().any(|id| id == call_id) {
@@ -729,6 +791,32 @@ impl WorkerCtx {
             EngineCommand::Hangup { call_id } => {
                 if let Err(err) = self.ua.hangup(&call_id, now) {
                     self.emit_cmd_error("hangup", err);
+                }
+            }
+            EngineCommand::Hold { call_id } => {
+                if let Err(err) = self.ua.hold(&call_id, now) {
+                    self.emit_cmd_error("hold", err);
+                }
+            }
+            EngineCommand::ResumeCall { call_id } => {
+                if let Err(err) = self.ua.resume_call(&call_id, now) {
+                    self.emit_cmd_error("resume_call", err);
+                }
+            }
+            EngineCommand::Transfer {
+                call_id,
+                target_uri,
+            } => {
+                if let Err(err) = self.ua.refer(&call_id, target_uri, now) {
+                    self.emit_cmd_error("transfer", err);
+                }
+            }
+            EngineCommand::AttendedTransfer {
+                call_id,
+                target_call_id,
+            } => {
+                if let Err(err) = self.ua.attended_transfer(&call_id, &target_call_id, now) {
+                    self.emit_cmd_error("attended_transfer", err);
                 }
             }
             EngineCommand::SendDtmf { call_id, digit } => {
@@ -905,7 +993,10 @@ impl WorkerCtx {
             let Some(media) = self.active_media.get_mut(call_id) else {
                 continue;
             };
-            if self.ua.call_state(call_id) != Some(CallState::Established) {
+            if !matches!(
+                self.ua.call_state(call_id),
+                Some(CallState::Established | CallState::ReInviting)
+            ) {
                 continue;
             }
 
@@ -999,27 +1090,33 @@ impl WorkerCtx {
             let Some(media) = self.active_media.get_mut(call_id) else {
                 continue;
             };
-            if self.ua.call_state(call_id) != Some(CallState::Established) {
+            if !matches!(
+                self.ua.call_state(call_id),
+                Some(CallState::Established | CallState::ReInviting)
+            ) {
                 continue;
             }
 
             if !primary_served {
                 primary_served = true;
-                // Capture and play out audio frames on the deterministic primary active call.
+                // Always capture from the audio port to keep host capture buffers fresh,
+                // but skip outbound RTP media transmission while the call is on hold.
                 let tx_pcm = self.audio_port.capture_frame_20ms();
-                if let Ok(pkt) = media.session.encode_pcm_frame(&tx_pcm) {
-                    if media.rtp_socket.send_to(&pkt, media.remote_rtp).is_ok() {
-                        media.rtp_packets_sent = media.rtp_packets_sent.saturating_add(1);
-                    }
-                }
-                if media.rtp_packets_sent >= 2 {
-                    if let Some(dtmf_pkt) = media.session.pop_dtmf_packet() {
-                        if media
-                            .rtp_socket
-                            .send_to(&dtmf_pkt, media.remote_rtp)
-                            .is_ok()
-                        {
+                if !(media.local_hold || media.remote_hold) {
+                    if let Ok(pkt) = media.session.encode_pcm_frame(&tx_pcm) {
+                        if media.rtp_socket.send_to(&pkt, media.remote_rtp).is_ok() {
                             media.rtp_packets_sent = media.rtp_packets_sent.saturating_add(1);
+                        }
+                    }
+                    if media.rtp_packets_sent >= 2 {
+                        if let Some(dtmf_pkt) = media.session.pop_dtmf_packet() {
+                            if media
+                                .rtp_socket
+                                .send_to(&dtmf_pkt, media.remote_rtp)
+                                .is_ok()
+                            {
+                                media.rtp_packets_sent = media.rtp_packets_sent.saturating_add(1);
+                            }
                         }
                     }
                 }

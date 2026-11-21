@@ -22,6 +22,7 @@ Legacy C/C++ SIP stacks often suffer from hidden global state, callback re-entra
   - **Universal Codec Plugin System:** Register custom external codecs (`G.729`, `L16`, `AMR-WB`, `Codec2`, etc.) via `AudioCodecPlugin` + `FnCodecFactory` + `EngineConfig::register_custom_codec` with automatic `8`/`16`/`48` kHz PCM adaptation.
 - **Adaptive Jitter Buffer & Microphone DSP:** 16-bit RTP sequence rollover handling, jitter-driven buffering depth, smooth zero-click PLC crossfade on recovered frames, and frame-level microphone noise gate / gain / soft limiter (`condition_mic_frame`).
 - **First-Class Mobile Lifecycle & Black-Box Flight Recorder:** Built-in `NetworkChanged` (Wi-Fi <-> LTE handover with `REGISTER` refresh + `re-INVITE`), `Suspend` / `Resume` (PushKit / FCM background wakeup), and a bounded per-call JSON flight recorder.
+- **Complete Softphone Call Control:** Call Hold / Resume (`re-INVITE` `a=sendonly`/`inactive`/`sendrecv`), Blind (`REFER` + `NOTIFY message/sipfrag`) & Attended (`Replaces`) Transfer, early/in-dialog `UPDATE`, `PRACK` (`100rel`), `Session-Timers` (RFC 4028 with `422` auto-retry), `Reason` (RFC 3326), and `P-Asserted-Identity` / `Privacy` Caller-ID (RFC 3323 / RFC 3325).
 - **Cross-Platform FFI (`bmsip-ffi`):** Unified UniFFI `.udl` contract (`BmsipClient`) for **Swift (iOS)** and **Kotlin (Android)** plus a C99 `extern "C"` ABI (`bmsip.h`), with reference OS audio/AEC adapters under `bindings/`.
 
 ---
@@ -118,6 +119,7 @@ docker compose exec -T dev cargo run -p bmsip-cli -- call \
   --codec opus \
   --mic-gain 4.0 \
   --live-audio \
+  --hold-ms 500 \
   --wav-out /tmp/echo_rx.wav \
   --json-report /tmp/call_blackbox.json
 

@@ -58,6 +58,9 @@ pub enum FfiEventKind {
     CallRinging,
     CallEstablished,
     CallMediaUpdated,
+    CallHoldChanged,
+    CallTransferRequested,
+    TransferStatus,
     DtmfReceived,
     CallTerminated,
     Suspended,
@@ -78,6 +81,9 @@ impl FfiEventKind {
             Self::CallRinging => "CallRinging",
             Self::CallEstablished => "CallEstablished",
             Self::CallMediaUpdated => "CallMediaUpdated",
+            Self::CallHoldChanged => "CallHoldChanged",
+            Self::CallTransferRequested => "CallTransferRequested",
+            Self::TransferStatus => "TransferStatus",
             Self::DtmfReceived => "DtmfReceived",
             Self::CallTerminated => "CallTerminated",
             Self::Suspended => "Suspended",
@@ -213,6 +219,34 @@ impl BmsipClient {
 
     pub fn hangup(&self, call_id: String) -> Result<(), FfiError> {
         self.send(EngineCommand::Hangup { call_id })
+    }
+
+    pub fn hold(&self, call_id: String) -> Result<(), FfiError> {
+        self.send(EngineCommand::Hold { call_id })
+    }
+
+    pub fn resume_call(&self, call_id: String) -> Result<(), FfiError> {
+        self.send(EngineCommand::ResumeCall { call_id })
+    }
+
+    pub fn transfer(&self, call_id: String, target_uri: String) -> Result<(), FfiError> {
+        let uri =
+            SipUri::parse(&target_uri).map_err(|e| FfiError::InvalidArgument(e.to_string()))?;
+        self.send(EngineCommand::Transfer {
+            call_id,
+            target_uri: uri,
+        })
+    }
+
+    pub fn attended_transfer(
+        &self,
+        call_id: String,
+        target_call_id: String,
+    ) -> Result<(), FfiError> {
+        self.send(EngineCommand::AttendedTransfer {
+            call_id,
+            target_call_id,
+        })
     }
 
     pub fn send_dtmf(&self, call_id: String, digit: String) -> Result<(), FfiError> {
@@ -375,6 +409,38 @@ fn map_engine_event(ev: EngineEvent) -> FfiEvent {
             call_id: Some(call_id),
             detail: Some(format!("remote_rtp={remote_rtp}")),
             status_code: None,
+            black_box_json: None,
+        },
+        EngineEvent::CallHoldChanged {
+            call_id,
+            local_hold,
+            remote_hold,
+        } => FfiEvent {
+            kind: FfiEventKind::CallHoldChanged,
+            call_id: Some(call_id),
+            detail: Some(format!(
+                "local_hold={local_hold}, remote_hold={remote_hold}"
+            )),
+            status_code: None,
+            black_box_json: None,
+        },
+        EngineEvent::CallTransferRequested { call_id, refer_to } => FfiEvent {
+            kind: FfiEventKind::CallTransferRequested,
+            call_id: Some(call_id),
+            detail: Some(refer_to),
+            status_code: None,
+            black_box_json: None,
+        },
+        EngineEvent::TransferStatus {
+            call_id,
+            status_code,
+            reason,
+            terminated,
+        } => FfiEvent {
+            kind: FfiEventKind::TransferStatus,
+            call_id: Some(call_id),
+            detail: Some(format!("{reason} (terminated={terminated})")),
+            status_code: Some(status_code),
             black_box_json: None,
         },
         EngineEvent::DtmfReceived { call_id, digit } => FfiEvent {

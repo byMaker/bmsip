@@ -92,6 +92,8 @@ struct CallCliArgs {
     mic_gain: f32,
     live_audio: bool,
     dtmf: Option<String>,
+    hold_ms: Option<u64>,
+    transfer: Option<String>,
     wav_in: Option<String>,
     wav_out: Option<String>,
     json_report: Option<String>,
@@ -165,6 +167,8 @@ fn print_usage() {
            --live-audio           Use 48 kHz live Linux microphone/speaker via PipeWire/PulseAudio/ALSA\n  \
            --wav <path>           Input 16-bit mono WAV file for analyze subcommand\n  \
            --dtmf <digits>        Optional RFC 4733 DTMF digits to transmit after connect (call)\n  \
+           --hold-ms <ms>         Optional mid-call hold duration before resuming (call)\n  \
+           --transfer <sip_uri>   Optional blind REFER transfer target prior to hangup (call)\n  \
            --wav-in <path>        Optional 16-bit mono WAV file to transmit (call)\n  \
            --wav-out <path>       Optional path to write received RX audio WAV\n  \
            --json-report <path>   Optional path to write per-call black-box JSON telemetry",
@@ -200,6 +204,8 @@ fn parse_call_args(args: &[String]) -> Result<CallCliArgs, String> {
     let mut mic_gain: f32 = 4.0;
     let mut live_audio = false;
     let mut dtmf: Option<String> = None;
+    let mut hold_ms: Option<u64> = None;
+    let mut transfer: Option<String> = None;
     let mut wav_in: Option<String> = None;
     let mut wav_out: Option<String> = None;
     let mut json_report: Option<String> = None;
@@ -230,6 +236,14 @@ fn parse_call_args(args: &[String]) -> Result<CallCliArgs, String> {
             }
             "--live-audio" => live_audio = true,
             "--dtmf" => dtmf = Some(next_arg_value(args, &mut i, "--dtmf")?),
+            "--hold-ms" => {
+                let raw = next_arg_value(args, &mut i, "--hold-ms")?;
+                hold_ms = Some(
+                    raw.parse::<u64>()
+                        .map_err(|_| format!("invalid --hold-ms '{raw}'"))?,
+                );
+            }
+            "--transfer" => transfer = Some(next_arg_value(args, &mut i, "--transfer")?),
             "--wav-in" => wav_in = Some(next_arg_value(args, &mut i, "--wav-in")?),
             "--wav-out" => wav_out = Some(next_arg_value(args, &mut i, "--wav-out")?),
             "--json-report" => json_report = Some(next_arg_value(args, &mut i, "--json-report")?),
@@ -249,6 +263,8 @@ fn parse_call_args(args: &[String]) -> Result<CallCliArgs, String> {
         mic_gain,
         live_audio,
         dtmf,
+        hold_ms,
+        transfer,
         wav_in,
         wav_out,
         json_report,
@@ -500,6 +516,8 @@ fn execute_outbound_session(
     mic_gain: f32,
     live_audio: bool,
     dtmf_digits: &[DtmfDigit],
+    hold_ms: Option<u64>,
+    transfer_target: Option<&SipUri>,
     tx_wav: WavPcm16,
     wav_out: Option<&str>,
     json_report: Option<&str>,
@@ -563,7 +581,31 @@ fn execute_outbound_session(
         });
     }
 
-    thread::sleep(Duration::from_millis(duration_ms));
+    if let Some(hms) = hold_ms {
+        let pre_ms = (duration_ms / 2).max(100);
+        thread::sleep(Duration::from_millis(pre_ms));
+        let _ = engine.send_command(EngineCommand::Hold {
+            call_id: call_id.clone(),
+        });
+        thread::sleep(Duration::from_millis(hms));
+        let _ = engine.send_command(EngineCommand::ResumeCall {
+            call_id: call_id.clone(),
+        });
+        let rem_ms = duration_ms.saturating_sub(pre_ms);
+        if rem_ms > 0 {
+            thread::sleep(Duration::from_millis(rem_ms));
+        }
+    } else {
+        thread::sleep(Duration::from_millis(duration_ms));
+    }
+
+    if let Some(target_uri) = transfer_target {
+        let _ = engine.send_command(EngineCommand::Transfer {
+            call_id: call_id.clone(),
+            target_uri: target_uri.clone(),
+        });
+        thread::sleep(Duration::from_millis(150));
+    }
     let _ = engine.send_command(EngineCommand::Hangup {
         call_id: call_id.clone(),
     });
@@ -636,6 +678,13 @@ fn run_call(cli: CallCliArgs) -> Result<(), String> {
         }
     };
 
+    let transfer_uri = match &cli.transfer {
+        Some(raw) => {
+            Some(SipUri::parse(raw).map_err(|e| format!("invalid --transfer '{raw}': {e}"))?)
+        }
+        None => None,
+    };
+
     execute_outbound_session(
         &cli.server,
         &cli.user,
@@ -646,6 +695,8 @@ fn run_call(cli: CallCliArgs) -> Result<(), String> {
         cli.mic_gain,
         cli.live_audio,
         &dtmf_digits,
+        cli.hold_ms,
+        transfer_uri.as_ref(),
         tx_wav,
         cli.wav_out.as_deref(),
         cli.json_report.as_deref(),
@@ -855,6 +906,8 @@ fn run_selftest(cli: SelftestCliArgs) -> Result<(), String> {
             4.0,
             false,
             &[],
+            None,
+            None,
             tx_wav,
             None,
             None,
@@ -1252,6 +1305,8 @@ fn run_interop(cli: InteropCliArgs) -> Result<(), String> {
                     4.0,
                     false,
                     &[],
+                    None,
+                    None,
                     tx_wav,
                     None,
                     None,
@@ -1358,6 +1413,10 @@ mod tests {
             "--mic-gain",
             "2.5",
             "--live-audio",
+            "--hold-ms",
+            "250",
+            "--transfer",
+            "sip:1002@asterisk:5060",
         ]);
         let parsed = parse_call_args(&args).unwrap();
         assert_eq!(parsed.server, "asterisk:5060");
@@ -1368,6 +1427,8 @@ mod tests {
         assert_eq!(CodecChoice::G722.default_wav_sample_rate_hz(), 16_000);
         assert_eq!(parsed.mic_gain, 2.5);
         assert!(parsed.live_audio);
+        assert_eq!(parsed.hold_ms, Some(250));
+        assert_eq!(parsed.transfer.as_deref(), Some("sip:1002@asterisk:5060"));
     }
 
     #[test]

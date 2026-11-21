@@ -38,6 +38,18 @@ int32_t bmsip_client_dial(const BmsipClientHandle *client, const char *target_ur
 int32_t bmsip_client_ring(const BmsipClientHandle *client, const char *call_id);
 int32_t bmsip_client_answer(const BmsipClientHandle *client, const char *call_id);
 int32_t bmsip_client_hangup(const BmsipClientHandle *client, const char *call_id);
+int32_t bmsip_client_hold(const BmsipClientHandle *client, const char *call_id);
+int32_t bmsip_client_resume_call(const BmsipClientHandle *client, const char *call_id);
+int32_t bmsip_client_transfer(
+    const BmsipClientHandle *client,
+    const char *call_id,
+    const char *target_uri
+);
+int32_t bmsip_client_attended_transfer(
+    const BmsipClientHandle *client,
+    const char *call_id,
+    const char *target_call_id
+);
 int32_t bmsip_client_send_dtmf(
     const BmsipClientHandle *client,
     const char *call_id,

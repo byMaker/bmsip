@@ -51,6 +51,9 @@ bmsip-ffi  ──┘                 └─────────────�
 | RFC 3550 / 4733 | RTP/RTCP media transport and DTMF telephone-event | Implemented (`v0.3.0`) |
 | RFC 6716 / 7587 | Native `libopus` 48 kHz VoIP codec + TOC/`fmtp` + mic DSP conditioning | Implemented (`v0.7.0`) |
 | ITU-T G.722 / RFC 3551 §4.5.2 | Pure-Rust 16 kHz wideband G.722 codec (PT 9) + universal pluggable `AudioCodecPlugin` / `CodecRegistry` | Implemented (`v0.9.0`) |
+| RFC 6337 / 3311 / 3262 | Call Hold/Resume (`a=sendonly`/`inactive`/`sendrecv`), early/in-dialog `UPDATE`, reliable `1xx` / `PRACK` (`100rel`) | Implemented (`v0.10.0`) |
+| RFC 3515 / 3891 | Blind (`REFER` + `NOTIFY message/sipfrag`) and Attended (`Replaces`) Call Transfer | Implemented (`v0.10.0`) |
+| RFC 4028 / 3326 / 3323 / 3325 | `Session-Timers` (`Session-Expires`/`Min-SE`/`422`), `Reason` header, `P-Asserted-Identity` & `Privacy` | Implemented (`v0.10.0`) |
 
 ---
 
@@ -87,7 +90,8 @@ All workspace crates share a synchronized **SemVer 2.0.0** version in root `Carg
 - **`0.8.0` — Stage 8:** RFC 3261 `Record-Route` response copying, multi-server Docker testbed (**Asterisk** `PJSIP` + **FreeSWITCH** `Sofia-SIP` + **Kamailio** `SIP Proxy`), unified `bmsip-cli interop` benchmark, and DSP audio analyzer / jitter PLC crossfade.
 - **`0.9.0` — Stage 9:** Universal pluggable audio codec registry (`AudioCodecPlugin`, `AudioCodecFactory`, `CodecRegistry`, `EngineConfig::register_custom_codec`) and built-in pure-Rust **ITU-T G.722** (16 kHz wideband HD Voice, PT `9`) verified across Asterisk, FreeSWITCH (`mod_spandsp`), and Kamailio.
 - **`0.9.1` — Stage 9 Polish:** Symmetric low-pass FIR downsamplers + stateful `StreamResampler`, zero-copy `RtpPacketRef` hot path, `Condvar` instant command wakeup & adaptive idle polling, live companion RTCP (`rtp_port + 1`) reporting, and deterministic parser mutation fuzz tests.
-- **`0.9.2` — Protocol, Media & FFI Hardening (Current):** RFC 3261 `491` glare / `remote_cseq` / `stale=true` / multi-`Contact` / `488` fixes, restart-safe `instance_seed`, 48 kHz-scaled RFC 4733 DTMF durations, mid-call SSRC reset & RTCP interval loss tracking, symmetric/Route SIP routing, RTP rebind on `NetworkChanged`, deterministic multi-call focus, bounded WAV recording, and native `8`/`16`/`48` kHz FFI/C99 HD audio bridges.
+- **`0.9.2` — Protocol, Media & FFI Hardening:** RFC 3261 `491` glare / `remote_cseq` / `stale=true` / multi-`Contact` / `488` fixes, restart-safe `instance_seed`, 48 kHz-scaled RFC 4733 DTMF durations, mid-call SSRC reset & RTCP interval loss tracking, symmetric/Route SIP routing, RTP rebind on `NetworkChanged`, deterministic multi-call focus, bounded WAV recording, and native `8`/`16`/`48` kHz FFI/C99 HD audio bridges.
+- **`0.10.0` — Stage 10 (Current):** Core Call Control (Hold/Resume via `a=sendonly`/`inactive`/`sendrecv`, Blind `REFER`/`NOTIFY` & Attended `Replaces` transfer, early/in-dialog `UPDATE`, `PRACK`/`100rel`, `Session-Timers` with `422` auto-retry and `UPDATE` refresh, `Reason`, and `P-Asserted-Identity`/`Privacy`) across `bmsip-core`, `bmsip-engine`, `bmsip-ffi` (UniFFI + C99), and `bmsip-cli`.
 
 ---
 
@@ -96,10 +100,7 @@ All workspace crates share a synchronized **SemVer 2.0.0** version in root `Carg
 - **TODO 1 — Transport Security & Media Encryption:**
   - SIP over TCP and TLS 1.2–1.3 (`rustls`, RFC 5922) with stream framing and persistent NAT keep-alive (RFC 5626).
   - Media encryption: **SRTP** (RFC 3711) with **SDES** key exchange (RFC 4568) and **DTLS-SRTP** for public internet traversal.
-- **TODO 2 — Core Call Control (Softphone Essentials):**
-  - Call Hold / Resume (`re-INVITE` with `a=sendonly` / `a=sendrecv`).
-  - Blind & attended call transfer (`REFER` RFC 3515, `Replaces` RFC 3891) and early dialog updates (`UPDATE` RFC 3311).
-  - `Session-Timers` (RFC 4028) for dead-peer detection, `PRACK` (RFC 3262) for reliable `180`/`183` responses, `Reason` header (RFC 3326), and Caller-ID headers (`Privacy` RFC 3323, `P-Asserted-Identity` RFC 3325).
+- **TODO 2 — Core Call Control (Softphone Essentials):** *Completed in `v0.10.0`.*
 - **TODO 3 — Early Media, Legacy DTMF & Comfort Noise:**
   - Early media (`183 Session Progress` with SDP) — activate RTP playout prior to `200 OK`.
   - Legacy SIP `INFO` DTMF (`application/dtmf-relay`, RFC 2976) alongside RFC 4733.

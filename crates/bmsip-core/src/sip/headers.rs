@@ -130,6 +130,16 @@ pub fn canonical_header_name(name: &str) -> String {
         "route" => "Route".to_string(),
         "require" => "Require".to_string(),
         "min-expires" => "Min-Expires".to_string(),
+        "rseq" => "RSeq".to_string(),
+        "rack" => "RAck".to_string(),
+        "min-se" => "Min-SE".to_string(),
+        "replaces" => "Replaces".to_string(),
+        "reason" => "Reason".to_string(),
+        "privacy" => "Privacy".to_string(),
+        "p-asserted-identity" => "P-Asserted-Identity".to_string(),
+        "p-preferred-identity" => "P-Preferred-Identity".to_string(),
+        "remote-party-id" => "Remote-Party-ID".to_string(),
+        "subscription-state" => "Subscription-State".to_string(),
         _ => name.trim().to_string(),
     }
 }
@@ -478,6 +488,444 @@ impl fmt::Display for CSeq {
     }
 }
 
+/// Typed `Replaces` header (RFC 3891) for attended call transfer dialog replacement.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ReplacesHeader {
+    pub call_id: String,
+    pub to_tag: String,
+    pub from_tag: String,
+    pub early_only: bool,
+}
+
+impl ReplacesHeader {
+    /// Creates a `ReplacesHeader` identifying an existing dialog to replace.
+    pub fn new(
+        call_id: impl Into<String>,
+        to_tag: impl Into<String>,
+        from_tag: impl Into<String>,
+    ) -> Self {
+        Self {
+            call_id: call_id.into(),
+            to_tag: to_tag.into(),
+            from_tag: from_tag.into(),
+            early_only: false,
+        }
+    }
+
+    /// Sets the `early-only` parameter (RFC 3891 §3).
+    pub fn with_early_only(mut self, early_only: bool) -> Self {
+        self.early_only = early_only;
+        self
+    }
+
+    /// Parses a raw or URI-percent-encoded `Replaces` value (`<call-id>;to-tag=...;from-tag=...[;early-only]`).
+    pub fn parse(input: &str) -> Result<Self, SipError> {
+        let decoded = percent_decode(input.trim());
+        let mut parts = decoded.split(';');
+        let call_id = parts
+            .next()
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .ok_or_else(|| SipError::ParseError(format!("missing call-id in Replaces '{input}'")))?
+            .to_string();
+
+        let mut to_tag: Option<String> = None;
+        let mut from_tag: Option<String> = None;
+        let mut early_only = false;
+
+        for raw_param in parts {
+            let p = raw_param.trim();
+            if p.is_empty() {
+                continue;
+            }
+            match p.split_once('=') {
+                Some((k, v)) => {
+                    let key = k.trim();
+                    let val = v.trim().trim_matches('"').to_string();
+                    if key.eq_ignore_ascii_case("to-tag") {
+                        to_tag = Some(val);
+                    } else if key.eq_ignore_ascii_case("from-tag") {
+                        from_tag = Some(val);
+                    }
+                }
+                None => {
+                    if p.eq_ignore_ascii_case("early-only") {
+                        early_only = true;
+                    }
+                }
+            }
+        }
+
+        let to_tag = to_tag
+            .filter(|s| !s.is_empty())
+            .ok_or_else(|| SipError::ParseError(format!("missing to-tag in Replaces '{input}'")))?;
+        let from_tag = from_tag.filter(|s| !s.is_empty()).ok_or_else(|| {
+            SipError::ParseError(format!("missing from-tag in Replaces '{input}'"))
+        })?;
+
+        Ok(Self {
+            call_id,
+            to_tag,
+            from_tag,
+            early_only,
+        })
+    }
+
+    /// Encodes the `Replaces` value for safe inclusion inside a `Refer-To` URI `?Replaces=` header parameter.
+    pub fn to_uri_escaped(&self) -> String {
+        let raw = self.to_string();
+        let mut out = String::with_capacity(raw.len() + 16);
+        for b in raw.bytes() {
+            match b {
+                b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'_' | b'.' | b'~' => {
+                    out.push(b as char);
+                }
+                _ => {
+                    use std::fmt::Write as _;
+                    let _ = write!(out, "%{b:02X}");
+                }
+            }
+        }
+        out
+    }
+}
+
+impl fmt::Display for ReplacesHeader {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(
+            f,
+            "{};to-tag={};from-tag={}",
+            self.call_id, self.to_tag, self.from_tag
+        )?;
+        if self.early_only {
+            f.write_str(";early-only")?;
+        }
+        Ok(())
+    }
+}
+
+/// Refresher role for RFC 4028 SIP Session Timers (`uac` or `uas`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SessionRefresher {
+    Uac,
+    Uas,
+}
+
+impl SessionRefresher {
+    /// Returns the wire `refresher=` parameter value (`"uac"` or `"uas"`).
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Uac => "uac",
+            Self::Uas => "uas",
+        }
+    }
+}
+
+impl fmt::Display for SessionRefresher {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
+/// Typed `Session-Expires` header (RFC 4028).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SessionExpires {
+    pub delta_seconds: u32,
+    pub refresher: Option<SessionRefresher>,
+}
+
+impl SessionExpires {
+    /// Creates a `Session-Expires` value with interval in seconds and optional refresher role.
+    pub fn new(delta_seconds: u32, refresher: Option<SessionRefresher>) -> Self {
+        Self {
+            delta_seconds,
+            refresher,
+        }
+    }
+
+    /// Parses `<delta-seconds>[;refresher=uac|uas]`.
+    pub fn parse(input: &str) -> Result<Self, SipError> {
+        let mut parts = input.trim().split(';');
+        let delta_str = parts
+            .next()
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .ok_or_else(|| SipError::ParseError(format!("empty Session-Expires '{input}'")))?;
+        let delta_seconds = delta_str.parse::<u32>().map_err(|_| {
+            SipError::ParseError(format!("invalid Session-Expires delta '{delta_str}'"))
+        })?;
+
+        let mut refresher = None;
+        for param in parts {
+            let p = param.trim();
+            if let Some((k, v)) = p.split_once('=') {
+                if k.trim().eq_ignore_ascii_case("refresher") {
+                    let role = v.trim();
+                    if role.eq_ignore_ascii_case("uac") {
+                        refresher = Some(SessionRefresher::Uac);
+                    } else if role.eq_ignore_ascii_case("uas") {
+                        refresher = Some(SessionRefresher::Uas);
+                    } else {
+                        return Err(SipError::ParseError(format!(
+                            "invalid Session-Expires refresher '{role}'"
+                        )));
+                    }
+                }
+            }
+        }
+
+        Ok(Self {
+            delta_seconds,
+            refresher,
+        })
+    }
+}
+
+impl fmt::Display for SessionExpires {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "{}", self.delta_seconds)?;
+        if let Some(r) = self.refresher {
+            write!(f, ";refresher={r}")?;
+        }
+        Ok(())
+    }
+}
+
+/// Typed `RAck` header (RFC 3262 §7.2) acknowledging a reliable provisional `1xx` response.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RAck {
+    pub rseq: u32,
+    pub cseq: u32,
+    pub method: Method,
+}
+
+impl RAck {
+    /// Creates a `RAck` header referencing `RSeq`, `CSeq` number, and method (typically `INVITE`).
+    pub fn new(rseq: u32, cseq: u32, method: Method) -> Self {
+        Self { rseq, cseq, method }
+    }
+
+    /// Parses `<rseq> <cseq> <METHOD>`.
+    pub fn parse(input: &str) -> Result<Self, SipError> {
+        let mut parts = input.split_whitespace();
+        let rseq_str = parts
+            .next()
+            .ok_or_else(|| SipError::ParseError(format!("empty RAck '{input}'")))?;
+        let cseq_str = parts
+            .next()
+            .ok_or_else(|| SipError::ParseError(format!("missing cseq in RAck '{input}'")))?;
+        let method_str = parts
+            .next()
+            .ok_or_else(|| SipError::ParseError(format!("missing method in RAck '{input}'")))?;
+        if parts.next().is_some() {
+            return Err(SipError::ParseError(format!(
+                "trailing tokens in RAck '{input}'"
+            )));
+        }
+        let rseq = rseq_str
+            .parse::<u32>()
+            .map_err(|_| SipError::ParseError(format!("invalid RAck rseq '{rseq_str}'")))?;
+        let cseq = cseq_str
+            .parse::<u32>()
+            .map_err(|_| SipError::ParseError(format!("invalid RAck cseq '{cseq_str}'")))?;
+        let method = Method::parse(method_str)?;
+        Ok(Self { rseq, cseq, method })
+    }
+}
+
+impl fmt::Display for RAck {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "{} {} {}", self.rseq, self.cseq, self.method)
+    }
+}
+
+/// Typed `Reason` header (RFC 3326) carrying SIP or ITU-T Q.850 release cause and reason text.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ReasonHeader {
+    pub protocol: String,
+    pub cause: Option<u16>,
+    pub text: Option<String>,
+}
+
+impl ReasonHeader {
+    /// Creates an ITU-T `Q.850` `Reason` header (e.g., `Q.850;cause=16;text="Normal call clearing"`).
+    pub fn q850(cause: u16, text: impl Into<String>) -> Self {
+        Self {
+            protocol: "Q.850".to_string(),
+            cause: Some(cause),
+            text: Some(text.into()),
+        }
+    }
+
+    /// Creates a `SIP` `Reason` header (e.g., `SIP;cause=200;text="Call completed elsewhere"`).
+    pub fn sip(cause: u16, text: impl Into<String>) -> Self {
+        Self {
+            protocol: "SIP".to_string(),
+            cause: Some(cause),
+            text: Some(text.into()),
+        }
+    }
+
+    /// Parses `<protocol>[;cause=<u16>][;text="..."]`.
+    pub fn parse(input: &str) -> Result<Self, SipError> {
+        let trimmed = input.trim();
+        let mut parts = split_unquoted(trimmed, ';').into_iter();
+        let protocol = parts
+            .next()
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .ok_or_else(|| SipError::ParseError(format!("empty Reason header '{input}'")))?
+            .to_string();
+
+        let mut cause = None;
+        let mut text = None;
+        for param in parts {
+            let p = param.trim();
+            if let Some((k, v)) = p.split_once('=') {
+                let key = k.trim();
+                let val = v.trim();
+                if key.eq_ignore_ascii_case("cause") {
+                    cause = val.parse::<u16>().ok();
+                } else if key.eq_ignore_ascii_case("text") {
+                    text = Some(unquote_sip_string(val));
+                }
+            }
+        }
+
+        Ok(Self {
+            protocol,
+            cause,
+            text,
+        })
+    }
+}
+
+impl fmt::Display for ReasonHeader {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(&self.protocol)?;
+        if let Some(c) = self.cause {
+            write!(f, ";cause={c}")?;
+        }
+        if let Some(t) = &self.text {
+            let escaped = t.replace('\\', "\\\\").replace('"', "\\\"");
+            write!(f, ";text=\"{escaped}\"")?;
+        }
+        Ok(())
+    }
+}
+
+/// Caller identity & privacy metadata extracted from `P-Asserted-Identity` / `Remote-Party-ID` / `Privacy` (RFC 3323 & RFC 3325).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CallerIdentity {
+    pub asserted_identity: Option<NameAddr>,
+    pub privacy: Vec<String>,
+}
+
+impl CallerIdentity {
+    /// Extracts caller identity and privacy tokens from SIP `Headers`, if any are present.
+    pub fn from_headers(headers: &Headers) -> Option<Self> {
+        let asserted_identity = headers
+            .get("P-Asserted-Identity")
+            .or_else(|| headers.get("P-Preferred-Identity"))
+            .or_else(|| headers.get("Remote-Party-ID"))
+            .and_then(|raw| NameAddr::parse_list(raw).ok()?.into_iter().next());
+
+        let mut privacy = Vec::new();
+        for raw in headers.get_all("Privacy") {
+            for tok in raw.split([';', ',']) {
+                let t = tok.trim();
+                if !t.is_empty() {
+                    privacy.push(t.to_string());
+                }
+            }
+        }
+
+        if asserted_identity.is_none() && privacy.is_empty() {
+            None
+        } else {
+            Some(Self {
+                asserted_identity,
+                privacy,
+            })
+        }
+    }
+}
+
+fn percent_decode(input: &str) -> String {
+    let bytes = input.as_bytes();
+    let mut out = Vec::with_capacity(bytes.len());
+    let mut i = 0;
+    while i < bytes.len() {
+        if bytes[i] == b'%' && i + 2 < bytes.len() {
+            if let (Some(hi), Some(lo)) = (hex_val(bytes[i + 1]), hex_val(bytes[i + 2])) {
+                out.push((hi << 4) | lo);
+                i += 3;
+                continue;
+            }
+        }
+        out.push(bytes[i]);
+        i += 1;
+    }
+    String::from_utf8_lossy(&out).into_owned()
+}
+
+fn hex_val(b: u8) -> Option<u8> {
+    match b {
+        b'0'..=b'9' => Some(b - b'0'),
+        b'a'..=b'f' => Some(b - b'a' + 10),
+        b'A'..=b'F' => Some(b - b'A' + 10),
+        _ => None,
+    }
+}
+
+fn split_unquoted(input: &str, delim: char) -> Vec<&str> {
+    let mut out = Vec::new();
+    let mut start = 0;
+    let mut in_quotes = false;
+    let mut escaped = false;
+    for (idx, ch) in input.char_indices() {
+        if escaped {
+            escaped = false;
+            continue;
+        }
+        if ch == '\\' && in_quotes {
+            escaped = true;
+            continue;
+        }
+        if ch == '"' {
+            in_quotes = !in_quotes;
+            continue;
+        }
+        if !in_quotes && ch == delim {
+            out.push(&input[start..idx]);
+            start = idx + delim.len_utf8();
+        }
+    }
+    out.push(&input[start..]);
+    out
+}
+
+fn unquote_sip_string(val: &str) -> String {
+    if val.len() >= 2 && val.starts_with('"') && val.ends_with('"') {
+        let inner = &val[1..val.len() - 1];
+        let mut out = String::with_capacity(inner.len());
+        let mut escaped = false;
+        for ch in inner.chars() {
+            if escaped {
+                out.push(ch);
+                escaped = false;
+            } else if ch == '\\' {
+                escaped = true;
+            } else {
+                out.push(ch);
+            }
+        }
+        out
+    } else {
+        val.to_string()
+    }
+}
+
 fn find_unquoted_char(input: &str, target: char) -> Option<usize> {
     let mut in_quotes = false;
     let mut escaped = false;
@@ -630,5 +1078,47 @@ mod tests {
         assert_eq!(cseq.seq, 42);
         assert_eq!(cseq.method, Method::Invite);
         assert_eq!(cseq.to_string(), "42 INVITE");
+    }
+
+    #[test]
+    fn parses_call_control_headers_replaces_session_expires_rack_reason_and_identity() {
+        let rep = ReplacesHeader::new("cid-1@10.0.0.1", "to-t", "from-t").with_early_only(true);
+        assert_eq!(
+            rep.to_string(),
+            "cid-1@10.0.0.1;to-tag=to-t;from-tag=from-t;early-only"
+        );
+        let escaped = rep.to_uri_escaped();
+        assert_eq!(ReplacesHeader::parse(&escaped).unwrap(), rep);
+        assert_eq!(ReplacesHeader::parse(&rep.to_string()).unwrap(), rep);
+
+        let se = SessionExpires::parse("1800;refresher=uas").unwrap();
+        assert_eq!(se.delta_seconds, 1800);
+        assert_eq!(se.refresher, Some(SessionRefresher::Uas));
+        assert_eq!(se.to_string(), "1800;refresher=uas");
+
+        let rack = RAck::parse("7 3 INVITE").unwrap();
+        assert_eq!(rack.rseq, 7);
+        assert_eq!(rack.cseq, 3);
+        assert_eq!(rack.method, Method::Invite);
+        assert_eq!(rack.to_string(), "7 3 INVITE");
+
+        let reason = ReasonHeader::parse("Q.850;cause=16;text=\"Normal call clearing\"").unwrap();
+        assert_eq!(reason.protocol, "Q.850");
+        assert_eq!(reason.cause, Some(16));
+        assert_eq!(reason.text.as_deref(), Some("Normal call clearing"));
+        assert_eq!(
+            reason.to_string(),
+            "Q.850;cause=16;text=\"Normal call clearing\""
+        );
+
+        let mut hdrs = Headers::new();
+        hdrs.set("P-Asserted-Identity", "\"CEO\" <sip:1001@pbx.local>");
+        hdrs.set("Privacy", "id;header");
+        let ci = CallerIdentity::from_headers(&hdrs).unwrap();
+        assert_eq!(
+            ci.asserted_identity.unwrap().uri,
+            SipUri::parse("sip:1001@pbx.local").unwrap()
+        );
+        assert_eq!(ci.privacy, vec!["id".to_string(), "header".to_string()]);
     }
 }

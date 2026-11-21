@@ -7,10 +7,11 @@ use std::time::{Duration, Instant};
 
 use bmsip_ffi::bmsip_engine::bmsip_media::WavPcm16;
 use bmsip_ffi::{
-    bmsip_client_audio_sample_rate_hz, bmsip_client_dial, bmsip_client_free, bmsip_client_hangup,
-    bmsip_client_new, bmsip_client_new_ex, bmsip_client_poll_event_json, bmsip_client_pop_pcm,
-    bmsip_client_push_pcm, bmsip_client_register, bmsip_client_unregister, bmsip_string_free,
-    BmsipClient, FfiConfig, FfiEvent, FfiEventKind,
+    bmsip_client_attended_transfer, bmsip_client_audio_sample_rate_hz, bmsip_client_dial,
+    bmsip_client_free, bmsip_client_hangup, bmsip_client_hold, bmsip_client_new,
+    bmsip_client_new_ex, bmsip_client_poll_event_json, bmsip_client_pop_pcm, bmsip_client_push_pcm,
+    bmsip_client_register, bmsip_client_resume_call, bmsip_client_transfer,
+    bmsip_client_unregister, bmsip_string_free, BmsipClient, FfiConfig, FfiEvent, FfiEventKind,
 };
 
 #[test]
@@ -31,6 +32,10 @@ fn udl_schema_matches_rust_sdk_surface() {
         "ring(string call_id)",
         "answer(string call_id)",
         "hangup(string call_id)",
+        "hold(string call_id)",
+        "resume_call(string call_id)",
+        "transfer(string call_id, string target_uri)",
+        "attended_transfer(string call_id, string target_call_id)",
         "send_dtmf(string call_id, string digit)",
         "notify_network_changed(string bind_ip, u16 sip_port)",
         "suspend()",
@@ -52,6 +57,9 @@ fn udl_schema_matches_rust_sdk_surface() {
         FfiEventKind::CallRinging,
         FfiEventKind::CallEstablished,
         FfiEventKind::CallMediaUpdated,
+        FfiEventKind::CallHoldChanged,
+        FfiEventKind::CallTransferRequested,
+        FfiEventKind::TransferStatus,
         FfiEventKind::DtmfReceived,
         FfiEventKind::CallTerminated,
         FfiEventKind::Suspended,
@@ -213,6 +221,43 @@ fn sdk_and_c_api_live_asterisk_call_pcm_bridge_and_telemetry() {
         rx_wav.rms_energy()
     );
 
+    client.hold(cid.clone()).unwrap();
+    let mut got_hold_true = false;
+    let hold_dl = Instant::now() + Duration::from_secs(6);
+    while Instant::now() < hold_dl {
+        if let Some(ev) = client.poll_event(50) {
+            if ev.kind == FfiEventKind::CallHoldChanged
+                && ev.detail.as_deref() == Some("local_hold=true, remote_hold=false")
+            {
+                got_hold_true = true;
+                break;
+            }
+        }
+    }
+    assert!(
+        got_hold_true,
+        "BmsipClient::hold did not emit CallHoldChanged"
+    );
+    thread::sleep(Duration::from_millis(200));
+
+    client.resume_call(cid.clone()).unwrap();
+    let mut got_hold_false = false;
+    let resume_dl = Instant::now() + Duration::from_secs(6);
+    while Instant::now() < resume_dl {
+        if let Some(ev) = client.poll_event(50) {
+            if ev.kind == FfiEventKind::CallHoldChanged
+                && ev.detail.as_deref() == Some("local_hold=false, remote_hold=false")
+            {
+                got_hold_false = true;
+                break;
+            }
+        }
+    }
+    assert!(
+        got_hold_false,
+        "BmsipClient::resume_call did not emit CallHoldChanged"
+    );
+
     client.hangup(cid.clone()).unwrap();
     let mut got_black_box = false;
     let bye_dl = Instant::now() + Duration::from_secs(6);
@@ -233,6 +278,16 @@ fn sdk_and_c_api_live_asterisk_call_pcm_bridge_and_telemetry() {
     // 2. C99 ABI (`bmsip_client_*`) safety and live Asterisk call test.
     unsafe {
         assert_eq!(bmsip_client_register(ptr::null()), -1);
+        assert_eq!(bmsip_client_hold(ptr::null(), ptr::null()), -1);
+        assert_eq!(bmsip_client_resume_call(ptr::null(), ptr::null()), -1);
+        assert_eq!(
+            bmsip_client_transfer(ptr::null(), ptr::null(), ptr::null()),
+            -1
+        );
+        assert_eq!(
+            bmsip_client_attended_transfer(ptr::null(), ptr::null(), ptr::null()),
+            -1
+        );
         bmsip_client_free(ptr::null_mut());
 
         let u = CString::new("1003").unwrap();
@@ -314,6 +369,45 @@ fn sdk_and_c_api_live_asterisk_call_pcm_bridge_and_telemetry() {
         );
 
         let c_cid = CString::new(c_call_id).unwrap();
+        assert_eq!(bmsip_client_hold(handle, c_cid.as_ptr()), 0);
+        let mut c_held = false;
+        let c_hold_dl = Instant::now() + Duration::from_secs(6);
+        while Instant::now() < c_hold_dl {
+            let json_ptr = bmsip_client_poll_event_json(handle, 50);
+            if !json_ptr.is_null() {
+                let json = CStr::from_ptr(json_ptr).to_string_lossy().into_owned();
+                bmsip_string_free(json_ptr);
+                if json.contains("\"CallHoldChanged\"") && json.contains("local_hold=true") {
+                    c_held = true;
+                    break;
+                }
+            }
+        }
+        assert!(
+            c_held,
+            "C-API bmsip_client_hold did not emit CallHoldChanged"
+        );
+        thread::sleep(Duration::from_millis(150));
+
+        assert_eq!(bmsip_client_resume_call(handle, c_cid.as_ptr()), 0);
+        let mut c_resumed = false;
+        let c_resume_dl = Instant::now() + Duration::from_secs(6);
+        while Instant::now() < c_resume_dl {
+            let json_ptr = bmsip_client_poll_event_json(handle, 50);
+            if !json_ptr.is_null() {
+                let json = CStr::from_ptr(json_ptr).to_string_lossy().into_owned();
+                bmsip_string_free(json_ptr);
+                if json.contains("\"CallHoldChanged\"") && json.contains("local_hold=false") {
+                    c_resumed = true;
+                    break;
+                }
+            }
+        }
+        assert!(
+            c_resumed,
+            "C-API bmsip_client_resume_call did not emit CallHoldChanged"
+        );
+
         assert_eq!(bmsip_client_hangup(handle, c_cid.as_ptr()), 0);
         thread::sleep(Duration::from_millis(150));
         assert_eq!(bmsip_client_unregister(handle), 0);

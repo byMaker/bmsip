@@ -3,8 +3,9 @@ use std::time::{Duration, Instant};
 
 use bmsip_core::auth::hash::md5_hex;
 use bmsip_core::dialog::{CallState, RegistrationState, UaConfig, UaEvent, UserAgent};
+use bmsip_core::sdp::{Direction, RtpCodec, SdpSession};
 use bmsip_core::sim::NetworkPolicy;
-use bmsip_core::sip::{Method, NameAddr, SipMessage, SipUri};
+use bmsip_core::sip::{CallerIdentity, Method, NameAddr, ReasonHeader, SipMessage, SipUri};
 use bmsip_core::transaction::{TransactionEvent, TransactionId, TransactionManager};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -1012,4 +1013,546 @@ fn answer_without_sdp_sends_488_and_clears_call() {
         SipMessage::Request(_) => panic!("expected 488 response"),
     };
     assert_eq!(resp.status_code, 488);
+}
+
+fn establish_clean_cluster_call(
+    cluster: &mut MiniSipCluster,
+    alice_rtp: u16,
+    bob_rtp: u16,
+) -> (String, Vec<UaEvent>, Vec<UaEvent>) {
+    let cid = cluster
+        .alice
+        .dial(
+            SipUri::parse("sip:bob@10.0.0.2:5062").unwrap(),
+            alice_rtp,
+            cluster.now,
+        )
+        .unwrap();
+
+    let mut all_alice = Vec::new();
+    let mut all_bob = Vec::new();
+    let mut bob_answered = false;
+    let mut alice_est = false;
+    let mut bob_est = false;
+
+    for _ in 0..40 {
+        let (a_ev, b_ev) = cluster.step_until(5, None);
+        for ev in &b_ev {
+            if let UaEvent::IncomingCall { call_id, .. } = ev {
+                if !bob_answered {
+                    bob_answered = true;
+                    cluster.bob.answer(call_id, bob_rtp, cluster.now).unwrap();
+                }
+            }
+            if matches!(ev, UaEvent::CallEstablished { .. }) {
+                bob_est = true;
+            }
+        }
+        for ev in &a_ev {
+            if matches!(ev, UaEvent::CallEstablished { .. }) {
+                alice_est = true;
+            }
+        }
+        all_alice.extend(a_ev);
+        all_bob.extend(b_ev);
+        if alice_est && bob_est {
+            break;
+        }
+    }
+    assert!(alice_est && bob_est, "call failed to establish");
+    (cid, all_alice, all_bob)
+}
+
+fn clean_policy() -> NetworkPolicy {
+    NetworkPolicy {
+        loss_percent: 0,
+        duplicate_percent: 0,
+        min_delay: Duration::from_millis(5),
+        max_delay: Duration::from_millis(5),
+    }
+}
+
+#[test]
+fn call_hold_and_resume_updates_sdp_direction_and_emits_events() {
+    let t0 = Instant::now();
+    let mut cluster = MiniSipCluster::new(t0, clean_policy(), 11);
+    let (cid, _, _) = establish_clean_cluster_call(&mut cluster, 40000, 50000);
+
+    cluster.alice.hold(&cid, cluster.now).unwrap();
+    assert_eq!(cluster.alice.hold_state(&cid), Some((true, false)));
+
+    let (a_hold, b_hold) = cluster.step_until(30, Some(cluster.now + Duration::from_secs(2)));
+    assert!(a_hold.iter().any(|e| matches!(
+        e,
+        UaEvent::CallHoldChanged {
+            local_hold: true,
+            remote_hold: false,
+            ..
+        }
+    )));
+    assert!(a_hold.iter().any(|e| matches!(
+        e,
+        UaEvent::CallMediaUpdated {
+            local_sdp,
+            remote_sdp,
+            ..
+        } if local_sdp.direction == Direction::SendOnly && remote_sdp.direction == Direction::RecvOnly
+    )));
+    assert!(b_hold.iter().any(|e| matches!(
+        e,
+        UaEvent::CallHoldChanged {
+            local_hold: false,
+            remote_hold: true,
+            ..
+        }
+    )));
+    assert!(b_hold.iter().any(|e| matches!(
+        e,
+        UaEvent::CallMediaUpdated {
+            local_sdp,
+            remote_sdp,
+            ..
+        } if local_sdp.direction == Direction::RecvOnly && remote_sdp.direction == Direction::SendOnly
+    )));
+    assert_eq!(cluster.bob.hold_state(&cid), Some((false, true)));
+
+    cluster.alice.resume_call(&cid, cluster.now).unwrap();
+    assert_eq!(cluster.alice.hold_state(&cid), Some((false, false)));
+
+    let (a_res, b_res) = cluster.step_until(30, Some(cluster.now + Duration::from_secs(2)));
+    assert!(a_res.iter().any(|e| matches!(
+        e,
+        UaEvent::CallHoldChanged {
+            local_hold: false,
+            remote_hold: false,
+            ..
+        }
+    )));
+    assert!(a_res.iter().any(|e| matches!(
+        e,
+        UaEvent::CallMediaUpdated {
+            local_sdp,
+            remote_sdp,
+            ..
+        } if local_sdp.direction == Direction::SendRecv && remote_sdp.direction == Direction::SendRecv
+    )));
+    assert!(b_res.iter().any(|e| matches!(
+        e,
+        UaEvent::CallHoldChanged {
+            local_hold: false,
+            remote_hold: false,
+            ..
+        }
+    )));
+    assert_eq!(cluster.bob.hold_state(&cid), Some((false, false)));
+
+    cluster.alice.hangup(&cid, cluster.now).unwrap();
+    let (a_end, b_end) = cluster.step_until(20, Some(cluster.now + Duration::from_secs(2)));
+    assert!(a_end
+        .iter()
+        .any(|e| matches!(e, UaEvent::CallTerminated { .. })));
+    assert!(b_end
+        .iter()
+        .any(|e| matches!(e, UaEvent::CallTerminated { .. })));
+}
+
+fn route_target_three(pkt: &[u8]) -> usize {
+    match SipMessage::parse(pkt).unwrap() {
+        SipMessage::Request(req) => {
+            if req.uri.host == "10.0.0.1" {
+                0
+            } else if req.uri.host == "10.0.0.2" {
+                1
+            } else {
+                2
+            }
+        }
+        SipMessage::Response(resp) => {
+            let via = resp.top_via().unwrap();
+            if via.sent_by.starts_with("10.0.0.1") {
+                0
+            } else if via.sent_by.starts_with("10.0.0.2") {
+                1
+            } else {
+                2
+            }
+        }
+    }
+}
+
+fn pump_three(
+    agents: &mut [&mut UserAgent; 3],
+    now: &mut Instant,
+    steps: usize,
+) -> [Vec<UaEvent>; 3] {
+    let mut evs = [Vec::new(), Vec::new(), Vec::new()];
+    for _ in 0..steps {
+        let mut any = false;
+        let mut out = Vec::new();
+        for (idx, ua) in agents.iter_mut().enumerate() {
+            evs[idx].extend(ua.drain_events());
+            for pkt in ua.poll_transmit() {
+                any = true;
+                let dest = route_target_three(&pkt);
+                out.push((dest, pkt));
+            }
+        }
+        for (dest, pkt) in out {
+            evs[dest].extend(agents[dest].receive_datagram(&pkt, *now));
+        }
+        *now += Duration::from_millis(10);
+        for (idx, ua) in agents.iter_mut().enumerate() {
+            evs[idx].extend(ua.handle_timeout(*now));
+        }
+        if !any && evs.iter().all(|v| v.is_empty()) {
+            // Still drain final transmits if timeouts queued anything.
+            let rem: usize = agents.iter_mut().map(|u| u.poll_transmit().len()).sum();
+            if rem == 0 {
+                break;
+            }
+        }
+    }
+    for (idx, ua) in agents.iter_mut().enumerate() {
+        evs[idx].extend(ua.drain_events());
+    }
+    evs
+}
+
+#[test]
+fn blind_and_attended_transfer_refer_notify_and_invite_replaces() {
+    let mut now = Instant::now();
+    let reg = SipUri::parse("sip:pbx.local:5060").unwrap();
+    let mut alice = UserAgent::new(UaConfig::new(
+        "alice",
+        "pw",
+        "pbx.local",
+        reg.clone(),
+        "10.0.0.1",
+        5060,
+    ));
+    let mut bob = UserAgent::new(UaConfig::new(
+        "bob",
+        "pw",
+        "pbx.local",
+        reg.clone(),
+        "10.0.0.2",
+        5062,
+    ));
+    let mut carol = UserAgent::new(UaConfig::new(
+        "carol",
+        "pw",
+        "pbx.local",
+        reg,
+        "10.0.0.3",
+        5064,
+    ));
+
+    // 1. Alice establishes Call 1 with Bob, and exercises blind REFER + NOTIFY.
+    let call_ab = alice
+        .dial(SipUri::parse("sip:bob@10.0.0.2:5062").unwrap(), 40000, now)
+        .unwrap();
+    {
+        let mut three = [&mut alice, &mut bob, &mut carol];
+        let _ = pump_three(&mut three, &mut now, 10);
+    }
+    bob.answer(&call_ab, 50000, now).unwrap();
+    {
+        let mut three = [&mut alice, &mut bob, &mut carol];
+        let _ = pump_three(&mut three, &mut now, 10);
+    }
+    assert_eq!(alice.call_state(&call_ab), Some(CallState::Established));
+
+    alice
+        .refer(
+            &call_ab,
+            SipUri::parse("sip:carol@10.0.0.3:5064").unwrap(),
+            now,
+        )
+        .unwrap();
+    let bob_evs = {
+        let mut three = [&mut alice, &mut bob, &mut carol];
+        pump_three(&mut three, &mut now, 10)[1].clone()
+    };
+    assert!(bob_evs.iter().any(|e| matches!(
+        e,
+        UaEvent::CallTransferRequested {
+            refer_to,
+            replaces: None,
+            referred_by: Some(_),
+            ..
+        } if refer_to.user.as_deref() == Some("carol")
+    )));
+
+    bob.notify_refer_status(&call_ab, 180, "Ringing", false, now)
+        .unwrap();
+    bob.notify_refer_status(&call_ab, 200, "OK", true, now)
+        .unwrap();
+    let alice_notifies = {
+        let mut three = [&mut alice, &mut bob, &mut carol];
+        pump_three(&mut three, &mut now, 10)[0].clone()
+    };
+    assert!(alice_notifies.iter().any(|e| matches!(
+        e,
+        UaEvent::TransferNotify {
+            status_code: 180,
+            terminated: false,
+            ..
+        }
+    )));
+    assert!(alice_notifies.iter().any(|e| matches!(
+        e,
+        UaEvent::TransferNotify {
+            status_code: 200,
+            terminated: true,
+            ..
+        }
+    )));
+
+    // 2. Alice establishes consultation Call 2 with Carol, then initiates attended REFER (?Replaces=).
+    let call_ac = alice
+        .dial(
+            SipUri::parse("sip:carol@10.0.0.3:5064").unwrap(),
+            40010,
+            now,
+        )
+        .unwrap();
+    {
+        let mut three = [&mut alice, &mut bob, &mut carol];
+        let _ = pump_three(&mut three, &mut now, 10);
+    }
+    carol.answer(&call_ac, 51000, now).unwrap();
+    {
+        let mut three = [&mut alice, &mut bob, &mut carol];
+        let _ = pump_three(&mut three, &mut now, 10);
+    }
+    assert_eq!(alice.call_state(&call_ac), Some(CallState::Established));
+
+    alice.attended_transfer(&call_ab, &call_ac, now).unwrap();
+    let bob_att = {
+        let mut three = [&mut alice, &mut bob, &mut carol];
+        pump_three(&mut three, &mut now, 10)[1].clone()
+    };
+    let (refer_to, rep) = bob_att
+        .iter()
+        .find_map(|e| match e {
+            UaEvent::CallTransferRequested {
+                refer_to,
+                replaces: Some(r),
+                ..
+            } => Some((refer_to.clone(), r.clone())),
+            _ => None,
+        })
+        .expect("attended REFER should carry parsed Replaces");
+    assert_eq!(rep.call_id, call_ac);
+
+    // 3. Bob dials Carol with INVITE + Replaces; Carol replaces call_ac and establishes call_bc.
+    let call_bc = bob.dial_with_replaces(refer_to, rep, 50020, now).unwrap();
+    let (evs_after_inv_a, evs_after_inv_c) = {
+        let mut three = [&mut alice, &mut bob, &mut carol];
+        let res = pump_three(&mut three, &mut now, 15);
+        (res[0].clone(), res[2].clone())
+    };
+    assert!(evs_after_inv_c.iter().any(|e| matches!(
+        e,
+        UaEvent::IncomingCall {
+            call_id,
+            replaces_call_id: Some(old_cid),
+            ..
+        } if call_id == &call_bc && old_cid == &call_ac
+    )));
+    assert!(evs_after_inv_a.iter().any(|e| matches!(
+        e,
+        UaEvent::CallTerminated {
+            call_id,
+            reason_header: Some(rh),
+            ..
+        } if call_id == &call_ac && rh.cause == Some(200)
+    )));
+
+    carol.answer(&call_bc, 51010, now).unwrap();
+    {
+        let mut three = [&mut alice, &mut bob, &mut carol];
+        let _ = pump_three(&mut three, &mut now, 15);
+    }
+    assert_eq!(bob.call_state(&call_bc), Some(CallState::Established));
+    assert_eq!(carol.call_state(&call_bc), Some(CallState::Established));
+}
+
+#[test]
+fn early_dialog_prack_100rel_and_update_offer_answer() {
+    let t0 = Instant::now();
+    let mut cluster = MiniSipCluster::new(t0, clean_policy(), 23);
+
+    let cid = cluster
+        .alice
+        .dial(
+            SipUri::parse("sip:bob@10.0.0.2:5062").unwrap(),
+            40000,
+            cluster.now,
+        )
+        .unwrap();
+
+    let (a_early_1, _) = cluster.step_until(15, Some(cluster.now + Duration::from_secs(1)));
+    assert!(!a_early_1
+        .iter()
+        .any(|e| matches!(e, UaEvent::CallTerminated { .. })));
+
+    let early_sdp = SdpSession::new(
+        "bob",
+        "1",
+        "10.0.0.2",
+        50000,
+        vec![RtpCodec::pcmu(), RtpCodec::telephone_event(101)],
+    );
+    let rseq = cluster
+        .bob
+        .ring_reliable(&cid, 183, "Session Progress", Some(early_sdp), cluster.now)
+        .unwrap();
+    assert_eq!(rseq, 1);
+
+    let (a_prack, _) = cluster.step_until(20, Some(cluster.now + Duration::from_secs(2)));
+    assert!(a_prack.iter().any(|e| matches!(
+        e,
+        UaEvent::CallRinging {
+            status_code: 183,
+            early_sdp: Some(_),
+            ..
+        }
+    )));
+    assert_eq!(cluster.alice.call_state(&cid), Some(CallState::Ringing));
+
+    // Send early-dialog UPDATE updating RTP IP and port prior to 200 OK.
+    cluster
+        .alice
+        .send_update(&cid, Some("10.0.0.99"), Some(41234), cluster.now)
+        .unwrap();
+    let (a_upd, b_upd) = cluster.step_until(20, Some(cluster.now + Duration::from_secs(2)));
+    assert!(a_upd
+        .iter()
+        .any(|e| matches!(e, UaEvent::CallMediaUpdated { .. })));
+    assert!(b_upd.iter().any(|e| matches!(
+        e,
+        UaEvent::CallMediaUpdated { remote_sdp, .. }
+            if remote_sdp.connection_ip == "10.0.0.99" && remote_sdp.audio_port == 41234
+    )));
+
+    cluster.bob.answer(&cid, 50000, cluster.now).unwrap();
+    let (a_est, b_est) = cluster.step_until(20, Some(cluster.now + Duration::from_secs(2)));
+    assert!(a_est
+        .iter()
+        .any(|e| matches!(e, UaEvent::CallEstablished { .. })));
+    assert!(b_est
+        .iter()
+        .any(|e| matches!(e, UaEvent::CallEstablished { .. })));
+}
+
+#[test]
+fn session_timers_422_min_se_retry_and_automatic_refresh() {
+    let t0 = Instant::now();
+    let reg = SipUri::parse("sip:pbx.local:5060").unwrap();
+    let mut cluster = MiniSipCluster::new(t0, clean_policy(), 37);
+    cluster.alice = UserAgent::new(
+        UaConfig::new(
+            "alice",
+            "alice-pw",
+            "pbx.local",
+            reg.clone(),
+            "10.0.0.1",
+            5060,
+        )
+        .with_session_timers(Some(90), 90),
+    );
+    cluster.bob = UserAgent::new(
+        UaConfig::new("bob", "bob-pw", "pbx.local", reg, "10.0.0.2", 5062)
+            .with_session_timers(Some(180), 180),
+    );
+
+    // Alice offers Session-Expires=90 < Bob Min-SE=180 -> 422 retry bumps to 180 automatically.
+    let (cid, _, _) = establish_clean_cluster_call(&mut cluster, 40000, 50000);
+    let est_at = cluster.now;
+    assert_eq!(cluster.alice.call_state(&cid), Some(CallState::Established));
+
+    // Advance across multiple 90 s refresh cycles past initial 180 s timeout; keepalive UPDATE keeps call alive.
+    let (a_evs, b_evs) = cluster.step_until(120, Some(est_at + Duration::from_secs(280)));
+    assert!(cluster.now >= est_at + Duration::from_secs(180));
+    assert!(!a_evs
+        .iter()
+        .any(|e| matches!(e, UaEvent::CallTerminated { .. })));
+    assert!(!b_evs
+        .iter()
+        .any(|e| matches!(e, UaEvent::CallTerminated { .. })));
+    assert_eq!(cluster.alice.call_state(&cid), Some(CallState::Established));
+    assert_eq!(cluster.bob.call_state(&cid), Some(CallState::Established));
+
+    // When all refresh packets are dropped, Session-Expires eventually expires with Reason cause=408.
+    cluster.policy.loss_percent = 100;
+    let (a_exp, b_exp) = cluster.step_until(120, Some(cluster.now + Duration::from_secs(250)));
+    assert!(
+        b_exp.iter().any(|e| matches!(
+            e,
+            UaEvent::CallTerminated {
+                status_code: Some(408),
+                reason_header: Some(rh),
+                ..
+            } if rh.cause == Some(408)
+        )) || a_exp.iter().any(|e| matches!(
+            e,
+            UaEvent::CallTerminated {
+                status_code: Some(408),
+                reason_header: Some(rh),
+                ..
+            } if rh.cause == Some(408)
+        )),
+        "expected Session-Timers expiry with status 408 and Reason cause=408"
+    );
+}
+
+#[test]
+fn reason_header_and_p_asserted_identity_privacy_roundtrip() {
+    let t0 = Instant::now();
+    let reg = SipUri::parse("sip:pbx.local:5060").unwrap();
+    let mut cluster = MiniSipCluster::new(t0, clean_policy(), 41);
+    cluster.alice = UserAgent::new(
+        UaConfig::new("alice", "alice-pw", "pbx.local", reg, "10.0.0.1", 5060)
+            .with_caller_identity(
+                Some(NameAddr::parse("\"Alice Corp\" <sip:+15550100@pbx.local>").unwrap()),
+                Some("id".to_string()),
+            ),
+    );
+
+    let (cid, _, b_init) = establish_clean_cluster_call(&mut cluster, 40000, 50000);
+    let identity: Option<CallerIdentity> = b_init.iter().find_map(|e| match e {
+        UaEvent::IncomingCall {
+            caller_identity, ..
+        } => caller_identity.clone(),
+        _ => None,
+    });
+    let identity = identity.expect("expected P-Asserted-Identity + Privacy on IncomingCall");
+    assert_eq!(
+        identity
+            .asserted_identity
+            .as_ref()
+            .and_then(|a| a.uri.user.as_deref()),
+        Some("+15550100")
+    );
+    assert_eq!(identity.privacy, vec!["id".to_string()]);
+
+    cluster
+        .alice
+        .hangup_with_reason(
+            &cid,
+            Some(ReasonHeader::q850(16, "Normal call clearing")),
+            cluster.now,
+        )
+        .unwrap();
+    let (_, b_end) = cluster.step_until(20, Some(cluster.now + Duration::from_secs(2)));
+    assert!(b_end.iter().any(|e| matches!(
+        e,
+        UaEvent::CallTerminated {
+            reason_header: Some(rh),
+            ..
+        } if rh.protocol == "Q.850"
+            && rh.cause == Some(16)
+            && rh.text.as_deref() == Some("Normal call clearing")
+    )));
 }

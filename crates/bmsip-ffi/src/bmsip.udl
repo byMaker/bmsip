@@ -24,6 +24,9 @@ enum FfiEventKind {
     "CallRinging",
     "CallEstablished",
     "CallMediaUpdated",
+    "CallHoldChanged",
+    "CallTransferRequested",
+    "TransferStatus",
     "DtmfReceived",
     "CallTerminated",
     "Suspended",
@@ -68,6 +71,18 @@ interface BmsipClient {
 
     [Throws=FfiError]
     void hangup(string call_id);
+
+    [Throws=FfiError]
+    void hold(string call_id);
+
+    [Throws=FfiError]
+    void resume_call(string call_id);
+
+    [Throws=FfiError]
+    void transfer(string call_id, string target_uri);
+
+    [Throws=FfiError]
+    void attended_transfer(string call_id, string target_call_id);
 
     [Throws=FfiError]
     void send_dtmf(string call_id, string digit);

@@ -231,6 +231,96 @@ pub unsafe extern "C" fn bmsip_client_hangup(
     }
 }
 
+/// Places an established call on local hold (`a=sendonly` / `a=inactive`) (`0` on success, `-1` on error).
+///
+/// # Safety
+/// `client` and `call_id` must be valid non-null pointers.
+#[no_mangle]
+pub unsafe extern "C" fn bmsip_client_hold(
+    client: *const BmsipClientHandle,
+    call_id: *const c_char,
+) -> i32 {
+    let (Some(c), Some(cid)) = (unsafe { client_ref(client) }, unsafe {
+        cstr_to_string(call_id)
+    }) else {
+        return -1;
+    };
+    if c.hold(cid).is_ok() {
+        0
+    } else {
+        -1
+    }
+}
+
+/// Resumes a call from local hold (`a=sendrecv`) (`0` on success, `-1` on error).
+///
+/// # Safety
+/// `client` and `call_id` must be valid non-null pointers.
+#[no_mangle]
+pub unsafe extern "C" fn bmsip_client_resume_call(
+    client: *const BmsipClientHandle,
+    call_id: *const c_char,
+) -> i32 {
+    let (Some(c), Some(cid)) = (unsafe { client_ref(client) }, unsafe {
+        cstr_to_string(call_id)
+    }) else {
+        return -1;
+    };
+    if c.resume_call(cid).is_ok() {
+        0
+    } else {
+        -1
+    }
+}
+
+/// Initiates a blind call transfer (`REFER`) to `target_uri` (`0` on success, `-1` on error).
+///
+/// # Safety
+/// `client`, `call_id`, and `target_uri` must be valid non-null pointers.
+#[no_mangle]
+pub unsafe extern "C" fn bmsip_client_transfer(
+    client: *const BmsipClientHandle,
+    call_id: *const c_char,
+    target_uri: *const c_char,
+) -> i32 {
+    let (Some(c), Some(cid), Some(uri)) = (
+        unsafe { client_ref(client) },
+        unsafe { cstr_to_string(call_id) },
+        unsafe { cstr_to_string(target_uri) },
+    ) else {
+        return -1;
+    };
+    if c.transfer(cid, uri).is_ok() {
+        0
+    } else {
+        -1
+    }
+}
+
+/// Initiates an attended call transfer (`REFER` with `?Replaces=...`) bridging `call_id` to `target_call_id` (`0` on success, `-1` on error).
+///
+/// # Safety
+/// `client`, `call_id`, and `target_call_id` must be valid non-null pointers.
+#[no_mangle]
+pub unsafe extern "C" fn bmsip_client_attended_transfer(
+    client: *const BmsipClientHandle,
+    call_id: *const c_char,
+    target_call_id: *const c_char,
+) -> i32 {
+    let (Some(c), Some(cid), Some(tcid)) = (
+        unsafe { client_ref(client) },
+        unsafe { cstr_to_string(call_id) },
+        unsafe { cstr_to_string(target_call_id) },
+    ) else {
+        return -1;
+    };
+    if c.attended_transfer(cid, tcid).is_ok() {
+        0
+    } else {
+        -1
+    }
+}
+
 /// Transmits an RFC 4733 DTMF digit (`'0'..'9'`, `'*'`, `'#'`, `'A'..'D'`).
 ///
 /// # Safety
