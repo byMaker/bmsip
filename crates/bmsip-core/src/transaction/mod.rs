@@ -1,6 +1,6 @@
 //! MODULE_CONTRACT: Sans-I/O RFC 3261 Section 17 transaction manager (`ICT`, `NICT`, `IST`, `NIST`).
-//! INVARIANTS: All time progresses strictly via injected `now: Instant`; `ICT` auto-emits `ACK` on `3xx..=6xx` and terminates immediately on `2xx`; unmatched `2xx` responses surface as `Unmatched2xx` for dialog-layer `ACK` retransmission; `IST` routes `ACK` to `ServerAckReceived` or `AckFor2xx`; terminated transactions are immediately evicted.
-//! RFC_REFS: RFC 3261 Sections 13.3.1.4, 17.1, 17.2, 18.1.2.
+//! INVARIANTS: All time progresses strictly via injected `now: Instant`; `ICT` auto-emits `ACK` on `3xx..=6xx` and terminates immediately on `2xx`; unmatched `2xx` responses (including in `IctState::Completed`) surface as `Unmatched2xx` for dialog-layer `ACK` retransmission; `IST` enters `Accepted` for `Timer L` (`64*T1`) on `2xx` per RFC 6026 to absorb `INVITE` retransmissions and routes `ACK` to `ServerAckReceived` or `AckFor2xx`; terminated transactions are immediately evicted.
+//! RFC_REFS: RFC 3261 Sections 13.3.1.4, 17.1, 17.2, 18.1.2; RFC 6026 Sections 7.1, 7.2, 8.5.
 
 use std::collections::{HashMap, VecDeque};
 use std::time::{Duration, Instant};
@@ -56,6 +56,10 @@ impl RfcTimers {
     }
 
     fn timer_j(self) -> Duration {
+        self.safe_t1() * 64
+    }
+
+    fn timer_l(self) -> Duration {
         self.safe_t1() * 64
     }
 }
@@ -321,7 +325,10 @@ impl ClientInviteTransaction {
                 }
             }
             IctState::Completed => {
-                if (300..700).contains(&code) {
+                if (200..300).contains(&code) {
+                    // RFC 6026 §7.2: 2xx arriving during Timer D must reach TU for ACK+BYE.
+                    events.push(TransactionEvent::Unmatched2xx(resp));
+                } else if (300..700).contains(&code) {
                     if let Some(ack) = &self.ack_bytes {
                         outbound.push_back(ack.clone());
                     }
@@ -460,6 +467,7 @@ impl ServerNonInviteTransaction {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum IstState {
     Proceeding,
+    Accepted,
     Completed,
     Confirmed,
     Terminated,
@@ -475,6 +483,7 @@ struct ServerInviteTransaction {
     timer_g_interval: Duration,
     timer_h: Option<Instant>,
     timer_i: Option<Instant>,
+    timer_l: Option<Instant>,
 }
 
 impl ServerInviteTransaction {
@@ -488,11 +497,12 @@ impl ServerInviteTransaction {
             timer_g_interval: Duration::ZERO,
             timer_h: None,
             timer_i: None,
+            timer_l: None,
         }
     }
 
     fn next_timeout(&self) -> Option<Instant> {
-        earliest_instant([self.timer_g, self.timer_h, self.timer_i])
+        earliest_instant([self.timer_g, self.timer_h, self.timer_i, self.timer_l])
     }
 
     fn on_retransmit(&self, outbound: &mut VecDeque<Vec<u8>>) {
@@ -507,7 +517,7 @@ impl ServerInviteTransaction {
                     outbound.push_back(fin.clone());
                 }
             }
-            IstState::Confirmed | IstState::Terminated => {}
+            IstState::Accepted | IstState::Confirmed | IstState::Terminated => {}
         }
     }
 
@@ -535,12 +545,12 @@ impl ServerInviteTransaction {
 
     fn send_response(
         &mut self,
-        tx_id: &TransactionId,
+        _tx_id: &TransactionId,
         resp: &SipResponse,
         now: Instant,
         timers: RfcTimers,
         outbound: &mut VecDeque<Vec<u8>>,
-        events: &mut Vec<TransactionEvent>,
+        _events: &mut Vec<TransactionEvent>,
     ) -> Result<(), SipError> {
         let code = resp.status_code;
         if self.state != IstState::Proceeding {
@@ -555,8 +565,10 @@ impl ServerInviteTransaction {
         if (100..200).contains(&code) {
             self.last_provisional = Some(bytes);
         } else if (200..300).contains(&code) {
-            self.state = IstState::Terminated;
-            events.push(TransactionEvent::TransactionTerminated(tx_id.clone()));
+            // RFC 6026 §7.1: enter `Accepted` for Timer L (64*T1) to absorb retransmitted INVITEs
+            // regardless of transport reliability.
+            self.state = IstState::Accepted;
+            self.timer_l = Some(now + timers.timer_l());
         } else if (300..700).contains(&code) {
             self.final_response = Some(bytes);
             self.state = IstState::Completed;
@@ -593,6 +605,13 @@ impl ServerInviteTransaction {
                     }
                     self.timer_g_interval = (self.timer_g_interval * 2).min(timers.safe_t2());
                     self.timer_g = Some(now + self.timer_g_interval);
+                }
+            }
+            IstState::Accepted => {
+                if self.timer_l.is_some_and(|dl| now >= dl) {
+                    self.state = IstState::Terminated;
+                    self.timer_l = None;
+                    events.push(TransactionEvent::TransactionTerminated(tx_id.clone()));
                 }
             }
             IstState::Confirmed => {
@@ -828,9 +847,13 @@ impl TransactionManager {
                         method: Method::Invite,
                     };
                     if let Some(ServerTx::Invite(ist)) = self.server_txs.get_mut(&invite_id) {
-                        ist.on_ack(&invite_id, now, self.timers, &mut events);
-                        if ist.state == IstState::Terminated {
-                            self.server_txs.remove(&invite_id);
+                        if ist.state == IstState::Accepted {
+                            events.push(TransactionEvent::AckFor2xx(req));
+                        } else {
+                            ist.on_ack(&invite_id, now, self.timers, &mut events);
+                            if ist.state == IstState::Terminated {
+                                self.server_txs.remove(&invite_id);
+                            }
                         }
                     } else {
                         events.push(TransactionEvent::AckFor2xx(req));

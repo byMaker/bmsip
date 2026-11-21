@@ -2531,3 +2531,405 @@ fn enforces_sdes_requires_tls_nonblocking_tcp_connect_and_p2p_tls_sdes_hold_call
     eng_alice.shutdown().unwrap();
     eng_bob.shutdown().unwrap();
 }
+
+fn goertzel_power(samples: &[i16], sample_rate_hz: f64, target_freq_hz: f64) -> f64 {
+    if samples.is_empty() {
+        return 0.0;
+    }
+    let omega = 2.0 * std::f64::consts::PI * target_freq_hz / sample_rate_hz;
+    let coeff = 2.0 * omega.cos();
+    let mut s_prev = 0.0f64;
+    let mut s_prev2 = 0.0f64;
+    for &sample in samples {
+        let s = f64::from(sample) + coeff * s_prev - s_prev2;
+        s_prev2 = s_prev;
+        s_prev = s;
+    }
+    let real = s_prev - s_prev2 * omega.cos();
+    let imag = s_prev2 * omega.sin();
+    (real * real + imag * imag) / ((samples.len() as f64) * (samples.len() as f64))
+}
+
+#[test]
+fn p0_g722_5500hz_transcodes_through_freeswitch_to_opus_48khz() {
+    let _guard = ASTERISK_TEST_MUTEX
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
+
+    let fs_addr = resolve_server("freeswitch");
+    let registrar = SipUri::parse("sip:freeswitch:5060").unwrap();
+
+    // Caller 1001 forces G.722 (16 kHz) with a high-band 5500 Hz sine wave (testing QMF upper band).
+    let mut cfg_1001 = UaConfig::new(
+        "1001",
+        "secret1001",
+        "freeswitch",
+        registrar.clone(),
+        "0.0.0.0",
+        0,
+    );
+    cfg_1001.supported_codecs = vec![RtpCodec::g722(), RtpCodec::telephone_event(101)];
+    let tone_5500 = WavPcm16::generate_sine_wave(16_000, 5_500, 2_200, 12_000);
+    let (port_1001, _) = WavAudioPort::new(tone_5500, true);
+    let eng_1001 = SipEngine::spawn(
+        EngineConfig::new(cfg_1001, fs_addr, IpAddr::V4(Ipv4Addr::UNSPECIFIED), 0),
+        Box::new(port_1001),
+    )
+    .unwrap();
+
+    // Callee 1002 forces native Opus (48 kHz) so FreeSWITCH bridges & transcodes G.722 <-> Opus.
+    let mut cfg_1002 = UaConfig::new("1002", "secret1002", "freeswitch", registrar, "0.0.0.0", 0);
+    cfg_1002.supported_codecs = vec![RtpCodec::opus(), RtpCodec::telephone_event_48k(102)];
+    let (port_1002, handle_1002) = WavAudioPort::new(WavPcm16::new(48_000, vec![0; 960]), true);
+    let eng_1002 = SipEngine::spawn(
+        EngineConfig::new(cfg_1002, fs_addr, IpAddr::V4(Ipv4Addr::UNSPECIFIED), 0),
+        Box::new(port_1002),
+    )
+    .unwrap();
+
+    eng_1001.send_command(EngineCommand::Register).unwrap();
+    eng_1002.send_command(EngineCommand::Register).unwrap();
+    assert!(
+        wait_for_engine_event(&eng_1001, Duration::from_secs(10), |e| matches!(
+            e,
+            EngineEvent::RegistrationChanged(RegistrationState::Registered { .. })
+        ))
+        .is_some(),
+        "1001 G.722 registration failed on freeswitch"
+    );
+    assert!(
+        wait_for_engine_event(&eng_1002, Duration::from_secs(10), |e| matches!(
+            e,
+            EngineEvent::RegistrationChanged(RegistrationState::Registered { .. })
+        ))
+        .is_some(),
+        "1002 Opus registration failed on freeswitch"
+    );
+
+    eng_1001
+        .send_command(EngineCommand::Dial {
+            target_uri: SipUri::parse("sip:1002@freeswitch:5060").unwrap(),
+        })
+        .unwrap();
+
+    let call_1001 = match wait_for_engine_event(&eng_1001, Duration::from_secs(6), |e| {
+        matches!(e, EngineEvent::OutboundCallStarted { .. })
+    })
+    .expect("OutboundCallStarted on 1001")
+    {
+        EngineEvent::OutboundCallStarted { call_id } => call_id,
+        _ => unreachable!(),
+    };
+
+    let call_1002 = match wait_for_engine_event(&eng_1002, Duration::from_secs(8), |e| {
+        matches!(e, EngineEvent::IncomingCall { .. })
+    })
+    .expect("IncomingCall on 1002")
+    {
+        EngineEvent::IncomingCall { call_id, .. } => call_id,
+        _ => unreachable!(),
+    };
+    eng_1002
+        .send_command(EngineCommand::Answer { call_id: call_1002 })
+        .unwrap();
+
+    let mut est_1001: Option<String> = None;
+    let mut seen_1001 = Vec::new();
+    let dl1 = Instant::now() + Duration::from_secs(8);
+    while Instant::now() < dl1 {
+        if let Some(ev) = eng_1001.recv_event_timeout(Duration::from_millis(50)) {
+            if let EngineEvent::CallEstablished { codec, .. } = &ev {
+                est_1001 = Some(codec.clone());
+                break;
+            }
+            let done = matches!(ev, EngineEvent::CallTerminated { .. });
+            seen_1001.push(ev);
+            if done {
+                break;
+            }
+        }
+    }
+    let est_1001 = est_1001.unwrap_or_else(|| {
+        let mut seen_1002 = Vec::new();
+        while let Some(ev) = eng_1002.try_recv_event() {
+            seen_1002.push(ev);
+        }
+        panic!("CallEstablished on 1001 failed; evs1={seen_1001:?}, evs2={seen_1002:?}");
+    });
+    assert_eq!(est_1001, "G722");
+
+    let est_1002 = match wait_for_engine_event(&eng_1002, Duration::from_secs(8), |e| {
+        matches!(e, EngineEvent::CallEstablished { .. })
+    })
+    .expect("CallEstablished on 1002")
+    {
+        EngineEvent::CallEstablished { codec, .. } => codec,
+        _ => unreachable!(),
+    };
+    assert_eq!(est_1002, "OPUS");
+
+    thread::sleep(Duration::from_millis(800));
+
+    eng_1001
+        .send_command(EngineCommand::Hangup { call_id: call_1001 })
+        .unwrap();
+    let _ = wait_for_engine_event(&eng_1001, Duration::from_secs(6), |e| {
+        matches!(e, EngineEvent::CallTerminated { .. })
+    });
+    let _ = wait_for_engine_event(&eng_1002, Duration::from_secs(6), |e| {
+        matches!(e, EngineEvent::CallTerminated { .. })
+    });
+
+    for eng in [&eng_1001, &eng_1002] {
+        eng.send_command(EngineCommand::Unregister).unwrap();
+        let _ = wait_for_engine_event(eng, Duration::from_secs(4), |e| {
+            matches!(
+                e,
+                EngineEvent::RegistrationChanged(RegistrationState::Unregistered)
+            )
+        });
+    }
+    eng_1001.shutdown().unwrap();
+    eng_1002.shutdown().unwrap();
+
+    let recorded = handle_1002.recorded_wav();
+    assert_eq!(recorded.sample_rate, 48_000);
+    assert!(
+        recorded.rms_energy() > 1500,
+        "expected G.722->Asterisk->Opus audio RMS > 1500, got {}",
+        recorded.rms_energy()
+    );
+    let half = recorded.samples.len() / 2;
+    let steady = &recorded.samples[half..];
+    let p_5500 = goertzel_power(steady, 48_000.0, 5_500.0);
+    let p_2500 = goertzel_power(steady, 48_000.0, 2_500.0);
+    let p_1000 = goertzel_power(steady, 48_000.0, 1_000.0);
+    assert!(
+        p_5500 > p_2500 * 5.0 && p_5500 > p_1000 * 5.0,
+        "expected strong 5500 Hz high-band tone after G.722 QMF -> spandsp -> Opus, got p5500={p_5500:.1}, p2500={p_2500:.1}, p1000={p_1000:.1}"
+    );
+}
+
+#[test]
+fn p0_multi_call_hold_focus_and_spoofed_rtp_rejection() {
+    use bmsip_engine::PcmQueueAudioPort;
+    use bmsip_media::{DtmfEventPayload, RtpPacketizer};
+
+    let dummy_reg = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 1);
+
+    // 1. Hub endpoint with PcmQueueAudioPort handles Call A (held) then Call B (active).
+    let (hub_port, hub_audio) = PcmQueueAudioPort::new(64);
+    let hub_ua = UaConfig::new(
+        "hub",
+        "pw",
+        "127.0.0.1",
+        SipUri::parse("sip:127.0.0.1:1").unwrap(),
+        "127.0.0.1",
+        0,
+    );
+    let eng_hub = SipEngine::spawn(
+        EngineConfig::new(hub_ua, dummy_reg, IpAddr::V4(Ipv4Addr::LOCALHOST), 0),
+        Box::new(hub_port),
+    )
+    .unwrap();
+    let hub_addr = eng_hub.local_sip_addr();
+
+    let alice_ua = UaConfig::new(
+        "alice",
+        "pw",
+        "127.0.0.1",
+        SipUri::parse(&format!("sip:{hub_addr}")).unwrap(),
+        "127.0.0.1",
+        0,
+    );
+    let (alice_port, _) = WavAudioPort::new(WavPcm16::new(8_000, vec![0; 160]), true);
+    let eng_alice = SipEngine::spawn(
+        EngineConfig::new(alice_ua, hub_addr, IpAddr::V4(Ipv4Addr::LOCALHOST), 0),
+        Box::new(alice_port),
+    )
+    .unwrap();
+
+    eng_alice
+        .send_command(EngineCommand::Dial {
+            target_uri: SipUri::parse(&format!("sip:hub@{hub_addr}")).unwrap(),
+        })
+        .unwrap();
+    let call_a_hub = match wait_for_engine_event(&eng_hub, Duration::from_secs(5), |e| {
+        matches!(e, EngineEvent::IncomingCall { .. })
+    })
+    .expect("hub IncomingCall A")
+    {
+        EngineEvent::IncomingCall { call_id, .. } => call_id,
+        _ => unreachable!(),
+    };
+    eng_hub
+        .send_command(EngineCommand::Answer {
+            call_id: call_a_hub.clone(),
+        })
+        .unwrap();
+    let alice_remote_rtp = match wait_for_engine_event(&eng_alice, Duration::from_secs(5), |e| {
+        matches!(e, EngineEvent::CallEstablished { .. })
+    })
+    .expect("alice CallEstablished")
+    {
+        EngineEvent::CallEstablished { remote_rtp, .. } => remote_rtp,
+        _ => unreachable!(),
+    };
+    assert!(
+        wait_for_engine_event(&eng_hub, Duration::from_secs(5), |e| {
+            matches!(e, EngineEvent::CallEstablished { .. })
+        })
+        .is_some()
+    );
+
+    // Wait briefly so hub latches Alice's real RTP source port, then inject spoofed DTMF '9' packets.
+    thread::sleep(Duration::from_millis(120));
+    let mut fake_pkt = RtpPacketizer::new(0xDEAD_BEEF, 101, 500, 1600);
+    let dtmf9 = DtmfEventPayload {
+        digit: DtmfDigit::D9,
+        end_of_event: true,
+        volume: 10,
+        duration: 1600,
+    }
+    .to_bytes();
+    let forged = fake_pkt.build_custom_packet_bytes(101, 1600, true, &dtmf9);
+    // Test both different loopback IP (127.0.0.2) and different port on 127.0.0.1.
+    for bind_addr in ["127.0.0.2:0", "127.0.0.1:0"] {
+        let spoofer = UdpSocket::bind(bind_addr).unwrap();
+        for _ in 0..3 {
+            let _ = spoofer.send_to(&forged, alice_remote_rtp);
+        }
+    }
+    thread::sleep(Duration::from_millis(120));
+    while let Some(ev) = eng_hub.try_recv_event() {
+        assert!(
+            !matches!(ev, EngineEvent::DtmfReceived { .. }),
+            "spoofed RTP DTMF packet must be rejected: {ev:?}"
+        );
+    }
+
+    // Put Call A on Hold and start Call B with Carol.
+    eng_hub
+        .send_command(EngineCommand::Hold {
+            call_id: call_a_hub.clone(),
+        })
+        .unwrap();
+    assert!(
+        wait_for_engine_event(&eng_hub, Duration::from_secs(5), |e| {
+            matches!(
+                e,
+                EngineEvent::CallHoldChanged {
+                    local_hold: true,
+                    ..
+                }
+            )
+        })
+        .is_some()
+    );
+
+    while hub_audio.pop_playout_frame().is_some() {}
+
+    let carol_ua = UaConfig::new(
+        "carol",
+        "pw",
+        "127.0.0.1",
+        SipUri::parse(&format!("sip:{hub_addr}")).unwrap(),
+        "127.0.0.1",
+        0,
+    );
+    let (carol_port, _) = WavAudioPort::new(
+        WavPcm16::generate_sine_wave(8_000, 1_000, 1_500, 12_000),
+        true,
+    );
+    let eng_carol = SipEngine::spawn(
+        EngineConfig::new(carol_ua, hub_addr, IpAddr::V4(Ipv4Addr::LOCALHOST), 0),
+        Box::new(carol_port),
+    )
+    .unwrap();
+    eng_carol
+        .send_command(EngineCommand::Dial {
+            target_uri: SipUri::parse(&format!("sip:hub@{hub_addr}")).unwrap(),
+        })
+        .unwrap();
+
+    let call_b_hub = match wait_for_engine_event(&eng_hub, Duration::from_secs(5), |e| {
+        matches!(e, EngineEvent::IncomingCall { .. })
+    })
+    .expect("hub IncomingCall B")
+    {
+        EngineEvent::IncomingCall { call_id, .. } => call_id,
+        _ => unreachable!(),
+    };
+    eng_hub
+        .send_command(EngineCommand::Answer {
+            call_id: call_b_hub.clone(),
+        })
+        .unwrap();
+    assert!(
+        wait_for_engine_event(&eng_hub, Duration::from_secs(5), |e| {
+            matches!(e, EngineEvent::CallEstablished { .. })
+        })
+        .is_some()
+    );
+
+    thread::sleep(Duration::from_millis(280));
+    let mut call_b_samples = Vec::new();
+    while let Some(frame) = hub_audio.pop_playout_frame() {
+        call_b_samples.extend_from_slice(&frame);
+    }
+    let rms_b = WavPcm16::new(8_000, call_b_samples).rms_energy();
+    assert!(
+        rms_b > 1500,
+        "expected active Call B audio focus while Call A is held (RMS > 1500), got {rms_b}"
+    );
+
+    // Explicitly switch active audio focus back via SetActiveCall after resuming Call A.
+    eng_hub
+        .send_command(EngineCommand::ResumeCall {
+            call_id: call_a_hub.clone(),
+        })
+        .unwrap();
+    let _ = wait_for_engine_event(&eng_hub, Duration::from_secs(5), |e| {
+        matches!(
+            e,
+            EngineEvent::CallHoldChanged {
+                local_hold: false,
+                ..
+            }
+        )
+    });
+    eng_hub
+        .send_command(EngineCommand::SetActiveCall {
+            call_id: call_a_hub.clone(),
+        })
+        .unwrap();
+    thread::sleep(Duration::from_millis(60));
+    while hub_audio.pop_playout_frame().is_some() {}
+    thread::sleep(Duration::from_millis(160));
+    let mut call_a_samples = Vec::new();
+    while let Some(frame) = hub_audio.pop_playout_frame() {
+        call_a_samples.extend_from_slice(&frame);
+    }
+    let rms_a = WavPcm16::new(8_000, call_a_samples).rms_energy();
+    assert!(
+        rms_a < 300,
+        "expected SetActiveCall to switch hub audio focus back to silent Call A (RMS < 300), got {rms_a}"
+    );
+
+    eng_hub
+        .send_command(EngineCommand::Hangup {
+            call_id: call_a_hub,
+        })
+        .unwrap();
+    eng_hub
+        .send_command(EngineCommand::Hangup {
+            call_id: call_b_hub,
+        })
+        .unwrap();
+    let _ = wait_for_engine_event(&eng_hub, Duration::from_secs(4), |e| {
+        matches!(e, EngineEvent::CallTerminated { .. })
+    });
+    eng_alice.shutdown().unwrap();
+    eng_carol.shutdown().unwrap();
+    eng_hub.shutdown().unwrap();
+}

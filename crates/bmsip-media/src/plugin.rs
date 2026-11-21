@@ -11,7 +11,7 @@ use crate::codec::G711Kind;
 use crate::error::MediaError;
 use crate::g722::{resample_pcm_20ms, G722Codec};
 use crate::opus::{
-    BuiltInOpusCodec, OpusCodecBackend, OPUS_RTP_CLOCK_RATE, PCM_FRAME_SAMPLES_48KHZ_20MS,
+    OpusCodecBackend, OPUS_RTP_CLOCK_RATE, PCM_FRAME_SAMPLES_48KHZ_20MS,
     PCM_FRAME_SAMPLES_8KHZ_20MS,
 };
 
@@ -266,15 +266,9 @@ impl CodecRegistry {
         }
     }
 
-    /// Creates a [`CodecRegistry`] pre-populated with built-in pure-Rust `PCMU`, `PCMA`, `G722`, and `Opus` plugins.
+    /// Creates a [`CodecRegistry`] pre-populated with built-in pure-Rust `PCMU`, `PCMA`, and `G722` plugins.
     pub fn with_builtin_codecs() -> Self {
         let mut reg = Self::new();
-        reg.register_fn(
-            AudioCodecDescriptor::new(111, "opus", OPUS_RTP_CLOCK_RATE, 48_000)
-                .with_channels(2)
-                .with_fmtp("minptime=10;useinbandfec=1"),
-            || Box::new(OpusPluginAdapter::new(Box::new(BuiltInOpusCodec::new()))),
-        );
         reg.register_fn(G722Codec::default_descriptor(), || {
             Box::new(G722Codec::new())
         });

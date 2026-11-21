@@ -105,31 +105,46 @@ impl SipUri {
             )));
         };
 
-        let (before_headers, headers_part) = match rest.split_once('?') {
+        // Per RFC 3261 §19.1.1 / §25.1, userinfo may contain `;` parameters (e.g.
+        // `sip:5551234;phone-context=+1-212@example.com;user=phone`), whereas URI headers after
+        // `?` may contain `@` inside header values (e.g. `?Replaces=cid@10.0.0.1`).
+        // Treat `@` as the userinfo delimiter only when it precedes `?` or when no `=` appears
+        // between `?` and `@`.
+        let has_userinfo = match (rest.find('@'), rest.find('?')) {
+            (Some(_), None) => true,
+            (Some(at), Some(q)) => at < q || !rest[q + 1..at].contains('='),
+            (None, _) => false,
+        };
+
+        let (user, password, after_userinfo) = if has_userinfo {
+            match rest.split_once('@') {
+                Some((userinfo, after)) => {
+                    if userinfo.is_empty() {
+                        return Err(SipError::InvalidUri(format!(
+                            "empty userinfo before '@' in '{trimmed}'"
+                        )));
+                    }
+                    let (u, p) = match userinfo.split_once(':') {
+                        Some((user, pass)) => (Some(user.to_string()), Some(pass.to_string())),
+                        None => (Some(userinfo.to_string()), None),
+                    };
+                    (u, p, after)
+                }
+                None => (None, None, rest),
+            }
+        } else {
+            (None, None, rest)
+        };
+
+        let (before_headers, headers_part) = match after_userinfo.split_once('?') {
             Some((left, right)) => (left, Some(right)),
-            None => (rest, None),
+            None => (after_userinfo, None),
         };
 
         let mut parts = before_headers.split(';');
-        let authority = parts
+        let hostport = parts
             .next()
             .ok_or_else(|| SipError::InvalidUri("empty authority".to_string()))?;
-
-        let (user, password, hostport) = match authority.split_once('@') {
-            Some((userinfo, hp)) => {
-                if userinfo.is_empty() {
-                    return Err(SipError::InvalidUri(format!(
-                        "empty userinfo before '@' in '{trimmed}'"
-                    )));
-                }
-                let (u, p) = match userinfo.split_once(':') {
-                    Some((user, pass)) => (Some(user.to_string()), Some(pass.to_string())),
-                    None => (Some(userinfo.to_string()), None),
-                };
-                (u, p, hp)
-            }
-            None => (None, None, authority),
-        };
 
         let (host, port) = parse_hostport(hostport)?;
 
@@ -296,5 +311,28 @@ mod tests {
         assert!(SipUri::parse("sip:").is_err());
         assert!(SipUri::parse("sip:@example.com").is_err());
         assert!(SipUri::parse("sip:example.com:99999").is_err());
+    }
+
+    #[test]
+    fn parses_userinfo_with_semicolon_params_and_headers_with_at() {
+        let uri1 = SipUri::parse("sip:alice;day=tue@atlanta.com").unwrap();
+        assert_eq!(uri1.user.as_deref(), Some("alice;day=tue"));
+        assert_eq!(uri1.host, "atlanta.com");
+        assert!(uri1.params.is_empty());
+
+        let uri2 =
+            SipUri::parse("sip:5551234;phone-context=+1-212@example.com;user=phone").unwrap();
+        assert_eq!(uri2.user.as_deref(), Some("5551234;phone-context=+1-212"));
+        assert_eq!(uri2.host, "example.com");
+        assert_eq!(uri2.param("user"), Some(Some("phone")));
+
+        let uri3 = SipUri::parse("sip:10.0.0.2:5062?Replaces=cid@10.0.0.1").unwrap();
+        assert_eq!(uri3.user, None);
+        assert_eq!(uri3.host, "10.0.0.2");
+        assert_eq!(uri3.port, Some(5062));
+        assert_eq!(
+            uri3.headers,
+            vec![("Replaces".to_string(), "cid@10.0.0.1".to_string())]
+        );
     }
 }

@@ -5,7 +5,9 @@ use bmsip_core::auth::hash::md5_hex;
 use bmsip_core::dialog::{CallState, RegistrationState, UaConfig, UaEvent, UserAgent};
 use bmsip_core::sdp::{Direction, RtpCodec, SdpSession};
 use bmsip_core::sim::NetworkPolicy;
-use bmsip_core::sip::{CallerIdentity, Method, NameAddr, ReasonHeader, SipMessage, SipUri};
+use bmsip_core::sip::{
+    CallerIdentity, Method, NameAddr, ReasonHeader, SipMessage, SipRequest, SipUri,
+};
 use bmsip_core::transaction::{TransactionEvent, TransactionId, TransactionManager};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -1941,4 +1943,337 @@ fn sdes_srtp_tls_enforcement_crypto_seed_hold_and_dtls_488_rejection() {
         resp_488.starts_with("SIP/2.0 488 "),
         "expected 488 Not Acceptable Here for DTLS-SRTP offer, got: {resp_488}"
     );
+}
+
+#[test]
+fn p0_rfc6026_accepted_state_absorbs_invite_retransmit_until_timer_l() {
+    let t0 = Instant::now();
+    let mut uac = TransactionManager::default();
+    let mut uas = TransactionManager::default();
+
+    let mut inv = SipRequest::new(
+        Method::Invite,
+        SipUri::parse("sip:bob@10.0.0.2:5062").unwrap(),
+    );
+    inv.headers
+        .add("Via", "SIP/2.0/UDP 10.0.0.1:5060;branch=z9hG4bK-acc-1");
+    inv.headers.set("From", "<sip:alice@pbx.local>;tag=a1");
+    inv.headers.set("To", "<sip:bob@pbx.local>");
+    inv.headers.set("Call-ID", "ist-accepted-1@10.0.0.1");
+    inv.headers.set("CSeq", "1 INVITE");
+
+    let _ = uac.start_client_transaction(inv.clone(), t0).unwrap();
+    let wire_inv = uac.poll_transmit().remove(0);
+
+    let evs1 = uas.receive_message(SipMessage::parse(&wire_inv).unwrap(), t0);
+    let TransactionEvent::ServerRequest { tx_id, request } = &evs1[0] else {
+        panic!("expected initial ServerRequest");
+    };
+    let mut ok = request.create_response(200, "OK").unwrap();
+    ok.headers.set("To", "<sip:bob@pbx.local>;tag=b1");
+    let _ = uas.send_server_response(tx_id, ok, t0).unwrap();
+    let _ = uas.poll_transmit();
+    assert_eq!(uas.active_server_count(), 1);
+
+    // Retransmitted INVITE arriving during Timer L must be absorbed without creating a new ServerRequest.
+    let evs_retx = uas.receive_message(
+        SipMessage::parse(&wire_inv).unwrap(),
+        t0 + Duration::from_secs(1),
+    );
+    assert!(evs_retx.is_empty());
+    assert!(uas.poll_transmit().is_empty());
+    assert_eq!(uas.active_server_count(), 1);
+
+    // ACK must emit AckFor2xx and keep IST in Accepted until Timer L (64 * 500ms = 32s).
+    let mut ack = SipRequest::new(Method::Ack, SipUri::parse("sip:bob@10.0.0.2:5062").unwrap());
+    ack.headers
+        .add("Via", "SIP/2.0/UDP 10.0.0.1:5060;branch=z9hG4bK-ack-2");
+    ack.headers.set("From", "<sip:alice@pbx.local>;tag=a1");
+    ack.headers.set("To", "<sip:bob@pbx.local>;tag=b1");
+    ack.headers.set("Call-ID", "ist-accepted-1@10.0.0.1");
+    ack.headers.set("CSeq", "1 ACK");
+    let ack_evs = uas.receive_message(
+        SipMessage::parse(&ack.to_bytes()).unwrap(),
+        t0 + Duration::from_secs(2),
+    );
+    assert!(matches!(
+        ack_evs.as_slice(),
+        [TransactionEvent::AckFor2xx(_)]
+    ));
+    assert_eq!(uas.active_server_count(), 1);
+
+    let term_evs = uas.handle_timeout(t0 + Duration::from_secs(33));
+    assert!(term_evs
+        .iter()
+        .any(|e| matches!(e, TransactionEvent::TransactionTerminated(_))));
+    assert_eq!(uas.active_server_count(), 0);
+}
+
+#[test]
+fn p0_hangup_sends_cancel_immediately_after_100_trying() {
+    let t0 = Instant::now();
+    let registrar = SipUri::parse("sip:pbx.local:5060").unwrap();
+    let mut alice = UserAgent::new(UaConfig::new(
+        "alice",
+        "pw",
+        "pbx.local",
+        registrar,
+        "10.0.0.1",
+        5060,
+    ));
+
+    let call_id = alice
+        .dial(SipUri::parse("sip:bob@pbx.local").unwrap(), 40000, t0)
+        .unwrap();
+    let inv_bytes = alice.poll_transmit().remove(0);
+    let SipMessage::Request(inv) = SipMessage::parse(&inv_bytes).unwrap() else {
+        panic!("expected INVITE");
+    };
+
+    let trying = inv.create_response(100, "Trying").unwrap().to_bytes();
+    let _ = alice.receive_datagram(&trying, t0 + Duration::from_millis(50));
+    let _ = alice.poll_transmit();
+
+    alice
+        .hangup(&call_id, t0 + Duration::from_millis(100))
+        .unwrap();
+    let out = alice.poll_transmit();
+    assert_eq!(out.len(), 1);
+    let SipMessage::Request(cancel) = SipMessage::parse(&out[0]).unwrap() else {
+        panic!("expected CANCEL");
+    };
+    assert_eq!(cancel.method, Method::Cancel);
+    assert_eq!(cancel.call_id().unwrap(), call_id);
+}
+
+#[test]
+fn p0_bodyless_200_ok_after_early_media_183_transitions_to_established() {
+    let t0 = Instant::now();
+    let registrar = SipUri::parse("sip:pbx.local:5060").unwrap();
+    let mut alice = UserAgent::new(UaConfig::new(
+        "alice",
+        "pw",
+        "pbx.local",
+        registrar,
+        "10.0.0.1",
+        5060,
+    ));
+    let call_id = alice
+        .dial(SipUri::parse("sip:bob@pbx.local").unwrap(), 40000, t0)
+        .unwrap();
+    let inv_bytes = alice.poll_transmit().remove(0);
+    let SipMessage::Request(inv) = SipMessage::parse(&inv_bytes).unwrap() else {
+        panic!("expected INVITE");
+    };
+
+    let early_sdp = SdpSession::new("bob", "55", "10.0.0.2", 50000, vec![RtpCodec::pcmu()]);
+    let mut r183 = inv
+        .create_response(183, "Session Progress")
+        .unwrap()
+        .with_body("application/sdp", early_sdp.to_string().into_bytes());
+    r183.headers.set("To", "<sip:bob@pbx.local>;tag=b-early");
+    r183.headers.set("Contact", "<sip:bob@10.0.0.2:5062>");
+    let _ = alice.receive_datagram(&r183.to_bytes(), t0 + Duration::from_millis(20));
+
+    let mut r200 = inv.create_response(200, "OK").unwrap();
+    r200.headers.set("To", "<sip:bob@pbx.local>;tag=b-early");
+    r200.headers.set("Contact", "<sip:bob@10.0.0.2:5062>");
+    let evs = alice.receive_datagram(&r200.to_bytes(), t0 + Duration::from_millis(40));
+    assert!(evs
+        .iter()
+        .any(|e| matches!(e, UaEvent::CallEstablished { call_id: cid, .. } if cid == &call_id)));
+
+    // Calling hangup must now emit BYE cleanly (state == Established).
+    alice
+        .hangup(&call_id, t0 + Duration::from_millis(60))
+        .unwrap();
+    let bye_found = alice
+        .poll_transmit()
+        .into_iter()
+        .filter_map(|b| SipMessage::parse(&b).ok())
+        .any(|m| matches!(m, SipMessage::Request(r) if r.method == Method::Bye));
+    assert!(
+        bye_found,
+        "expected BYE after bodyless 200 OK established call"
+    );
+}
+
+#[test]
+fn p0_bodyless_200_ok_to_reinvite_recovers_established_state() {
+    let t0 = Instant::now();
+    let registrar = SipUri::parse("sip:pbx.local:5060").unwrap();
+    let mut alice = UserAgent::new(UaConfig::new(
+        "alice",
+        "pw",
+        "pbx.local",
+        registrar,
+        "10.0.0.1",
+        5060,
+    ));
+    let call_id = alice
+        .dial(SipUri::parse("sip:bob@pbx.local").unwrap(), 40000, t0)
+        .unwrap();
+    let inv_bytes = alice.poll_transmit().remove(0);
+    let SipMessage::Request(inv) = SipMessage::parse(&inv_bytes).unwrap() else {
+        panic!("expected INVITE");
+    };
+    let ans = SdpSession::new("bob", "1", "10.0.0.2", 50000, vec![RtpCodec::pcmu()]);
+    let mut ok1 = inv
+        .create_response(200, "OK")
+        .unwrap()
+        .with_body("application/sdp", ans.to_string().into_bytes());
+    ok1.headers.set("To", "<sip:bob@pbx.local>;tag=b1");
+    ok1.headers.set("Contact", "<sip:bob@10.0.0.2:5060>");
+    let _ = alice.receive_datagram(&ok1.to_bytes(), t0 + Duration::from_millis(10));
+    let _ = alice.poll_transmit(); // ACK
+
+    alice
+        .hold(&call_id, t0 + Duration::from_millis(20))
+        .unwrap();
+    assert_eq!(alice.call_state(&call_id), Some(CallState::ReInviting));
+    let reinv_bytes = alice.poll_transmit().remove(0);
+    let SipMessage::Request(reinv) = SipMessage::parse(&reinv_bytes).unwrap() else {
+        panic!("expected re-INVITE");
+    };
+    let ok2 = reinv.create_response(200, "OK").unwrap(); // bodyless 200 OK to re-INVITE
+    let evs = alice.receive_datagram(&ok2.to_bytes(), t0 + Duration::from_millis(30));
+    assert_eq!(alice.call_state(&call_id), Some(CallState::Established));
+    assert!(evs
+        .iter()
+        .any(|e| matches!(e, UaEvent::CallMediaUpdated { call_id: cid, .. } if cid == &call_id)));
+}
+
+#[test]
+fn p0_200_ok_ack_timeout_sends_bye_per_rfc3261() {
+    let t0 = Instant::now();
+    let registrar = SipUri::parse("sip:pbx.local:5060").unwrap();
+    let mut bob = UserAgent::new(UaConfig::new(
+        "bob",
+        "pw",
+        "pbx.local",
+        registrar,
+        "10.0.0.2",
+        5062,
+    ));
+
+    let offer = SdpSession::new("alice", "1", "10.0.0.1", 40000, vec![RtpCodec::pcmu()]);
+    let inv = format!(
+        "INVITE sip:bob@10.0.0.2:5062 SIP/2.0\r\n\
+         Via: SIP/2.0/UDP 10.0.0.1:5060;branch=z9hG4bK-noack-1\r\n\
+         Max-Forwards: 70\r\n\
+         From: <sip:alice@pbx.local>;tag=a1\r\n\
+         To: <sip:bob@pbx.local>\r\n\
+         Call-ID: no-ack-timeout@10.0.0.1\r\n\
+         CSeq: 1 INVITE\r\n\
+         Contact: <sip:alice@10.0.0.1:5060>\r\n\
+         Content-Type: application/sdp\r\n\
+         Content-Length: {}\r\n\r\n{}",
+        offer.to_string().len(),
+        offer
+    );
+    let _ = bob.receive_datagram(inv.as_bytes(), t0);
+    let _ = bob.poll_transmit(); // 100 Trying
+    bob.answer("no-ack-timeout@10.0.0.1", 50000, t0).unwrap();
+    let _ = bob.poll_transmit(); // initial 200 OK
+
+    // Wrong CSeq ACK (e.g. CSeq 99 ACK) must NOT clear awaiting_ack.
+    let stale_ack = b"ACK sip:bob@10.0.0.2:5062 SIP/2.0\r\n\
+        Via: SIP/2.0/UDP 10.0.0.1:5060;branch=z9hG4bK-ack-wrong\r\n\
+        Max-Forwards: 70\r\n\
+        From: <sip:alice@pbx.local>;tag=a1\r\n\
+        To: <sip:bob@pbx.local>;tag=unexpected\r\n\
+        Call-ID: no-ack-timeout@10.0.0.1\r\n\
+        CSeq: 99 ACK\r\n\
+        Content-Length: 0\r\n\r\n";
+    let _ = bob.receive_datagram(stale_ack, t0 + Duration::from_millis(10));
+
+    let mut saw_bye = false;
+    let mut saw_term = false;
+    for _ in 0..30 {
+        let Some(dl) = bob.poll_timeout() else {
+            break;
+        };
+        let evs = bob.handle_timeout(dl);
+        for pkt in bob.poll_transmit() {
+            if let Ok(SipMessage::Request(r)) = SipMessage::parse(&pkt) {
+                if r.method == Method::Bye {
+                    saw_bye = true;
+                }
+            }
+        }
+        if evs
+            .iter()
+            .any(|e| matches!(e, UaEvent::CallTerminated { .. }))
+        {
+            saw_term = true;
+            break;
+        }
+    }
+    assert!(
+        saw_bye,
+        "expected BYE on 200 OK ACK timeout (RFC 3261 §13.3.1.4)"
+    );
+    assert!(saw_term, "expected CallTerminated on 200 OK ACK timeout");
+}
+
+#[test]
+fn p0_forked_second_2xx_triggers_ack_and_bye_for_forked_leg() {
+    let t0 = Instant::now();
+    let registrar = SipUri::parse("sip:pbx.local:5060").unwrap();
+    let mut alice = UserAgent::new(UaConfig::new(
+        "alice",
+        "pw",
+        "pbx.local",
+        registrar,
+        "10.0.0.1",
+        5060,
+    ));
+
+    let call_id = alice
+        .dial(SipUri::parse("sip:bob@pbx.local").unwrap(), 40000, t0)
+        .unwrap();
+    let inv_bytes = alice.poll_transmit().remove(0);
+    let SipMessage::Request(inv) = SipMessage::parse(&inv_bytes).unwrap() else {
+        panic!("expected INVITE");
+    };
+
+    let ans1 = SdpSession::new("bob1", "1", "10.0.0.2", 50000, vec![RtpCodec::pcmu()]);
+    let mut r200_1 = inv
+        .create_response(200, "OK")
+        .unwrap()
+        .with_body("application/sdp", ans1.to_string().into_bytes());
+    r200_1.headers.set("To", "<sip:bob@pbx.local>;tag=leg1");
+    r200_1.headers.set("Contact", "<sip:bob1@10.0.0.2:5060>");
+    let _ = alice.receive_datagram(&r200_1.to_bytes(), t0 + Duration::from_millis(10));
+    let _ = alice.poll_transmit(); // primary ACK
+
+    let ans2 = SdpSession::new("bob2", "2", "10.0.0.3", 50002, vec![RtpCodec::pcmu()]);
+    let mut r200_2 = inv
+        .create_response(200, "OK")
+        .unwrap()
+        .with_body("application/sdp", ans2.to_string().into_bytes());
+    r200_2.headers.set("To", "<sip:bob@pbx.local>;tag=leg2");
+    r200_2.headers.set("Contact", "<sip:bob2@10.0.0.3:5060>");
+    let _ = alice.receive_datagram(&r200_2.to_bytes(), t0 + Duration::from_millis(20));
+
+    let out: Vec<SipRequest> = alice
+        .poll_transmit()
+        .into_iter()
+        .filter_map(|b| match SipMessage::parse(&b).ok()? {
+            SipMessage::Request(r) => Some(r),
+            SipMessage::Response(_) => None,
+        })
+        .collect();
+
+    assert!(out.iter().any(|r| {
+        r.method == Method::Ack
+            && r.uri.host == "10.0.0.3"
+            && r.to().ok().and_then(|t| t.tag).as_deref() == Some("leg2")
+    }));
+    assert!(out.iter().any(|r| {
+        r.method == Method::Bye
+            && r.uri.host == "10.0.0.3"
+            && r.to().ok().and_then(|t| t.tag).as_deref() == Some("leg2")
+    }));
+    assert_eq!(alice.call_state(&call_id), Some(CallState::Established));
 }

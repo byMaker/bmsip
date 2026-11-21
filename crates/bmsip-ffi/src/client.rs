@@ -14,8 +14,8 @@ use bmsip_engine::bmsip_core::sdp::{RtpCodec, SrtpMode};
 use bmsip_engine::bmsip_core::sip::{SipTransport, SipUri};
 use bmsip_engine::bmsip_media::DtmfDigit;
 use bmsip_engine::{
-    EngineCommand, EngineConfig, EngineEvent, PcmAudioHandle, PcmQueueAudioPort, SipEngine,
-    TlsConfig,
+    EngineCommand, EngineConfig, EngineEvent, EngineEventReceiver, PcmAudioHandle,
+    PcmQueueAudioPort, SipEngine, TlsConfig,
 };
 
 /// Cross-platform FFI error surfaced to Swift, Kotlin, and C callers.
@@ -186,6 +186,7 @@ impl FfiEvent {
 /// High-level cross-platform SIP client matching `interface BmsipClient` in `bmsip.udl`.
 pub struct BmsipClient {
     engine: Mutex<Option<SipEngine>>,
+    events: EngineEventReceiver,
     audio: PcmAudioHandle,
 }
 
@@ -198,6 +199,11 @@ impl BmsipClient {
     /// Creates and starts a new [`BmsipClient`] with an explicit PCM bridge rate (`8000`, `16000`, or `48000` Hz).
     pub fn new_with_sample_rate(config: FfiConfig, sample_rate_hz: u32) -> Result<Self, FfiError> {
         Self::new_with_transport(config, sample_rate_hz, FfiTransport::Udp, None, false)
+    }
+
+    /// UniFFI-aligned alias for [`BmsipClient::new_with_sample_rate`].
+    pub fn with_sample_rate(config: FfiConfig, sample_rate_hz: u32) -> Result<Self, FfiError> {
+        Self::new_with_sample_rate(config, sample_rate_hz)
     }
 
     /// Creates and starts a new [`BmsipClient`] with explicit PCM bridge rate, SIP transport (`Udp`/`Tcp`/`Tls`),
@@ -217,6 +223,17 @@ impl BmsipClient {
             tls_ca_pem,
             tls_insecure,
         )
+    }
+
+    /// UniFFI-aligned alias for [`BmsipClient::new_with_transport`].
+    pub fn with_transport(
+        config: FfiConfig,
+        sample_rate_hz: u32,
+        transport: FfiTransport,
+        tls_ca_pem: Option<String>,
+        tls_insecure: bool,
+    ) -> Result<Self, FfiError> {
+        Self::new_with_transport(config, sample_rate_hz, transport, tls_ca_pem, tls_insecure)
     }
 
     /// Creates and starts a new [`BmsipClient`] with explicit PCM bridge rate, SIP transport (`Udp`/`Tcp`/`Tls`),
@@ -284,11 +301,32 @@ impl BmsipClient {
             PcmQueueAudioPort::new_with_sample_rate(sample_rate_hz, 64);
         let engine = SipEngine::spawn(eng_cfg, Box::new(audio_port))
             .map_err(|e| FfiError::RuntimeError(e.to_string()))?;
+        let events = engine.event_receiver();
 
         Ok(Self {
             engine: Mutex::new(Some(engine)),
+            events,
             audio: audio_handle,
         })
+    }
+
+    /// UniFFI-aligned alias for [`BmsipClient::new_with_security`].
+    pub fn with_security(
+        config: FfiConfig,
+        sample_rate_hz: u32,
+        transport: FfiTransport,
+        srtp_mode: FfiSrtpMode,
+        tls_ca_pem: Option<String>,
+        tls_insecure: bool,
+    ) -> Result<Self, FfiError> {
+        Self::new_with_security(
+            config,
+            sample_rate_hz,
+            transport,
+            srtp_mode,
+            tls_ca_pem,
+            tls_insecure,
+        )
     }
 
     /// Returns the configured mono PCM sample rate (`8000`, `16000`, or `48000` Hz) of the audio bridge.
@@ -417,14 +455,11 @@ impl BmsipClient {
     }
 
     pub fn poll_event(&self, timeout_ms: u32) -> Option<FfiEvent> {
-        let ev = {
-            let guard = self.engine.lock().ok()?;
-            let eng = guard.as_ref()?;
-            if timeout_ms == 0 {
-                eng.try_recv_event()
-            } else {
-                eng.recv_event_timeout(Duration::from_millis(u64::from(timeout_ms)))
-            }
+        let ev = if timeout_ms == 0 {
+            self.events.try_recv()
+        } else {
+            self.events
+                .recv_timeout(Duration::from_millis(u64::from(timeout_ms)))
         };
         ev.map(map_engine_event)
     }

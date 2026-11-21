@@ -375,6 +375,8 @@ struct CallSession {
     inbound_invite_req: Option<SipRequest>,
     inbound_invite_branch: Option<String>,
     pending_cancel: bool,
+    pending_cancel_reason: Option<ReasonHeader>,
+    received_provisional: bool,
     invite_auth_attempts: u8,
     bye_auth_attempts: u8,
     update_auth_attempts: u8,
@@ -704,6 +706,8 @@ impl UserAgent {
             inbound_invite_req: None,
             inbound_invite_branch: None,
             pending_cancel: false,
+            pending_cancel_reason: None,
+            received_provisional: false,
             invite_auth_attempts: 0,
             bye_auth_attempts: 0,
             update_auth_attempts: 0,
@@ -1127,9 +1131,17 @@ impl UserAgent {
 
         match (direction, state) {
             (CallDirection::Outbound, CallState::Calling) => {
-                // RFC 3261 §9.1: CANCEL MUST NOT be sent until a 1xx provisional response arrives.
-                if let Some(call) = self.calls.get_mut(call_id) {
+                // RFC 3261 §9.1: CANCEL MUST NOT be sent until ANY 1xx provisional arrives
+                // (including `100 Trying`, which keeps CallState in `Calling`).
+                let already_got_1xx = self
+                    .calls
+                    .get(call_id)
+                    .is_some_and(|c| c.received_provisional);
+                if already_got_1xx {
+                    self.send_cancel_for_call_with_reason(call_id, reason, now)?;
+                } else if let Some(call) = self.calls.get_mut(call_id) {
                     call.pending_cancel = true;
+                    call.pending_cancel_reason = reason;
                     call.state = CallState::Cancelling;
                 }
                 Ok(())
@@ -1915,10 +1927,21 @@ impl UserAgent {
             }
 
             if timed_out {
-                self.terminate_call(
+                if let Some(call) = self.calls.get_mut(&call_id) {
+                    call.awaiting_ack = None;
+                }
+                let reason_hdr = ReasonHeader::sip(408, "ACK Timeout");
+                let _ = self.send_bye_for_call_with_reason(
+                    &call_id,
+                    None,
+                    Some(reason_hdr.clone()),
+                    now,
+                );
+                self.terminate_call_with_reason(
                     &call_id,
                     None,
                     "ACK timeout for 200 OK (RFC 3261 §13.3.1.4)".to_string(),
+                    Some(reason_hdr),
                 );
             } else if let Some(resp) = resend_resp {
                 self.transactions.send_stateless_response(resp);
@@ -2329,10 +2352,6 @@ impl UserAgent {
         ack
     }
 
-    fn send_cancel_for_call(&mut self, call_id: &str, now: Instant) -> Result<(), SipError> {
-        self.send_cancel_for_call_with_reason(call_id, None, now)
-    }
-
     fn send_cancel_for_call_with_reason(
         &mut self,
         call_id: &str,
@@ -2346,6 +2365,7 @@ impl UserAgent {
                 .ok_or_else(|| SipError::TransactionError(format!("unknown call {call_id}")))?;
             call.state = CallState::Cancelling;
             call.pending_cancel = false;
+            call.pending_cancel_reason = None;
             call.active_invite_req.clone().ok_or_else(|| {
                 SipError::TransactionError("missing original INVITE request for CANCEL".to_string())
             })?
@@ -2474,7 +2494,7 @@ impl UserAgent {
                     self.on_client_final(tx_id, response, now);
                 }
                 TransactionEvent::Unmatched2xx(response) => {
-                    self.on_unmatched_2xx(response);
+                    self.on_unmatched_2xx(response, now);
                 }
                 TransactionEvent::TransactionTimeout(tx_id) => {
                     self.on_transaction_timeout(tx_id);
@@ -2788,6 +2808,8 @@ impl UserAgent {
             inbound_invite_req: Some(request),
             inbound_invite_branch: Some(branch),
             pending_cancel: false,
+            pending_cancel_reason: None,
+            received_provisional: false,
             invite_auth_attempts: 0,
             bye_auth_attempts: 0,
             update_auth_attempts: 0,
@@ -3510,8 +3532,18 @@ impl UserAgent {
     }
 
     fn on_ack_for_2xx(&mut self, ack: SipRequest) {
-        if let Ok(cid) = ack.call_id() {
-            if let Some(call) = self.calls.get_mut(cid) {
+        let Ok(cid) = ack.call_id() else {
+            return;
+        };
+        let ack_cseq = ack.cseq().ok().map(|c| c.seq);
+        let ack_to_tag = ack.to().ok().and_then(|t| t.tag);
+        if let Some(call) = self.calls.get_mut(cid) {
+            let expected_cseq = call
+                .awaiting_ack
+                .as_ref()
+                .and_then(|p| p.response.cseq().ok().map(|c| c.seq));
+            let to_ok = ack_to_tag.as_deref() == Some(call.local_tag.as_str());
+            if to_ok && expected_cseq.is_some() && ack_cseq == expected_cseq {
                 call.awaiting_ack = None;
             }
         }
@@ -3532,6 +3564,7 @@ impl UserAgent {
             if call.active_invite_tx.as_ref() != Some(&tx_id) {
                 return;
             }
+            call.received_provisional = true;
 
             if let Ok(to) = response.to() {
                 if let Some(tag) = to.tag {
@@ -3626,7 +3659,11 @@ impl UserAgent {
 
         // Send deferred CANCEL as soon as any 1xx provisional response arrives (RFC 3261 §9.1).
         if self.calls.get(&call_id).is_some_and(|c| c.pending_cancel) {
-            if let Err(err) = self.send_cancel_for_call(&call_id, now) {
+            let reason = self
+                .calls
+                .get_mut(&call_id)
+                .and_then(|c| c.pending_cancel_reason.take());
+            if let Err(err) = self.send_cancel_for_call_with_reason(&call_id, reason, now) {
                 self.pending_events
                     .push_back(UaEvent::ProtocolWarning(err.to_string()));
             }
@@ -3814,6 +3851,7 @@ impl UserAgent {
                 call.active_invite_tx = None;
                 call.active_invite_req = None;
                 call.pending_cancel = false;
+                call.pending_cancel_reason = None;
                 call.invite_auth_attempts = 0;
                 call.session_timer_retries = 0;
 
@@ -3878,6 +3916,39 @@ impl UserAgent {
                             }
                         }
                     }
+                } else if is_reinvite {
+                    call.state = CallState::Established;
+                    if let (Some(local_sdp), Some(remote_sdp)) =
+                        (call.local_sdp.clone(), call.remote_sdp.clone())
+                    {
+                        established_payload =
+                            Some((local_sdp, remote_sdp, call.negotiated_codecs.clone()));
+                    }
+                } else if let (Some(local_sdp), Some(remote_sdp)) =
+                    (call.local_sdp.clone(), call.remote_sdp.clone())
+                {
+                    // Bodyless 200 OK after early media answer (e.g. reliable 183 + PRACK).
+                    let effective_srtp = self
+                        .config
+                        .effective_srtp_mode()
+                        .unwrap_or(SrtpMode::Disabled);
+                    if effective_srtp == SrtpMode::SdesRequired && call.negotiated_srtp.is_none() {
+                        self.pending_events.push_back(UaEvent::ProtocolWarning(
+                            "bodyless 200 OK to INVITE lacked required SDES SRTP negotiation"
+                                .to_string(),
+                        ));
+                        cancelling_race = true;
+                    } else {
+                        call.state = CallState::Established;
+                        established_payload =
+                            Some((local_sdp, remote_sdp, call.negotiated_codecs.clone()));
+                    }
+                } else {
+                    // Initial INVITE received 200 OK without any SDP answer in dialog or 18x.
+                    self.pending_events.push_back(UaEvent::ProtocolWarning(
+                        "200 OK to INVITE missing SDP answer".to_string(),
+                    ));
+                    cancelling_race = true;
                 }
 
                 let ack_snapshot = call.clone();
@@ -3945,6 +4016,7 @@ impl UserAgent {
                     call.session_expires_secs = Some(new_se);
                     call.session_timer_retries = call.session_timer_retries.saturating_add(1);
                     call.local_cseq += 1;
+                    call.received_provisional = false;
                     call.local_sdp.clone().map(|sdp| {
                         if is_reinvite {
                             Self::build_in_dialog_invite(config_ref, call, &branch, &sdp, None)
@@ -4004,6 +4076,7 @@ impl UserAgent {
                         let next_req = if let Some(call) = self.calls.get_mut(call_id) {
                             call.invite_auth_attempts = attempts.saturating_add(1);
                             call.local_cseq += 1;
+                            call.received_provisional = false;
                             call.local_sdp.clone().map(|sdp| {
                                 if is_reinvite {
                                     Self::build_in_dialog_invite(
@@ -4405,15 +4478,106 @@ impl UserAgent {
         self.terminate_call_with_reason(call_id, Some(code), response.reason_phrase, reason_header);
     }
 
-    fn on_unmatched_2xx(&mut self, response: SipResponse) {
-        let Ok(call_id) = response.call_id() else {
+    fn on_unmatched_2xx(&mut self, response: SipResponse, now: Instant) {
+        let Ok(call_id) = response.call_id().map(str::to_string) else {
             return;
         };
-        if let Some(call) = self.calls.get(call_id) {
-            if let Some(ack) = &call.last_ack_for_2xx {
-                let _ = self.transactions.send_ack_for_2xx(ack.clone());
+        let Ok(cseq) = response.cseq() else {
+            return;
+        };
+        if cseq.method != Method::Invite {
+            return;
+        }
+        let resp_to_tag = response.to().ok().and_then(|t| t.tag);
+
+        if let Some(call) = self.calls.get(&call_id) {
+            if resp_to_tag.is_some() && resp_to_tag == call.remote_tag {
+                if let Some(ack) = &call.last_ack_for_2xx {
+                    if ack.cseq().ok().map(|c| c.seq) == Some(cseq.seq) {
+                        let _ = self.transactions.send_ack_for_2xx(ack.clone());
+                    }
+                }
+                return;
             }
         }
+
+        // RFC 3261 §13.2.2.4 / RFC 6026: Unmatched 2xx for a forked or late leg MUST be ACKed
+        // with its own To-tag/Contact/Record-Route and immediately torn down with BYE.
+        let (fallback_target, bye_cseq) = if let Some(call) = self.calls.get_mut(&call_id) {
+            call.local_cseq += 1;
+            (
+                Some(call.remote_uri.clone()),
+                call.local_cseq.max(cseq.seq.saturating_add(1)),
+            )
+        } else {
+            (None, cseq.seq.saturating_add(1))
+        };
+
+        let target_uri = response
+            .contact()
+            .ok()
+            .flatten()
+            .map(|c| c.uri)
+            .or(fallback_target)
+            .or_else(|| response.to().ok().map(|t| t.uri));
+        let Some(target_uri) = target_uri else {
+            return;
+        };
+
+        let route_set = extract_record_routes(&response.headers, true);
+        let ack_branch = self.next_branch();
+        let mut ack = SipRequest::new(Method::Ack, target_uri.clone());
+        ack.headers.add(
+            "Via",
+            Via::new(
+                self.config.transport.via_proto(),
+                format!("{}:{}", self.config.local_host, self.config.local_sip_port),
+                ack_branch,
+            )
+            .to_string(),
+        );
+        for route in &route_set {
+            ack.headers
+                .add("Route", NameAddr::new(route.clone()).to_string());
+        }
+        if let Some(from) = response.headers.get("From") {
+            ack.headers.set("From", from);
+        }
+        if let Some(to) = response.headers.get("To") {
+            ack.headers.set("To", to);
+        }
+        ack.headers.set("Call-ID", call_id.clone());
+        ack.headers
+            .set("CSeq", CSeq::new(cseq.seq, Method::Ack).to_string());
+        ack.headers.set("Max-Forwards", "70");
+        let _ = self.transactions.send_ack_for_2xx(ack);
+
+        let bye_branch = self.next_branch();
+        let mut bye = SipRequest::new(Method::Bye, target_uri);
+        bye.headers.add(
+            "Via",
+            Via::new(
+                self.config.transport.via_proto(),
+                format!("{}:{}", self.config.local_host, self.config.local_sip_port),
+                bye_branch,
+            )
+            .to_string(),
+        );
+        for route in &route_set {
+            bye.headers
+                .add("Route", NameAddr::new(route.clone()).to_string());
+        }
+        if let Some(from) = response.headers.get("From") {
+            bye.headers.set("From", from);
+        }
+        if let Some(to) = response.headers.get("To") {
+            bye.headers.set("To", to);
+        }
+        bye.headers.set("Call-ID", call_id);
+        bye.headers
+            .set("CSeq", CSeq::new(bye_cseq, Method::Bye).to_string());
+        bye.headers.set("Max-Forwards", "70");
+        let _ = self.transactions.start_client_transaction(bye, now);
     }
 
     fn on_transaction_timeout(&mut self, tx_id: TransactionId) {

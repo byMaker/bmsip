@@ -104,6 +104,41 @@ struct PeerDriveOutput {
     warning: Option<String>,
 }
 
+fn drain_tls_plaintext(
+    role: &mut TlsRole,
+    framer: &mut SipStreamFramer,
+    progressed: &mut bool,
+    closed: &mut bool,
+    fatal_frame_err: &mut bool,
+    warning: &mut Option<String>,
+) -> bool {
+    let mut plain_buf = [0u8; 8192];
+    loop {
+        match role.read_plaintext(&mut plain_buf) {
+            Ok(0) => return true,
+            Ok(n) => {
+                *progressed = true;
+                if let Err(err) = framer.push(&plain_buf[..n]) {
+                    *warning = Some(format!("SIP TLS framing error: {err}"));
+                    *closed = true;
+                    *fatal_frame_err = true;
+                    return false;
+                }
+            }
+            Err(e) if is_would_block(&e) => return true,
+            Err(e) if e.kind() == io::ErrorKind::UnexpectedEof => {
+                *closed = true;
+                return false;
+            }
+            Err(err) => {
+                *warning = Some(format!("TLS plaintext read error: {err}"));
+                *closed = true;
+                return false;
+            }
+        }
+    }
+}
+
 impl StreamPeer {
     fn new(stream: TcpStream, tls: Option<TlsRole>, is_outbound: bool, now: Instant) -> Self {
         Self {
@@ -139,7 +174,9 @@ impl StreamPeer {
             let mut progressed = false;
 
             // 1. Read incoming bytes from TCP socket (decrypting via rustls when TLS is enabled).
+            let mut fatal_frame_err = false;
             if let Some(role) = self.tls.as_mut() {
+                let mut tls_fatal_err = false;
                 loop {
                     match role.read_tls(&mut self.stream) {
                         Ok(0) => {
@@ -151,6 +188,19 @@ impl StreamPeer {
                             if let Err(err) = role.process_new_packets() {
                                 warning = Some(format!("TLS handshake/record error: {err}"));
                                 closed = true;
+                                tls_fatal_err = true;
+                                break;
+                            }
+                            // Drain plaintext inside the read_tls loop so records >16 KiB never stall rustls.
+                            if !drain_tls_plaintext(
+                                role,
+                                &mut self.framer,
+                                &mut progressed,
+                                &mut closed,
+                                &mut fatal_frame_err,
+                                &mut warning,
+                            ) {
+                                tls_fatal_err = true;
                                 break;
                             }
                         }
@@ -158,36 +208,21 @@ impl StreamPeer {
                         Err(err) => {
                             warning = Some(format!("TLS TCP read error: {err}"));
                             closed = true;
+                            tls_fatal_err = true;
                             break;
                         }
                     }
                 }
 
-                if !closed {
-                    let mut plain_buf = [0u8; 8192];
-                    loop {
-                        match role.read_plaintext(&mut plain_buf) {
-                            Ok(0) => break,
-                            Ok(n) => {
-                                progressed = true;
-                                if let Err(err) = self.framer.push(&plain_buf[..n]) {
-                                    warning = Some(format!("SIP TLS framing error: {err}"));
-                                    closed = true;
-                                    break;
-                                }
-                            }
-                            Err(e) if is_would_block(&e) => break,
-                            Err(e) if e.kind() == io::ErrorKind::UnexpectedEof => {
-                                closed = true;
-                                break;
-                            }
-                            Err(err) => {
-                                warning = Some(format!("TLS plaintext read error: {err}"));
-                                closed = true;
-                                break;
-                            }
-                        }
-                    }
+                if !tls_fatal_err && !fatal_frame_err {
+                    let _ = drain_tls_plaintext(
+                        role,
+                        &mut self.framer,
+                        &mut progressed,
+                        &mut closed,
+                        &mut fatal_frame_err,
+                        &mut warning,
+                    );
                 }
             } else {
                 let mut buf = [0u8; 8192];
@@ -202,6 +237,7 @@ impl StreamPeer {
                             if let Err(err) = self.framer.push(&buf[..n]) {
                                 warning = Some(format!("SIP TCP framing error: {err}"));
                                 closed = true;
+                                fatal_frame_err = true;
                                 break;
                             }
                         }
@@ -215,22 +251,28 @@ impl StreamPeer {
                 }
             }
 
-            // 2. Deframe complete SIP messages and respond to RFC 5626 keep-alive pings.
-            if !closed {
+            // 2. Deframe complete SIP messages (including messages received right before TCP EOF).
+            if !fatal_frame_err {
                 match self.framer.drain_frames() {
                     Ok(frames) => {
                         for frame in frames {
                             match frame {
                                 StreamFrame::Message(msg) => {
-                                    self.next_keepalive_at = now + RFC5626_KEEPALIVE_INTERVAL;
+                                    if !closed {
+                                        self.next_keepalive_at = now + RFC5626_KEEPALIVE_INTERVAL;
+                                    }
                                     messages.push(msg);
                                 }
                                 StreamFrame::KeepAlivePing => {
-                                    self.plain_tx.push(RFC5626_KEEPALIVE_PONG.to_vec());
-                                    progressed = true;
+                                    if !closed {
+                                        self.plain_tx.push(RFC5626_KEEPALIVE_PONG.to_vec());
+                                        progressed = true;
+                                    }
                                 }
                                 StreamFrame::KeepAlivePong => {
-                                    self.next_keepalive_at = now + RFC5626_KEEPALIVE_INTERVAL;
+                                    if !closed {
+                                        self.next_keepalive_at = now + RFC5626_KEEPALIVE_INTERVAL;
+                                    }
                                 }
                             }
                         }

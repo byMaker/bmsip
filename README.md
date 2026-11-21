@@ -2,7 +2,7 @@
 
 **bmsip** is a modern, embeddable, cross-platform SIP & RTP telephony library written in Rust from the ground up for **Linux**, **iOS**, and **Android**, complete with a live-audio Linux CLI softphone and an automated multi-server SIP interoperability lab.
 
-- **Current Version:** `0.14.0` ([CHANGELOG.md](./CHANGELOG.md))
+- **Current Version:** `0.14.1` ([CHANGELOG.md](./CHANGELOG.md))
 - **Architecture Specification:** [ARCHITECTURE.md](./ARCHITECTURE.md)
 - **Developer Guides:** [SDK Guide](./docs/SDK_GUIDE.md) · [Codecs & Audio Pipeline](./docs/CODECS_AND_AUDIO.md) · [CLI & Interop Lab](./docs/CLI_AND_TESTING.md)
 - **License:** `AGPL-3.0-only` ([LICENSE](./LICENSE) · [NOTICE](./NOTICE) · commercial licensing: [bymaker.com](https://bymaker.com))
@@ -17,10 +17,10 @@ Legacy C/C++ SIP stacks often suffer from hidden global state, callback re-entra
 - **Multi-Transport SIP Signaling & SRTP Media Encryption:** Pure-Rust `rustls` TLS 1.2–1.3 (`ring`, RFC 5922, mTLS), non-blocking TCP/TLS connection setup and stream framing (`SipStreamFramer`, RFC 5626 keep-alive), and 100% safe-Rust **SRTP / SRTCP** (`AES_CM_128_HMAC_SHA1_80` / `_32`, RFC 3711) with **SDES** (`RTP/SAVP`, `a=crypto:`, RFC 4568) backed by 256-bit OS CSPRNG keys, per-SSRC ROC/replay tracking, and TLS-enforced key transport.
 - **Lock-Safe Command/Event Runtime (`bmsip-engine`):** Multiple independent `SipEngine` instances run safely in one process. Applications interact strictly via non-blocking `EngineCommand` / `EngineEvent` queues — zero callbacks under mutexes.
 - **Built-in "Golden Trio" Audio Codecs + Pluggable Registry (`bmsip-media`):**
-  - **Opus (`48 kHz` Fullband HD):** Native `libopus` C FFI integration (`LibOpusCodec`) with pure-Rust RFC 6716 TOC fallback (`BuiltInOpusCodec`).
-  - **ITU-T G.722 (`16 kHz` Wideband HD Voice):** Pure Safe Rust SB-ADPCM Mode 1 codec (payload type `9`, RFC 3551 §4.5.2) for wide hardware IP-phone/PBX compatibility.
+  - **Opus (`48 kHz` Fullband HD):** Native `libopus` C FFI integration (`LibOpusCodec`) wired cleanly into `SipEngine` (Opus is omitted from SDP offers if `libopus` is unavailable).
+  - **ITU-T G.722 (`16 kHz` Wideband HD Voice):** Pure Safe Rust SB-ADPCM Mode 1 codec (payload type `9`, RFC 3551 §4.5.2) with standard QMF subband polarity & scaling for hardware IP-phone/Asterisk `spandsp` compatibility.
   - **ITU-T G.711 (`8 kHz`):** Pure Safe Rust `PCMU` (μ-law, PT `0`) and `PCMA` (A-law, PT `8`).
-  - **Universal Codec Plugin System:** Register custom external codecs (`G.729`, `L16`, `AMR-WB`, `Codec2`, etc.) via `AudioCodecPlugin` + `FnCodecFactory` + `EngineConfig::register_custom_codec` with automatic `8`/`16`/`48` kHz PCM adaptation.
+  - **Universal Codec Plugin System:** Register custom external codecs (`G.729`, `L16`, `AMR-WB`, `Codec2`, etc.) via `AudioCodecPlugin` + `FnCodecFactory` + `CodecRegistry` / `EngineConfig::register_custom_codec` with automatic `8`/`16`/`48` kHz PCM adaptation.
 - **Adaptive Jitter Buffer & Microphone DSP:** 16-bit RTP sequence rollover handling, jitter-driven buffering depth, smooth zero-click PLC crossfade on recovered frames, and frame-level microphone noise gate / gain / soft limiter (`condition_mic_frame`).
 - **First-Class Mobile Lifecycle & Black-Box Flight Recorder:** Built-in `NetworkChanged` (Wi-Fi <-> LTE handover with `REGISTER` refresh + `re-INVITE`), `Suspend` / `Resume` (PushKit / FCM background wakeup), and a bounded per-call JSON flight recorder.
 - **Complete Softphone Call Control:** Call Hold / Resume (`re-INVITE` `a=sendonly`/`inactive`/`sendrecv`), Blind (`REFER` + `NOTIFY message/sipfrag`) & Attended (`Replaces`) Transfer, early/in-dialog `UPDATE`, `PRACK` (`100rel`), `Session-Timers` (RFC 4028 with `422` auto-retry), `Reason` (RFC 3326), and `P-Asserted-Identity` / `Privacy` Caller-ID (RFC 3323 / RFC 3325).

@@ -17,8 +17,8 @@ This document describes `bmsip`'s audio pipeline (`bmsip-media` and `bmsip-engin
 
 ### 1.1 Opus (`LibOpusCodec` & `BuiltInOpusCodec`)
 
-- **`bmsip-engine::LibOpusCodec`** ([`crates/bmsip-engine/src/opus_native.rs`](../crates/bmsip-engine/src/opus_native.rs)): Links system `libopus` (`build.rs`) and implements `OpusCodecBackend` at `48000 Hz` mono using `OPUS_APPLICATION_VOIP`, `64 kbps` bitrate, complexity `8`, and optional in-band FEC (`OPUS_SET_INBAND_FEC(1)`).
-- **`bmsip-media::BuiltInOpusCodec`** ([`crates/bmsip-media/src/opus.rs`](../crates/bmsip-media/src/opus.rs)): Pure-Rust `#![forbid(unsafe_code)]` fallback packing RFC 6716 TOC headers (`OpusToc`) and SDP `fmtp` parsing (`OpusFmtp`), used directly in pure-Rust sans-I/O unit tests.
+- **`bmsip-engine::LibOpusCodec`** ([`crates/bmsip-engine/src/opus_native.rs`](../crates/bmsip-engine/src/opus_native.rs)): Links system `libopus` (`build.rs`) and implements `OpusCodecBackend` at `48000 Hz` mono using `OPUS_APPLICATION_VOIP`, `64 kbps` bitrate, complexity `8`, and optional in-band FEC (`OPUS_SET_INBAND_FEC(1)`). `SipEngine` probes `LibOpusCodec` at startup and strips `opus` from advertised SDP codecs if native `libopus` initialization fails, rather than sending placeholder bytes on the wire.
+- **`bmsip-media::BuiltInOpusCodec` / `CodecRegistry::with_builtin_codecs()`** ([`crates/bmsip-media/src/opus.rs`](../crates/bmsip-media/src/opus.rs)): Pure-Rust `#![forbid(unsafe_code)]` RFC 6716 TOC packet helper (`OpusToc`) and SDP `fmtp` parser (`OpusFmtp`) retained strictly for pure-Rust `bmsip-media` unit tests; `CodecRegistry::with_builtin_codecs()` registers only standard-compliant pure-Rust `G722`, `PCMU`, and `PCMA`.
 - **`condition_mic_frame` (`bmsip-media::opus`)**: Pre-conditions raw microphone PCM frames using a **frame-level peak noise gate** (preventing zero-crossing crossover distortion), fixed-point `Q8` gain scaling, and rational soft-knee peak limiting within `[-32000, 32000]`.
 
 ### 1.2 Pure-Rust ITU-T G.722 (`bmsip-media::g722`)
@@ -56,8 +56,8 @@ Built-in adapters: `NullAudioPort`, `WavAudioPort`/`WavAudioHandle` (supports `8
 
 ### 3.2 `AdaptiveJitterBuffer` (`bmsip-media::jitter`)
 
-- **Out-of-Order Reordering & Mid-Call SSRC Changes:** Handles 16-bit RTP sequence rollover (RFC 3550 §5.1) and automatically resets sequence/jitter state when the remote RTP SSRC changes mid-call (e.g., PBX bridge or transfer).
-- **Dynamic Depth Adaptation:** Scales buffered target depth between `[min_depth_frames, max_depth_frames]` using RFC 3550 jitter estimates (`scaled_jitter` adjusted when `AudioPort` sample rate differs from RTP clock rate).
+- **Out-of-Order Reordering, Non-Audio Sequence Skipping & Mid-Call SSRC Changes:** Handles 16-bit RTP sequence rollover (RFC 3550 §5.1), skips non-audio RTP sequence numbers (`mark_non_audio_seq`, e.g., RFC 4733 DTMF) without synthesizing false PLC frames, and automatically resets sequence/jitter state when the remote RTP SSRC changes mid-call.
+- **Dynamic Depth Adaptation & Excess-Depth Shrinking:** Scales buffered target depth between `[min_depth_frames, max_depth_frames]` using RFC 3550 jitter estimates (`scaled_jitter` adjusted when `AudioPort` sample rate differs from RTP clock rate) and smoothly drains buffered frames exceeding `target_depth_frames + 2` after transient bursts subside.
 - **Decayed PLC & Boundary Crossfade:** Missing frames replay an attenuated copy (`7/8` exponential decay) of the last good frame; normal and concealed boundaries crossfade smoothly over up to 24 samples from `last_emitted_sample` to prevent audible phase clicks.
 
 ---

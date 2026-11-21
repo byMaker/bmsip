@@ -424,8 +424,8 @@ impl G722Encoder {
 
     fn encode_pair(&mut self, s0: i16, s1: i16) -> u8 {
         self.x.copy_within(2..24, 0);
-        self.x[22] = i32::from(s0 >> 1);
-        self.x[23] = i32::from(s1 >> 1);
+        self.x[22] = i32::from(s0);
+        self.x[23] = i32::from(s1);
 
         let mut acca = 0i32;
         let mut accb = 0i32;
@@ -434,7 +434,7 @@ impl G722Encoder {
             accb += self.x[2 * i + 1] * QMF_COEFFS[11 - i];
         }
         let xlow = (acca + accb) >> 14;
-        let xhigh = (acca - accb) >> 14;
+        let xhigh = (accb - acca) >> 14;
 
         // Quantize lower subband (6 bits).
         let el = saturate16(xlow - self.band_l.s);
@@ -531,8 +531,8 @@ impl G722Decoder {
 
         // QMF synthesis back to 16 kHz sample pair.
         self.rx.copy_within(2..24, 0);
-        self.rx[22] = rlow - rhigh;
-        self.rx[23] = rlow + rhigh;
+        self.rx[22] = rlow + rhigh;
+        self.rx[23] = rlow - rhigh;
 
         let mut acca = 0i32;
         let mut accb = 0i32;
@@ -540,8 +540,8 @@ impl G722Decoder {
             acca += self.rx[2 * i] * QMF_COEFFS[i];
             accb += self.rx[2 * i + 1] * QMF_COEFFS[11 - i];
         }
-        let s0 = (accb >> 10).clamp(i32::from(i16::MIN), i32::from(i16::MAX)) as i16;
-        let s1 = (acca >> 10).clamp(i32::from(i16::MIN), i32::from(i16::MAX)) as i16;
+        let s0 = (accb >> 11).clamp(i32::from(i16::MIN), i32::from(i16::MAX)) as i16;
+        let s1 = (acca >> 11).clamp(i32::from(i16::MIN), i32::from(i16::MAX)) as i16;
         (s0, s1)
     }
 }
@@ -654,5 +654,35 @@ mod tests {
         let f48 = vec![1000i16; 960];
         assert_eq!(resample_pcm_20ms(&f48, 160).unwrap().len(), 160);
         assert_eq!(resample_pcm_20ms(&f48, 320).unwrap().len(), 320);
+    }
+
+    #[test]
+    fn g722_nyquist_highband_polarity_matches_itut_qmf() {
+        // Nyquist alternating input [+A, -A, +A, -A, ...]:
+        // With ITU-T G.722 QMF xhigh = (accb - acca) >> 14, every even sample (+A) enters acca
+        // and odd sample (-A) enters accb, so steady xhigh is negative (eh < 0 -> ih in {0, 1}),
+        // and decoding into rx[22]=rlow+rhigh, rx[23]=rlow-rhigh preserves (+, -) polarity.
+        let mut enc = G722Encoder::new();
+        let mut dec = G722Decoder::new();
+        let mut nyquist = [0i16; 320];
+        for (i, s) in nyquist.iter_mut().enumerate() {
+            *s = if i % 2 == 0 { 12_000 } else { -12_000 };
+        }
+        let encoded = enc.encode(&nyquist);
+        for &byte in &encoded[24..80] {
+            let ih = (byte >> 6) & 0x03;
+            assert!(
+                ih <= 1,
+                "expected negative high-band quantizer code ih in {{0,1}} for [+A,-A] Nyquist, got ih={ih}"
+            );
+        }
+        let decoded = dec.decode(&encoded);
+        for pair in decoded[64..200].as_chunks::<2>().0 {
+            assert!(
+                pair[0] > 2_000 && pair[1] < -2_000,
+                "expected preserved [+,-] Nyquist polarity after G.722 QMF decode, got {:?}",
+                pair
+            );
+        }
     }
 }

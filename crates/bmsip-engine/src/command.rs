@@ -101,6 +101,9 @@ pub enum EngineCommand {
         call_id: String,
         target_call_id: String,
     },
+    SetActiveCall {
+        call_id: String,
+    },
     SendDtmf {
         call_id: String,
         digit: DtmfDigit,

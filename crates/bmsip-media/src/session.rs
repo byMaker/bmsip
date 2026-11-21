@@ -493,6 +493,7 @@ impl MediaSession {
 
         if pkt.payload_type == self.dtmf_payload_type {
             let ev = DtmfEventPayload::parse(pkt.payload)?;
+            self.jitter.mark_non_audio_seq(pkt.sequence_number);
             return Ok(self.dtmf_detector.feed(pkt.timestamp, ev));
         }
 

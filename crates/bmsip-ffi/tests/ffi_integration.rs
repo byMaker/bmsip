@@ -831,3 +831,49 @@ fn ffi_and_c_api_tls_transport_live_asterisk_call() {
     }
     srtp_client.shutdown();
 }
+
+#[test]
+fn p0_ffi_poll_event_does_not_block_concurrent_commands() {
+    use std::sync::Arc;
+
+    let client = Arc::new(
+        BmsipClient::with_security(
+            FfiConfig {
+                username: "1001".to_string(),
+                password: "pw".to_string(),
+                domain: "127.0.0.1".to_string(),
+                registrar_addr: "127.0.0.1:59999".to_string(),
+                bind_ip: "127.0.0.1".to_string(),
+                sip_port: 0,
+                enable_opus: false,
+            },
+            8_000,
+            FfiTransport::Udp,
+            FfiSrtpMode::Disabled,
+            None,
+            false,
+        )
+        .unwrap(),
+    );
+
+    let poller = Arc::clone(&client);
+    let poll_thread = thread::spawn(move || {
+        let _ = poller.poll_event(800);
+    });
+
+    // Give the background thread time to enter `poll_event(800)`.
+    thread::sleep(Duration::from_millis(40));
+
+    let t0 = Instant::now();
+    let local = client.local_sip_address();
+    assert!(!local.is_empty());
+    client.request_telemetry(None).unwrap();
+    let elapsed = t0.elapsed();
+    assert!(
+        elapsed < Duration::from_millis(100),
+        "concurrent API calls blocked behind poll_event(800): elapsed={elapsed:?}"
+    );
+
+    client.shutdown();
+    poll_thread.join().unwrap();
+}

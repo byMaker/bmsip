@@ -5,6 +5,25 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.14.1] - 2026-11-21
+
+### Fixed
+- **SIP URI & Dialog/Transaction State Machines (`bmsip-core`):**
+  - Updated `SipUri::parse` to treat `@` as the userinfo delimiter only when it precedes `?` or when no `=` appears between `?` and `@`, preserving userinfo `;` parameters (e.g., `sip:alice;day=tue@atlanta.com`, `sip:5551234;phone-context=+1-212@example.com;user=phone`) while keeping `@` inside `?` URI headers (e.g., `?Replaces=cid@10.0.0.1`) intact.
+  - Added RFC 6026 `IstState::Accepted` + `Timer L` (`64 * T1`) in `ServerInviteTransaction` to absorb retransmitted `INVITE`s without spawning duplicate transactions while routing `ACK` for `2xx` to `TransactionEvent::AckFor2xx`, and surfaced `2xx` arriving in `IctState::Completed` as `TransactionEvent::Unmatched2xx`.
+  - Fixed `UserAgent::hangup_with_reason` to transmit `CANCEL` immediately once any `1xx` (including `100 Trying`, tracked via `received_provisional`) has arrived; handled bodyless `200 OK` responses on `re-INVITE` and early-media `183` dialogs (or `ACK`+`BYE` when no SDP answer was ever supplied); transmitted `BYE` on `200 OK` `ACK` timeout per RFC 3261 §13.3.1.4; verified `CSeq` and `To-tag` in `on_ack_for_2xx`; and implemented `on_unmatched_2xx` to `ACK`+`BYE` forked/unmatched `2xx` legs without disturbing the primary call.
+- **Wideband G.722 QMF, Jitter Buffer & Wire Opus Safety (`bmsip-media`, `bmsip-engine`):**
+  - Fixed ITU-T G.722 QMF high-band filter signs (`(accb - acca) >> 14` on encode, `rx[22] = rlow + rhigh` / `rx[23] = rlow - rhigh` on decode) and 16-bit PCM scaling (`>> 11` synthesis shift), resolving high-band polarity & 6 dB level mismatch against `spandsp` / Asterisk.
+  - Removed the `BuiltInOpusCodec` placeholder from `CodecRegistry::with_builtin_codecs()` and prevented `SipEngine` from falling back to `BuiltInOpusCodec` on the wire (stripping `opus` from `supported_codecs` at startup if native `LibOpusCodec` fails to initialize).
+  - Updated `AdaptiveJitterBuffer` with `mark_non_audio_seq` so RFC 4733 DTMF sequence numbers skip playout cleanly without triggering false PLC frames, and added smooth excess-depth shrinking (`> target_depth_frames + 2`) to recover playout latency after jitter bursts.
+- **Testbed Hardening (`.devcontainer/`):**
+  - Enabled FreeSWITCH `media_mix_inbound_outbound_codecs` + `nolocal:absolute_codec_string` for live `G.722 <-> Opus` transcoding verification and enforced `max_contacts=1` (`remove_existing=yes`) in Asterisk `pjsip.conf` to prevent stale test contacts.
+- **TLS Plaintext Draining, RTP Source Latching & Multi-Call Focus (`bmsip-engine`, `bmsip-ffi`):**
+  - Fixed `StreamPeer::drive_io` to drain `rustls` plaintext inside the `read_tls` loop (preventing >16 KiB stalls) and always drain pending plaintext and `SipStreamFramer` frames on clean TCP/TLS EOF.
+  - Added unencrypted RTP/RTCP source IP validation with symmetric port latching (`latched_rtp_source` / `latched_rtcp_source`, reset on SDP updates and `NetworkChanged`), relying on RFC 3711 HMAC-SHA1 authentication when SRTP is active.
+  - Added `EngineCommand::SetActiveCall` and dynamic non-held primary media focus selection so multi-call hold / attended transfer workflows never mute the active call.
+  - Added `EngineEventReceiver` so `BmsipClient::poll_event` no longer holds the engine mutex while waiting, preventing starvation of concurrent `dial`/`hangup`/`shutdown` calls, and exposed `BmsipClient::with_sample_rate`, `with_transport`, and `with_security` aliases matching `bmsip.udl`.
+
 ## [0.14.0] - 2026-11-21
 
 ### Security & Hardening

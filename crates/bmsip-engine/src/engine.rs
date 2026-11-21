@@ -12,9 +12,9 @@ use bmsip_core::dialog::{CallState, RegistrationState, UaEvent, UserAgent};
 use bmsip_core::sdp::{NegotiatedSrtp, RtpCodec, SrtpMode};
 use bmsip_core::sip::{Method, NameAddr, SipMessage, SipTransport, SipUri};
 use bmsip_media::{
-    AudioCodecPlugin, BuiltInOpusCodec, CodecRegistry, G711Kind, JitterBufferConfig, MediaSession,
-    OpusCodecBackend, SessionCodec, CN_PAYLOAD_TYPE, G722_PAYLOAD_TYPE,
-    PCM_FRAME_SAMPLES_16KHZ_20MS, PCM_FRAME_SAMPLES_48KHZ_20MS, PCM_FRAME_SAMPLES_8KHZ_20MS,
+    AudioCodecPlugin, CodecRegistry, G711Kind, JitterBufferConfig, MediaSession, OpusCodecBackend,
+    SessionCodec, CN_PAYLOAD_TYPE, G722_PAYLOAD_TYPE, PCM_FRAME_SAMPLES_16KHZ_20MS,
+    PCM_FRAME_SAMPLES_48KHZ_20MS, PCM_FRAME_SAMPLES_8KHZ_20MS,
 };
 use ring::rand::{SecureRandom, SystemRandom};
 
@@ -54,6 +54,8 @@ struct CallMediaRuntime {
     rtcp_socket: Option<UdpSocket>,
     remote_rtp: SocketAddr,
     remote_rtcp: SocketAddr,
+    latched_rtp_source: Option<SocketAddr>,
+    latched_rtcp_source: Option<SocketAddr>,
     session: MediaSession,
     started_at: Instant,
     rtp_packets_sent: u32,
@@ -69,6 +71,31 @@ struct SharedState {
     events: Mutex<(VecDeque<EngineEvent>, bool)>,
     event_cv: Condvar,
     local_sip_addr: Mutex<SocketAddr>,
+}
+
+/// Cloneable receiver handle for [`EngineEvent`] notifications that does not contend on engine locks.
+#[derive(Clone)]
+pub struct EngineEventReceiver {
+    shared: Arc<SharedState>,
+}
+
+impl EngineEventReceiver {
+    /// Pops the next available [`EngineEvent`] without blocking.
+    pub fn try_recv(&self) -> Option<EngineEvent> {
+        let mut guard = self.shared.events.lock().ok()?;
+        guard.0.pop_front()
+    }
+
+    /// Waits up to `timeout` for the next [`EngineEvent`].
+    pub fn recv_timeout(&self, timeout: Duration) -> Option<EngineEvent> {
+        let guard = self.shared.events.lock().ok()?;
+        let (mut guard, _) = self
+            .shared
+            .event_cv
+            .wait_timeout_while(guard, timeout, |state| state.0.is_empty() && !state.1)
+            .ok()?;
+        guard.0.pop_front()
+    }
 }
 
 /// Lock-safe, multi-instance SIP & RTP runtime engine.
@@ -113,6 +140,14 @@ impl SipEngine {
             config.ua_config.crypto_seed = generate_crypto_seed()?;
         }
 
+        let opus_available = LibOpusCodec::new().is_ok();
+        if !opus_available {
+            config
+                .ua_config
+                .supported_codecs
+                .retain(|c| !c.encoding_name.eq_ignore_ascii_case("opus"));
+        }
+
         let shared = Arc::new(SharedState {
             commands: Mutex::new(VecDeque::new()),
             cmd_cv: Condvar::new(),
@@ -130,6 +165,7 @@ impl SipEngine {
                     sip_transport,
                     advertised_addr,
                     audio_port,
+                    opus_available,
                     worker_shared,
                 );
             })
@@ -139,6 +175,13 @@ impl SipEngine {
             shared,
             worker: Some(worker),
         })
+    }
+
+    /// Returns a cloneable [`EngineEventReceiver`] for concurrent event polling.
+    pub fn event_receiver(&self) -> EngineEventReceiver {
+        EngineEventReceiver {
+            shared: Arc::clone(&self.shared),
+        }
     }
 
     /// Enqueues a non-blocking command to the engine worker and wakes it immediately.
@@ -205,11 +248,13 @@ struct WorkerCtx {
     sip_transport: SipTransportDriver,
     ua: UserAgent,
     codec_registry: CodecRegistry,
+    opus_available: bool,
     audio_port: Box<dyn AudioPort>,
     recorder: FlightRecorder,
     pending_rtp_sockets: HashMap<String, (UdpSocket, Option<UdpSocket>)>,
     active_media: HashMap<String, CallMediaRuntime>,
     call_order: Vec<String>,
+    focused_call_id: Option<String>,
     inbound_tx_sources: HashMap<(String, String), SocketAddr>,
     inbound_call_sources: HashMap<String, SocketAddr>,
     outbound_tx_targets: HashMap<String, SocketAddr>,
@@ -513,6 +558,8 @@ impl WorkerCtx {
                                 media.remote_rtp = remote_rtp;
                                 media.remote_rtcp =
                                     SocketAddr::new(ip, remote_sdp.audio_port.saturating_add(1));
+                                media.latched_rtp_source = None;
+                                media.latched_rtcp_source = None;
                                 if media.session.codec() != session_codec
                                     || media.session.dtmf_payload_type() != dtmf_pt
                                     || media.session.dtmf_clock_rate_hz() != dtmf_clock
@@ -530,6 +577,8 @@ impl WorkerCtx {
                             media.remote_rtp = remote_rtp;
                             media.remote_rtcp =
                                 SocketAddr::new(ip, remote_sdp.audio_port.saturating_add(1));
+                            media.latched_rtp_source = None;
+                            media.latched_rtcp_source = None;
                         }
                         self.sync_call_srtp(&call_id, now);
                         let detail = match updated_codec_label {
@@ -564,6 +613,14 @@ impl WorkerCtx {
                     if let Some(media) = self.active_media.get_mut(&call_id) {
                         media.local_hold = local_hold;
                         media.remote_hold = remote_hold;
+                    }
+                    if !local_hold
+                        && self.focused_call_id.as_deref().is_none_or(|fid| {
+                            fid == call_id
+                                || self.active_media.get(fid).is_none_or(|m| m.local_hold)
+                        })
+                    {
+                        self.focused_call_id = Some(call_id.clone());
                     }
                     self.recorder.record(
                         now,
@@ -657,7 +714,7 @@ impl WorkerCtx {
                 !c.encoding_name.eq_ignore_ascii_case("telephone-event") && !c.is_comfort_noise()
             })
             .find_map(|c| {
-                if c.encoding_name.eq_ignore_ascii_case("opus") {
+                if c.encoding_name.eq_ignore_ascii_case("opus") && self.opus_available {
                     Some((
                         SessionCodec::Opus {
                             payload_type: c.payload_type,
@@ -757,6 +814,8 @@ impl WorkerCtx {
         if let Some(media) = self.active_media.get_mut(call_id) {
             media.remote_rtp = remote_rtp;
             media.remote_rtcp = remote_rtcp;
+            media.latched_rtp_source = None;
+            media.latched_rtcp_source = None;
             media.local_hold = local_hold;
             media.remote_hold = remote_hold;
             if let Some(NegotiatedSrtp::Sdes {
@@ -810,15 +869,35 @@ impl WorkerCtx {
             frame_samples,
             ..JitterBufferConfig::default()
         };
-        let opus_backend: Box<dyn OpusCodecBackend> = match LibOpusCodec::new() {
-            Ok(native) => Box::new(native),
-            Err(_) => Box::new(BuiltInOpusCodec::new()),
+        let opus_backend: Option<Box<dyn OpusCodecBackend>> = match (
+            self.opus_available,
+            LibOpusCodec::new(),
+        ) {
+            (true, Ok(native)) => Some(Box::new(native)),
+            (true, Err(err)) => {
+                let msg = format!(
+                        "native libopus init failed for call {call_id}; falling back away from Opus: {err}"
+                    );
+                self.recorder
+                    .record(now, TelemetryCategory::Warning, Some(call_id), msg.clone());
+                self.push_event(EngineEvent::Warning(msg));
+                None
+            }
+            (false, _) => None,
         };
+        let (session_codec, codec_name) =
+            if opus_backend.is_none() && matches!(session_codec, SessionCodec::Opus { .. }) {
+                (SessionCodec::G711(G711Kind::Pcmu), "PCMU".to_string())
+            } else {
+                (session_codec, codec_name)
+            };
         let mut session =
             MediaSession::new_with_session_codec(session_codec, dtmf_pt, self.ssrc_counter, jb_cfg)
                 .with_dtmf_clock_rate(dtmf_clock_rate_hz)
-                .with_cn_payload_type(cn_pt)
-                .with_opus_backend(opus_backend);
+                .with_cn_payload_type(cn_pt);
+        if let Some(opus) = opus_backend {
+            session = session.with_opus_backend(opus);
+        }
         if let Some(plugin) = custom_plugin {
             session = session.with_codec_plugin(plugin);
         }
@@ -845,6 +924,8 @@ impl WorkerCtx {
                 rtcp_socket,
                 remote_rtp,
                 remote_rtcp,
+                latched_rtp_source: None,
+                latched_rtcp_source: None,
                 session,
                 started_at: now,
                 rtp_packets_sent: 0,
@@ -857,6 +938,7 @@ impl WorkerCtx {
         if !self.call_order.iter().any(|id| id == call_id) {
             self.call_order.push(call_id.to_string());
         }
+        self.focused_call_id = Some(call_id.to_string());
         Some((codec_name, remote_rtp))
     }
 
@@ -895,6 +977,9 @@ impl WorkerCtx {
         self.pending_rtp_sockets.remove(call_id);
         self.inbound_call_sources.remove(call_id);
         self.call_order.retain(|id| id != call_id);
+        if self.focused_call_id.as_deref() == Some(call_id) {
+            self.focused_call_id = None;
+        }
         let (sent, rx, lost, jitter) = match self.active_media.remove(call_id) {
             Some(media) => {
                 let stats = media.session.stats();
@@ -1103,6 +1188,23 @@ impl WorkerCtx {
                     self.emit_cmd_error("attended_transfer", err);
                 }
             }
+            EngineCommand::SetActiveCall { call_id } => {
+                if self.call_order.iter().any(|id| id == &call_id)
+                    || self.active_media.contains_key(&call_id)
+                {
+                    self.focused_call_id = Some(call_id.clone());
+                    self.recorder.record(
+                        now,
+                        TelemetryCategory::DialogFsm,
+                        Some(&call_id),
+                        "active audio focus switched to call",
+                    );
+                } else {
+                    self.push_event(EngineEvent::Warning(format!(
+                        "cannot focus unknown call {call_id}"
+                    )));
+                }
+            }
             EngineCommand::SendDtmf { call_id, digit } => {
                 if let Some(media) = self.active_media.get_mut(&call_id) {
                     media.session.queue_dtmf(digit);
@@ -1165,6 +1267,8 @@ impl WorkerCtx {
                             if let Some(media) = self.active_media.get_mut(&cid) {
                                 media.rtp_socket = new_rtp;
                                 media.rtcp_socket = new_rtcp;
+                                media.latched_rtp_source = None;
+                                media.latched_rtcp_source = None;
                                 rebound_rtp_ports.insert(cid, new_port);
                             }
                         }
@@ -1292,15 +1396,34 @@ impl WorkerCtx {
             let mut rtp_buf = [0u8; 4096];
             loop {
                 match media.rtp_socket.recv_from(&mut rtp_buf) {
-                    Ok((len, _)) => {
+                    Ok((len, src_addr)) => {
+                        if !media.session.is_srtp_active()
+                            && !media.remote_rtp.ip().is_unspecified()
+                        {
+                            if src_addr.ip() != media.remote_rtp.ip() {
+                                continue;
+                            }
+                            if let Some(latched) = media.latched_rtp_source {
+                                if src_addr != latched {
+                                    continue;
+                                }
+                            }
+                        }
                         let pkt_slice = &rtp_buf[..len];
                         let samples_per_ms = media.session.clock_rate_hz() / 1000;
                         let arrival_samples = (media.started_at.elapsed().as_millis() as u32)
                             .saturating_mul(samples_per_ms);
-                        if let Ok(Some(digit)) =
-                            media.session.receive_rtp(pkt_slice, arrival_samples)
+                        if let Ok(opt_digit) = media.session.receive_rtp(pkt_slice, arrival_samples)
                         {
-                            dtmf_events.push((call_id.clone(), digit));
+                            if !media.session.is_srtp_active()
+                                && !media.remote_rtp.ip().is_unspecified()
+                                && media.latched_rtp_source.is_none()
+                            {
+                                media.latched_rtp_source = Some(src_addr);
+                            }
+                            if let Some(digit) = opt_digit {
+                                dtmf_events.push((call_id.clone(), digit));
+                            }
                         }
                     }
                     Err(e)
@@ -1319,8 +1442,26 @@ impl WorkerCtx {
                 let mut rtcp_buf = [0u8; 1024];
                 loop {
                     match rtcp_sock.recv_from(&mut rtcp_buf) {
-                        Ok((len, _)) => {
-                            let _ = media.session.receive_rtcp(&rtcp_buf[..len]);
+                        Ok((len, src_addr)) => {
+                            if !media.session.is_srtp_active()
+                                && !media.remote_rtcp.ip().is_unspecified()
+                            {
+                                if src_addr.ip() != media.remote_rtcp.ip() {
+                                    continue;
+                                }
+                                if let Some(latched) = media.latched_rtcp_source {
+                                    if src_addr != latched {
+                                        continue;
+                                    }
+                                }
+                            }
+                            if media.session.receive_rtcp(&rtcp_buf[..len]).is_ok()
+                                && !media.session.is_srtp_active()
+                                && !media.remote_rtcp.ip().is_unspecified()
+                                && media.latched_rtcp_source.is_none()
+                            {
+                                media.latched_rtcp_source = Some(src_addr);
+                            }
                         }
                         Err(e)
                             if matches!(
@@ -1371,24 +1512,53 @@ impl WorkerCtx {
 
         self.pump_rtp_rx(now);
 
-        let call_ids = self.call_order.clone();
+        let active_call_ids: Vec<String> = self
+            .call_order
+            .iter()
+            .filter(|cid| {
+                self.active_media.contains_key(cid.as_str())
+                    && matches!(
+                        self.ua.call_state(cid),
+                        Some(CallState::Ringing | CallState::Established | CallState::ReInviting)
+                    )
+            })
+            .cloned()
+            .collect();
+
+        // Select audio focus: explicit non-held focused call -> newest non-held call -> newest call.
+        let primary_call_id: Option<String> = self
+            .focused_call_id
+            .as_ref()
+            .filter(|cid| {
+                active_call_ids.iter().any(|id| id == *cid)
+                    && self
+                        .active_media
+                        .get(cid.as_str())
+                        .is_some_and(|m| !m.local_hold)
+            })
+            .cloned()
+            .or_else(|| {
+                active_call_ids
+                    .iter()
+                    .rev()
+                    .find(|cid| {
+                        self.active_media
+                            .get(cid.as_str())
+                            .is_some_and(|m| !m.local_hold)
+                    })
+                    .cloned()
+            })
+            .or_else(|| active_call_ids.last().cloned());
+
         let mut stats_updates: Vec<(String, u32, u32, i32, u32)> = Vec::new();
         let mut rtcp_sent_calls: Vec<String> = Vec::new();
-        let mut primary_served = false;
 
-        for call_id in &call_ids {
+        for call_id in &active_call_ids {
             let Some(media) = self.active_media.get_mut(call_id) else {
                 continue;
             };
-            if !matches!(
-                self.ua.call_state(call_id),
-                Some(CallState::Ringing | CallState::Established | CallState::ReInviting)
-            ) {
-                continue;
-            }
 
-            if !primary_served {
-                primary_served = true;
+            if primary_call_id.as_deref() == Some(call_id.as_str()) {
                 // Always capture from the audio port to keep host capture buffers fresh,
                 // but skip outbound RTP media transmission while the call is on hold.
                 let tx_pcm = self.audio_port.capture_frame_20ms();
@@ -1468,6 +1638,7 @@ fn run_worker(
     sip_transport: SipTransportDriver,
     local_sip_addr: SocketAddr,
     audio_port: Box<dyn AudioPort>,
+    opus_available: bool,
     shared: Arc<SharedState>,
 ) {
     let now = Instant::now();
@@ -1478,11 +1649,13 @@ fn run_worker(
         sip_transport,
         ua: UserAgent::new(config.ua_config),
         codec_registry: config.codec_registry,
+        opus_available,
         audio_port,
         recorder: FlightRecorder::new(now, config.telemetry_capacity),
         pending_rtp_sockets: HashMap::new(),
         active_media: HashMap::new(),
         call_order: Vec::new(),
+        focused_call_id: None,
         inbound_tx_sources: HashMap::new(),
         inbound_call_sources: HashMap::new(),
         outbound_tx_targets: HashMap::new(),
