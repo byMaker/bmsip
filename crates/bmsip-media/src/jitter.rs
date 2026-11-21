@@ -31,6 +31,8 @@ pub enum PlayoutFrame {
     Normal(Vec<i16>),
     /// Concealed frame synthesized for a missing packet (attenuated last good frame).
     Concealed(Vec<i16>),
+    /// Comfort noise frame synthesized under RFC 3389 DTX/CN silence.
+    ComfortNoise(Vec<i16>),
     /// Silence emitted while priming buffer depth or after sustained stream pause.
     Buffering(Vec<i16>),
 }
@@ -39,7 +41,9 @@ impl PlayoutFrame {
     /// Returns the underlying PCM samples slice.
     pub fn samples(&self) -> &[i16] {
         match self {
-            Self::Normal(s) | Self::Concealed(s) | Self::Buffering(s) => s.as_slice(),
+            Self::Normal(s) | Self::Concealed(s) | Self::ComfortNoise(s) | Self::Buffering(s) => {
+                s.as_slice()
+            }
         }
     }
 }

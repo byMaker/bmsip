@@ -1556,3 +1556,135 @@ fn reason_header_and_p_asserted_identity_privacy_roundtrip() {
             && rh.text.as_deref() == Some("Normal call clearing")
     )));
 }
+
+#[test]
+fn early_media_183_session_progress_negotiates_codecs_and_transitions_to_200_ok() {
+    let t0 = Instant::now();
+    let mut cluster = MiniSipCluster::new(t0, clean_policy(), 53);
+
+    let cid = cluster
+        .alice
+        .dial(
+            SipUri::parse("sip:bob@10.0.0.2:5062").unwrap(),
+            40000,
+            cluster.now,
+        )
+        .unwrap();
+    let (_, b_in) = cluster.step_until(15, Some(cluster.now + Duration::from_secs(1)));
+    assert!(b_in
+        .iter()
+        .any(|e| matches!(e, UaEvent::IncomingCall { call_id, .. } if call_id == &cid)));
+
+    let early_ans = cluster
+        .bob
+        .ring_early_media(&cid, 183, 50000, false, cluster.now)
+        .unwrap();
+    assert_eq!(early_ans.audio_port, 50000);
+    assert_eq!(cluster.bob.local_rtp_port(&cid), Some(50000));
+    assert!(!cluster.bob.negotiated_codecs(&cid).unwrap().is_empty());
+
+    let (a_early, _) = cluster.step_until(20, Some(cluster.now + Duration::from_secs(2)));
+    assert!(a_early.iter().any(|e| matches!(
+        e,
+        UaEvent::CallRinging {
+            status_code: 183,
+            early_sdp: Some(sdp),
+            ..
+        } if sdp.audio_port == 50000
+    )));
+    assert_eq!(cluster.alice.call_state(&cid), Some(CallState::Ringing));
+    assert_eq!(
+        cluster.alice.remote_sdp(&cid).map(|s| s.audio_port),
+        Some(50000)
+    );
+    assert!(!cluster.alice.negotiated_codecs(&cid).unwrap().is_empty());
+
+    // Answer passes 0 so UAS reuses its early-media local RTP port 50000.
+    cluster.bob.answer(&cid, 0, cluster.now).unwrap();
+    let (a_est, b_est) = cluster.step_until(20, Some(cluster.now + Duration::from_secs(2)));
+    assert!(a_est
+        .iter()
+        .any(|e| matches!(e, UaEvent::CallEstablished { .. })));
+    assert!(b_est
+        .iter()
+        .any(|e| matches!(e, UaEvent::CallEstablished { .. })));
+    assert_eq!(cluster.bob.local_rtp_port(&cid), Some(50000));
+}
+
+#[test]
+fn sip_info_dtmf_relay_and_raw_dtmf_roundtrip_and_invalid_rejection() {
+    let t0 = Instant::now();
+    let mut cluster = MiniSipCluster::new(t0, clean_policy(), 61);
+    let (cid, _, _) = establish_clean_cluster_call(&mut cluster, 40000, 50000);
+
+    // Invalid digit rejected synchronously.
+    assert!(cluster
+        .alice
+        .send_info_dtmf(&cid, 'Z', 160, cluster.now)
+        .is_err());
+
+    // Valid RFC 2976 SIP INFO application/dtmf-relay delivery.
+    cluster
+        .alice
+        .send_info_dtmf(&cid, '*', 220, cluster.now)
+        .unwrap();
+    let (_, b_evs) = cluster.step_until(20, Some(cluster.now + Duration::from_secs(2)));
+    assert!(b_evs.iter().any(|e| matches!(
+        e,
+        UaEvent::DtmfReceived {
+            call_id,
+            digit: '*',
+            duration_ms: 220,
+        } if call_id == &cid
+    )));
+
+    // Validate inbound raw INFO with `application/dtmf` and reject unsupported MIME types with 415.
+    let dlg = cluster.alice.dialog_id(&cid).unwrap();
+    let raw_dtmf = format!(
+        "INFO sip:bob@10.0.0.2:5062 SIP/2.0\r\n\
+         Via: SIP/2.0/UDP 10.0.0.1:5060;branch=z9hG4bK-raw-info-1\r\n\
+         From: <sip:alice@pbx.local>;tag={}\r\n\
+         To: <sip:bob@pbx.local>;tag={}\r\n\
+         Call-ID: {cid}\r\n\
+         CSeq: 90 INFO\r\n\
+         Content-Type: application/dtmf\r\n\
+         Content-Length: 1\r\n\r\n#",
+        dlg.local_tag, dlg.remote_tag
+    );
+    let raw_evs = cluster
+        .bob
+        .receive_datagram(raw_dtmf.as_bytes(), cluster.now);
+    assert!(raw_evs.iter().any(|e| matches!(
+        e,
+        UaEvent::DtmfReceived {
+            call_id,
+            digit: '#',
+            duration_ms: 160,
+        } if call_id == &cid
+    )));
+    let ok_wire = cluster.bob.poll_transmit();
+    assert_eq!(ok_wire.len(), 1);
+    let SipMessage::Response(ok_resp) = SipMessage::parse(&ok_wire[0]).unwrap() else {
+        panic!("expected 200 OK response to INFO");
+    };
+    assert_eq!(ok_resp.status_code, 200);
+
+    let bad_ct = format!(
+        "INFO sip:bob@10.0.0.2:5062 SIP/2.0\r\n\
+         Via: SIP/2.0/UDP 10.0.0.1:5060;branch=z9hG4bK-raw-info-2\r\n\
+         From: <sip:alice@pbx.local>;tag={}\r\n\
+         To: <sip:bob@pbx.local>;tag={}\r\n\
+         Call-ID: {cid}\r\n\
+         CSeq: 91 INFO\r\n\
+         Content-Type: application/json\r\n\
+         Content-Length: 2\r\n\r\n{{}}",
+        dlg.local_tag, dlg.remote_tag
+    );
+    let _ = cluster.bob.receive_datagram(bad_ct.as_bytes(), cluster.now);
+    let rej_wire = cluster.bob.poll_transmit();
+    assert_eq!(rej_wire.len(), 1);
+    let SipMessage::Response(rej_resp) = SipMessage::parse(&rej_wire[0]).unwrap() else {
+        panic!("expected 415 response to unsupported INFO Content-Type");
+    };
+    assert_eq!(rej_resp.status_code, 415);
+}

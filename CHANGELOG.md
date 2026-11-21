@@ -5,6 +5,19 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.11.0] - 2026-11-21
+
+### Added
+- **Early Media `183` / `180` SDP Playout (`bmsip-core`, `bmsip-engine`, `bmsip-ffi`):**
+  - Added `UserAgent::ring_early_media` (supporting optional `100rel` reliable early-media SDP responses) and `UserAgent::{negotiated_codecs, local_rtp_port, remote_sdp}` accessors; UAC provisional `1xx` handling now intersects early-media SDP codecs and reuses the early RTP socket upon `200 OK` answer.
+  - Added `EngineCommand::RingEarlyMedia`, `EngineEvent::EarlyMediaStarted`, `BmsipClient::ring_early_media`, C99 `bmsip_client_ring_early_media`, and enabled RTP TX/RX pumping while in `CallState::Ringing` for active early-media sessions.
+- **Legacy SIP `INFO` DTMF (`bmsip-core`, `bmsip-engine`, `bmsip-ffi`, `bmsip-cli`):**
+  - Implemented RFC 2976 SIP `INFO` (`application/dtmf-relay` and `application/dtmf`) sending (`UserAgent::send_info_dtmf` with 401/407 Digest retry) and inbound validation (`415` on unsupported `Content-Type`, `400` on invalid DTMF payload, `UaEvent::DtmfReceived` -> `EngineEvent::DtmfReceived`).
+  - Added `EngineCommand::SendInfoDtmf`, `BmsipClient::send_info_dtmf`, C99 `bmsip_client_send_info_dtmf`, and `--dtmf-mode rfc4733|info` in `bmsip-cli call`.
+- **RFC 3389 Comfort Noise (`bmsip-core`, `bmsip-media`, `bmsip-engine`):**
+  - Added SDP static payload type `13` (`RtpCodec::cn()`, `RtpCodec::is_comfort_noise()`, included in default offered codecs while still requiring a primary speech codec in `negotiate_offer_answer`).
+  - Implemented `bmsip_media::cn` (`ComfortNoisePacket`, `ComfortNoiseGenerator`), `PlayoutFrame::ComfortNoise`, and SID DTX synthesis & auto-deactivation inside `MediaSession::receive_rtp` / `pop_playout_frame`.
+
 ## [0.10.0] - 2026-11-21
 
 ### Added

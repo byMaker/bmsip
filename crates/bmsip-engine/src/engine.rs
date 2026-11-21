@@ -14,8 +14,8 @@ use bmsip_core::sdp::RtpCodec;
 use bmsip_core::sip::{Method, NameAddr, SipMessage, SipUri};
 use bmsip_media::{
     AudioCodecPlugin, BuiltInOpusCodec, CodecRegistry, G711Kind, JitterBufferConfig, MediaSession,
-    OpusCodecBackend, SessionCodec, G722_PAYLOAD_TYPE, PCM_FRAME_SAMPLES_16KHZ_20MS,
-    PCM_FRAME_SAMPLES_48KHZ_20MS, PCM_FRAME_SAMPLES_8KHZ_20MS,
+    OpusCodecBackend, SessionCodec, CN_PAYLOAD_TYPE, G722_PAYLOAD_TYPE,
+    PCM_FRAME_SAMPLES_16KHZ_20MS, PCM_FRAME_SAMPLES_48KHZ_20MS, PCM_FRAME_SAMPLES_8KHZ_20MS,
 };
 
 use crate::audio::AudioPort;
@@ -370,7 +370,7 @@ impl WorkerCtx {
                 UaEvent::CallRinging {
                     call_id,
                     status_code,
-                    ..
+                    early_sdp,
                 } => {
                     self.recorder.record(
                         now,
@@ -379,9 +379,38 @@ impl WorkerCtx {
                         format!("ringing status={status_code}"),
                     );
                     self.push_event(EngineEvent::CallRinging {
-                        call_id,
+                        call_id: call_id.clone(),
                         status_code,
                     });
+                    if let Some(remote_sdp) = early_sdp {
+                        if remote_sdp.audio_port > 0
+                            && (self.active_media.contains_key(&call_id)
+                                || self.pending_rtp_sockets.contains_key(&call_id))
+                        {
+                            let codecs = self
+                                .ua
+                                .negotiated_codecs(&call_id)
+                                .map(|s| s.to_vec())
+                                .unwrap_or_else(|| remote_sdp.codecs.clone());
+                            if let Some((codec_name, remote_rtp)) =
+                                self.activate_or_update_media(&call_id, &remote_sdp, &codecs, now)
+                            {
+                                self.recorder.record(
+                                    now,
+                                    TelemetryCategory::DialogFsm,
+                                    Some(&call_id),
+                                    format!(
+                                        "early media started codec={codec_name} remote_rtp={remote_rtp}"
+                                    ),
+                                );
+                                self.push_event(EngineEvent::EarlyMediaStarted {
+                                    call_id,
+                                    codec: codec_name,
+                                    remote_rtp,
+                                });
+                            }
+                        }
+                    }
                 }
                 UaEvent::CallEstablished {
                     call_id,
@@ -401,7 +430,7 @@ impl WorkerCtx {
                         let remote_rtp = SocketAddr::new(ip, remote_sdp.audio_port);
                         let mut updated_codec_label: Option<String> = None;
                         if !negotiated_codecs.is_empty() {
-                            let (session_codec, codec_name, custom_plugin, dtmf_pt, dtmf_clock) =
+                            let (session_codec, codec_name, custom_plugin, dtmf_pt, dtmf_clock, _) =
                                 self.select_media_codecs(&negotiated_codecs);
                             if let Some(media) = self.active_media.get_mut(&call_id) {
                                 media.remote_rtp = remote_rtp;
@@ -505,6 +534,25 @@ impl WorkerCtx {
                         terminated,
                     });
                 }
+                UaEvent::DtmfReceived {
+                    call_id,
+                    digit,
+                    duration_ms,
+                } => {
+                    if let Ok(d) = bmsip_media::DtmfDigit::from_char(digit) {
+                        self.recorder.record_dtmf(&call_id, d.to_char());
+                        self.recorder.record(
+                            now,
+                            TelemetryCategory::SipRx,
+                            Some(&call_id),
+                            format!(
+                                "received SIP INFO DTMF '{}' duration={duration_ms}ms",
+                                d.to_char()
+                            ),
+                        );
+                        self.push_event(EngineEvent::DtmfReceived { call_id, digit: d });
+                    }
+                }
                 UaEvent::ProtocolWarning(msg) => {
                     self.recorder
                         .record(now, TelemetryCategory::Warning, None, msg.clone());
@@ -523,10 +571,13 @@ impl WorkerCtx {
         Option<Box<dyn AudioCodecPlugin>>,
         u8,
         u32,
+        u8,
     ) {
         let (session_codec, codec_name, custom_plugin) = negotiated_codecs
             .iter()
-            .filter(|c| !c.encoding_name.eq_ignore_ascii_case("telephone-event"))
+            .filter(|c| {
+                !c.encoding_name.eq_ignore_ascii_case("telephone-event") && !c.is_comfort_noise()
+            })
             .find_map(|c| {
                 if c.encoding_name.eq_ignore_ascii_case("opus") {
                     Some((
@@ -579,30 +630,31 @@ impl WorkerCtx {
             .map(|c| (c.payload_type, c.clock_rate.max(8_000)))
             .unwrap_or((101, 8_000));
 
+        let cn_pt = negotiated_codecs
+            .iter()
+            .find(|c| c.is_comfort_noise())
+            .map_or(CN_PAYLOAD_TYPE, |c| c.payload_type);
+
         (
             session_codec,
             codec_name,
             custom_plugin,
             dtmf_pt,
             dtmf_clock_rate_hz,
+            cn_pt,
         )
     }
 
-    fn on_call_established(
+    fn activate_or_update_media(
         &mut self,
         call_id: &str,
         remote_sdp: &bmsip_core::sdp::SdpSession,
         negotiated_codecs: &[RtpCodec],
         now: Instant,
-    ) {
-        let Some((rtp_socket, rtcp_socket)) = self.pending_rtp_sockets.remove(call_id) else {
-            let msg = format!("missing bound RTP socket for established call {call_id}");
-            self.recorder
-                .record(now, TelemetryCategory::Warning, Some(call_id), msg.clone());
-            self.push_event(EngineEvent::Warning(msg));
-            return;
-        };
-
+    ) -> Option<(String, SocketAddr)> {
+        if remote_sdp.audio_port == 0 {
+            return None;
+        }
         let remote_ip: IpAddr = match remote_sdp.connection_ip.parse() {
             Ok(ip) => ip,
             Err(err) => {
@@ -613,13 +665,42 @@ impl WorkerCtx {
                 self.recorder
                     .record(now, TelemetryCategory::Warning, Some(call_id), msg.clone());
                 self.push_event(EngineEvent::Warning(msg));
-                return;
+                return None;
             }
         };
         let remote_rtp = SocketAddr::new(remote_ip, remote_sdp.audio_port);
+        let remote_rtcp = SocketAddr::new(remote_ip, remote_sdp.audio_port.saturating_add(1));
 
-        let (session_codec, codec_name, custom_plugin, dtmf_pt, dtmf_clock_rate_hz) =
+        let (session_codec, codec_name, custom_plugin, dtmf_pt, dtmf_clock_rate_hz, cn_pt) =
             self.select_media_codecs(negotiated_codecs);
+        let (local_hold, remote_hold) = self.ua.hold_state(call_id).unwrap_or((false, false));
+
+        if let Some(media) = self.active_media.get_mut(call_id) {
+            media.remote_rtp = remote_rtp;
+            media.remote_rtcp = remote_rtcp;
+            media.local_hold = local_hold;
+            media.remote_hold = remote_hold;
+            if media.session.codec() != session_codec
+                || media.session.dtmf_payload_type() != dtmf_pt
+                || media.session.dtmf_clock_rate_hz() != dtmf_clock_rate_hz
+            {
+                media.session.reconfigure_codec(
+                    session_codec,
+                    dtmf_pt,
+                    dtmf_clock_rate_hz,
+                    custom_plugin,
+                );
+            }
+            return Some((codec_name, remote_rtp));
+        }
+
+        let Some((rtp_socket, rtcp_socket)) = self.pending_rtp_sockets.remove(call_id) else {
+            let msg = format!("missing bound RTP socket for call {call_id}");
+            self.recorder
+                .record(now, TelemetryCategory::Warning, Some(call_id), msg.clone());
+            self.push_event(EngineEvent::Warning(msg));
+            return None;
+        };
 
         let port_rate = self.audio_port.sample_rate_hz();
         let frame_samples = match port_rate {
@@ -639,12 +720,11 @@ impl WorkerCtx {
         let mut session =
             MediaSession::new_with_session_codec(session_codec, dtmf_pt, self.ssrc_counter, jb_cfg)
                 .with_dtmf_clock_rate(dtmf_clock_rate_hz)
+                .with_cn_payload_type(cn_pt)
                 .with_opus_backend(opus_backend);
         if let Some(plugin) = custom_plugin {
             session = session.with_codec_plugin(plugin);
         }
-        let (local_hold, remote_hold) = self.ua.hold_state(call_id).unwrap_or((false, false));
-        let remote_rtcp = SocketAddr::new(remote_ip, remote_sdp.audio_port.saturating_add(1));
         self.active_media.insert(
             call_id.to_string(),
             CallMediaRuntime {
@@ -664,6 +744,21 @@ impl WorkerCtx {
         if !self.call_order.iter().any(|id| id == call_id) {
             self.call_order.push(call_id.to_string());
         }
+        Some((codec_name, remote_rtp))
+    }
+
+    fn on_call_established(
+        &mut self,
+        call_id: &str,
+        remote_sdp: &bmsip_core::sdp::SdpSession,
+        negotiated_codecs: &[RtpCodec],
+        now: Instant,
+    ) {
+        let Some((codec_name, remote_rtp)) =
+            self.activate_or_update_media(call_id, remote_sdp, negotiated_codecs, now)
+        else {
+            return;
+        };
         self.recorder.record(
             now,
             TelemetryCategory::DialogFsm,
@@ -766,18 +861,63 @@ impl WorkerCtx {
                     self.emit_cmd_error("ring", err);
                 }
             }
-            EngineCommand::Answer { call_id } => {
-                match bind_rtp_socket(self.bind_ip, self.local_sip_addr.ip()) {
-                    Ok((rtp_sock, rtcp_sock, rtp_port)) => {
-                        self.pending_rtp_sockets
-                            .insert(call_id.clone(), (rtp_sock, rtcp_sock));
-                        if let Err(err) = self.ua.answer(&call_id, rtp_port, now) {
-                            self.pending_rtp_sockets.remove(&call_id);
-                            self.emit_cmd_error("answer", err);
+            EngineCommand::RingEarlyMedia { call_id } => {
+                let mut freshly_bound = false;
+                let rtp_port_res = if self.active_media.contains_key(&call_id)
+                    || self.pending_rtp_sockets.contains_key(&call_id)
+                {
+                    Ok(self.ua.local_rtp_port(&call_id).unwrap_or(0))
+                } else {
+                    match bind_rtp_socket(self.bind_ip, self.local_sip_addr.ip()) {
+                        Ok((rtp_sock, rtcp_sock, rtp_port)) => {
+                            self.pending_rtp_sockets
+                                .insert(call_id.clone(), (rtp_sock, rtcp_sock));
+                            freshly_bound = true;
+                            Ok(rtp_port)
+                        }
+                        Err(err) => Err(err),
+                    }
+                };
+                match rtp_port_res {
+                    Ok(rtp_port) => {
+                        match self
+                            .ua
+                            .ring_early_media(&call_id, 183, rtp_port, false, now)
+                        {
+                            Ok(_) => {
+                                if let (Some(rsdp), Some(codecs)) = (
+                                    self.ua.remote_sdp(&call_id).cloned(),
+                                    self.ua.negotiated_codecs(&call_id).map(|s| s.to_vec()),
+                                ) {
+                                    if let Some((codec_name, remote_rtp)) =
+                                        self.activate_or_update_media(&call_id, &rsdp, &codecs, now)
+                                    {
+                                        self.recorder.record(
+                                            now,
+                                            TelemetryCategory::DialogFsm,
+                                            Some(&call_id),
+                                            format!(
+                                                "early media (183) started codec={codec_name} remote_rtp={remote_rtp}"
+                                            ),
+                                        );
+                                        self.push_event(EngineEvent::EarlyMediaStarted {
+                                            call_id,
+                                            codec: codec_name,
+                                            remote_rtp,
+                                        });
+                                    }
+                                }
+                            }
+                            Err(err) => {
+                                if freshly_bound {
+                                    self.pending_rtp_sockets.remove(&call_id);
+                                }
+                                self.emit_cmd_error("ring_early_media", err);
+                            }
                         }
                     }
                     Err(err) => {
-                        let msg = format!("RTP bind failed on answer: {err}");
+                        let msg = format!("RTP bind failed on ring_early_media: {err}");
                         self.recorder.record(
                             now,
                             TelemetryCategory::Warning,
@@ -785,6 +925,37 @@ impl WorkerCtx {
                             msg.clone(),
                         );
                         self.push_event(EngineEvent::Warning(msg));
+                    }
+                }
+            }
+            EngineCommand::Answer { call_id } => {
+                if self.active_media.contains_key(&call_id)
+                    || self.pending_rtp_sockets.contains_key(&call_id)
+                {
+                    let existing_port = self.ua.local_rtp_port(&call_id).unwrap_or(0);
+                    if let Err(err) = self.ua.answer(&call_id, existing_port, now) {
+                        self.emit_cmd_error("answer", err);
+                    }
+                } else {
+                    match bind_rtp_socket(self.bind_ip, self.local_sip_addr.ip()) {
+                        Ok((rtp_sock, rtcp_sock, rtp_port)) => {
+                            self.pending_rtp_sockets
+                                .insert(call_id.clone(), (rtp_sock, rtcp_sock));
+                            if let Err(err) = self.ua.answer(&call_id, rtp_port, now) {
+                                self.pending_rtp_sockets.remove(&call_id);
+                                self.emit_cmd_error("answer", err);
+                            }
+                        }
+                        Err(err) => {
+                            let msg = format!("RTP bind failed on answer: {err}");
+                            self.recorder.record(
+                                now,
+                                TelemetryCategory::Warning,
+                                Some(&call_id),
+                                msg.clone(),
+                            );
+                            self.push_event(EngineEvent::Warning(msg));
+                        }
                     }
                 }
             }
@@ -832,6 +1003,28 @@ impl WorkerCtx {
                     self.push_event(EngineEvent::Warning(format!(
                         "cannot send DTMF on inactive call {call_id}"
                     )));
+                }
+            }
+            EngineCommand::SendInfoDtmf {
+                call_id,
+                digit,
+                duration_ms,
+            } => {
+                if let Err(err) =
+                    self.ua
+                        .send_info_dtmf(&call_id, digit.to_char(), duration_ms, now)
+                {
+                    self.emit_cmd_error("send_info_dtmf", err);
+                } else {
+                    self.recorder.record(
+                        now,
+                        TelemetryCategory::SipTx,
+                        Some(&call_id),
+                        format!(
+                            "sent SIP INFO DTMF '{}' duration={duration_ms}ms",
+                            digit.to_char()
+                        ),
+                    );
                 }
             }
             EngineCommand::NetworkChanged {
@@ -995,7 +1188,7 @@ impl WorkerCtx {
             };
             if !matches!(
                 self.ua.call_state(call_id),
-                Some(CallState::Established | CallState::ReInviting)
+                Some(CallState::Ringing | CallState::Established | CallState::ReInviting)
             ) {
                 continue;
             }
@@ -1092,7 +1285,7 @@ impl WorkerCtx {
             };
             if !matches!(
                 self.ua.call_state(call_id),
-                Some(CallState::Established | CallState::ReInviting)
+                Some(CallState::Ringing | CallState::Established | CallState::ReInviting)
             ) {
                 continue;
             }

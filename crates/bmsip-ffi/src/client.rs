@@ -56,6 +56,7 @@ pub enum FfiEventKind {
     OutboundCallStarted,
     IncomingCall,
     CallRinging,
+    EarlyMediaStarted,
     CallEstablished,
     CallMediaUpdated,
     CallHoldChanged,
@@ -79,6 +80,7 @@ impl FfiEventKind {
             Self::OutboundCallStarted => "OutboundCallStarted",
             Self::IncomingCall => "IncomingCall",
             Self::CallRinging => "CallRinging",
+            Self::EarlyMediaStarted => "EarlyMediaStarted",
             Self::CallEstablished => "CallEstablished",
             Self::CallMediaUpdated => "CallMediaUpdated",
             Self::CallHoldChanged => "CallHoldChanged",
@@ -166,6 +168,7 @@ impl BmsipClient {
                 RtpCodec::g722(),
                 RtpCodec::pcmu(),
                 RtpCodec::pcma(),
+                RtpCodec::cn(),
                 RtpCodec::telephone_event_48k(102),
                 RtpCodec::telephone_event(101),
             ];
@@ -174,6 +177,7 @@ impl BmsipClient {
                 RtpCodec::g722(),
                 RtpCodec::pcmu(),
                 RtpCodec::pcma(),
+                RtpCodec::cn(),
                 RtpCodec::telephone_event(101),
             ];
         }
@@ -211,6 +215,10 @@ impl BmsipClient {
 
     pub fn ring(&self, call_id: String) -> Result<(), FfiError> {
         self.send(EngineCommand::Ring { call_id })
+    }
+
+    pub fn ring_early_media(&self, call_id: String) -> Result<(), FfiError> {
+        self.send(EngineCommand::RingEarlyMedia { call_id })
     }
 
     pub fn answer(&self, call_id: String) -> Result<(), FfiError> {
@@ -256,6 +264,24 @@ impl BmsipClient {
             .ok_or_else(|| FfiError::InvalidArgument("empty DTMF digit".to_string()))?;
         let d = DtmfDigit::from_char(ch).map_err(|e| FfiError::InvalidArgument(e.to_string()))?;
         self.send(EngineCommand::SendDtmf { call_id, digit: d })
+    }
+
+    pub fn send_info_dtmf(
+        &self,
+        call_id: String,
+        digit: String,
+        duration_ms: u32,
+    ) -> Result<(), FfiError> {
+        let ch = digit
+            .chars()
+            .next()
+            .ok_or_else(|| FfiError::InvalidArgument("empty DTMF digit".to_string()))?;
+        let d = DtmfDigit::from_char(ch).map_err(|e| FfiError::InvalidArgument(e.to_string()))?;
+        self.send(EngineCommand::SendInfoDtmf {
+            call_id,
+            digit: d,
+            duration_ms,
+        })
     }
 
     pub fn notify_network_changed(&self, bind_ip: String, sip_port: u16) -> Result<(), FfiError> {
@@ -388,6 +414,17 @@ fn map_engine_event(ev: EngineEvent) -> FfiEvent {
             call_id: Some(call_id),
             detail: None,
             status_code: Some(status_code),
+            black_box_json: None,
+        },
+        EngineEvent::EarlyMediaStarted {
+            call_id,
+            codec,
+            remote_rtp,
+        } => FfiEvent {
+            kind: FfiEventKind::EarlyMediaStarted,
+            call_id: Some(call_id),
+            detail: Some(format!("codec={codec}, remote_rtp={remote_rtp}")),
+            status_code: None,
             black_box_json: None,
         },
         EngineEvent::CallEstablished {

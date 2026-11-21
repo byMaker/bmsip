@@ -22,6 +22,7 @@ enum FfiEventKind {
     "OutboundCallStarted",
     "IncomingCall",
     "CallRinging",
+    "EarlyMediaStarted",
     "CallEstablished",
     "CallMediaUpdated",
     "CallHoldChanged",
@@ -67,6 +68,9 @@ interface BmsipClient {
     void ring(string call_id);
 
     [Throws=FfiError]
+    void ring_early_media(string call_id);
+
+    [Throws=FfiError]
     void answer(string call_id);
 
     [Throws=FfiError]
@@ -86,6 +90,9 @@ interface BmsipClient {
 
     [Throws=FfiError]
     void send_dtmf(string call_id, string digit);
+
+    [Throws=FfiError]
+    void send_info_dtmf(string call_id, string digit, u32 duration_ms);
 
     [Throws=FfiError]
     void notify_network_changed(string bind_ip, u16 sip_port);

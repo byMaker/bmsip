@@ -88,6 +88,17 @@ impl RtpCodec {
         }
     }
 
+    /// RFC 3389 Comfort Noise (static payload type 13, 8000 Hz RTP clock).
+    pub fn cn() -> Self {
+        Self {
+            payload_type: 13,
+            encoding_name: "CN".to_string(),
+            clock_rate: 8000,
+            channels: None,
+            fmtp: None,
+        }
+    }
+
     /// Opus audio codec (typical dynamic PT 111, 48000 Hz, 2 channels).
     pub fn opus() -> Self {
         Self {
@@ -130,6 +141,11 @@ impl RtpCodec {
 
     fn is_telephone_event(&self) -> bool {
         self.encoding_name.eq_ignore_ascii_case("telephone-event")
+    }
+
+    /// Returns `true` if this entry represents RFC 3389 Comfort Noise (`CN`, PT 13).
+    pub fn is_comfort_noise(&self) -> bool {
+        self.encoding_name.eq_ignore_ascii_case("CN") || self.payload_type == 13
     }
 }
 
@@ -407,7 +423,7 @@ pub fn negotiate_offer_answer(
 
     for offered in &offer.codecs {
         if let Some(local) = local_supported.iter().find(|c| c.matches_format(offered)) {
-            if !offered.is_telephone_event() {
+            if !offered.is_telephone_event() && !offered.is_comfort_noise() {
                 has_real_audio = true;
             }
             // RFC 3264: answer MUST use the payload type number sent by the offerer.
@@ -512,6 +528,7 @@ fn static_audio_codec(pt: u8) -> Option<(&'static str, u32)> {
         3 => Some(("GSM", 8000)),
         8 => Some(("PCMA", 8000)),
         9 => Some(("G722", 8000)),
+        13 => Some(("CN", 8000)),
         _ => None,
     }
 }
@@ -612,5 +629,43 @@ mod tests {
         );
         let local = vec![RtpCodec::pcmu(), RtpCodec::telephone_event(101)];
         assert!(negotiate_offer_answer(&offer, &local, "10.0.0.2", 4002).is_err());
+    }
+
+    #[test]
+    fn parses_and_negotiates_comfort_noise_pt13_and_rejects_cn_only_offer() {
+        let offer = SdpSession::new(
+            "alice",
+            "1",
+            "10.0.0.1",
+            4000,
+            vec![
+                RtpCodec::pcmu(),
+                RtpCodec::cn(),
+                RtpCodec::telephone_event(101),
+            ],
+        );
+        let reparsed = SdpSession::parse(&offer.to_string()).unwrap();
+        assert!(reparsed.codecs.iter().any(RtpCodec::is_comfort_noise));
+
+        let local = vec![
+            RtpCodec::pcmu(),
+            RtpCodec::cn(),
+            RtpCodec::telephone_event(101),
+        ];
+        let (ans, negotiated) =
+            negotiate_offer_answer(&reparsed, &local, "10.0.0.2", 4002).unwrap();
+        assert_eq!(ans.codecs.len(), 3);
+        assert!(negotiated
+            .iter()
+            .any(|c| c.payload_type == 13 && c.is_comfort_noise()));
+
+        let cn_only = SdpSession::new(
+            "alice",
+            "2",
+            "10.0.0.1",
+            4000,
+            vec![RtpCodec::cn(), RtpCodec::telephone_event(101)],
+        );
+        assert!(negotiate_offer_answer(&cn_only, &local, "10.0.0.2", 4002).is_err());
     }
 }

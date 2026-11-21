@@ -36,6 +36,7 @@ int32_t bmsip_client_register(const BmsipClientHandle *client);
 int32_t bmsip_client_unregister(const BmsipClientHandle *client);
 int32_t bmsip_client_dial(const BmsipClientHandle *client, const char *target_uri);
 int32_t bmsip_client_ring(const BmsipClientHandle *client, const char *call_id);
+int32_t bmsip_client_ring_early_media(const BmsipClientHandle *client, const char *call_id);
 int32_t bmsip_client_answer(const BmsipClientHandle *client, const char *call_id);
 int32_t bmsip_client_hangup(const BmsipClientHandle *client, const char *call_id);
 int32_t bmsip_client_hold(const BmsipClientHandle *client, const char *call_id);
@@ -54,6 +55,12 @@ int32_t bmsip_client_send_dtmf(
     const BmsipClientHandle *client,
     const char *call_id,
     char digit
+);
+int32_t bmsip_client_send_info_dtmf(
+    const BmsipClientHandle *client,
+    const char *call_id,
+    char digit,
+    uint32_t duration_ms
 );
 int32_t bmsip_client_notify_network_changed(
     const BmsipClientHandle *client,

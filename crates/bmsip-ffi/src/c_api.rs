@@ -344,6 +344,51 @@ pub unsafe extern "C" fn bmsip_client_send_dtmf(
     }
 }
 
+/// Sends an RFC 2976 SIP `INFO` (`application/dtmf-relay`) DTMF digit (`'0'..'9'`, `'*'`, `'#'`, `'A'..'D'`).
+///
+/// # Safety
+/// `client` and `call_id` must be valid non-null pointers.
+#[no_mangle]
+pub unsafe extern "C" fn bmsip_client_send_info_dtmf(
+    client: *const BmsipClientHandle,
+    call_id: *const c_char,
+    digit: c_char,
+    duration_ms: u32,
+) -> i32 {
+    let (Some(c), Some(cid)) = (unsafe { client_ref(client) }, unsafe {
+        cstr_to_string(call_id)
+    }) else {
+        return -1;
+    };
+    let ch = (digit as u8) as char;
+    if c.send_info_dtmf(cid, ch.to_string(), duration_ms).is_ok() {
+        0
+    } else {
+        -1
+    }
+}
+
+/// Sends `183 Session Progress` with negotiated early-media SDP on an incoming call (`0` on success, `-1` on error).
+///
+/// # Safety
+/// `client` and `call_id` must be valid non-null pointers.
+#[no_mangle]
+pub unsafe extern "C" fn bmsip_client_ring_early_media(
+    client: *const BmsipClientHandle,
+    call_id: *const c_char,
+) -> i32 {
+    let (Some(c), Some(cid)) = (unsafe { client_ref(client) }, unsafe {
+        cstr_to_string(call_id)
+    }) else {
+        return -1;
+    };
+    if c.ring_early_media(cid).is_ok() {
+        0
+    } else {
+        -1
+    }
+}
+
 /// Notifies the engine of a local IP/port handover (`Wi-Fi <-> LTE`).
 ///
 /// # Safety

@@ -24,21 +24,23 @@ bmsip-cli call \
   [--hold-ms <ms>] \
   [--transfer <sip_uri>] \
   [--dtmf <digits>] \
+  [--dtmf-mode rfc4733|info] \
   [--wav-in <path>] \
   [--wav-out <path>] \
   [--json-report <path>]
 ```
 
 - `--live-audio`: Captures microphone input and plays decoded RX audio at `48000 Hz` via PipeWire (`pw-cat`) / PulseAudio (`parec`/`pacat`) / ALSA (`arecord`/`aplay`).
-- `--codec <name>`: Sets preferred outbound SDP offer order:
-  - `opus` (default): `[opus/48000, G722/8000, PCMU, PCMA, telephone-event/48000, telephone-event/8000]`
-  - `g722`: `[G722/8000, PCMU, PCMA, telephone-event/8000]`
-  - `pcmu`: `[PCMU, PCMA, telephone-event/8000]`
-  - `pcma`: `[PCMA, PCMU, telephone-event/8000]`
+- `--codec <name>`: Sets preferred outbound SDP offer order (all presets also advertise static Comfort Noise `CN/8000` PT `13`):
+  - `opus` (default): `[opus/48000, G722/8000, PCMU, PCMA, CN, telephone-event/48000, telephone-event/8000]`
+  - `g722`: `[G722/8000, PCMU, PCMA, CN, telephone-event/8000]`
+  - `pcmu`: `[PCMU, PCMA, CN, telephone-event/8000]`
+  - `pcma`: `[PCMA, PCMU, CN, telephone-event/8000]`
 - `--mic-gain <mult>`: Microphone software gain multiplier before soft limiting (default: `4.0`).
 - `--hold-ms <ms>`: Places the active call on hold via `re-INVITE` (`a=sendonly`) for `<ms>` milliseconds mid-call, then automatically resumes (`a=sendrecv`).
 - `--transfer <sip_uri>`: Initiates a blind transfer (`REFER`, RFC 3515) to `<sip_uri>` once media has streamed.
-- `--dtmf <digits>`: Transmits RFC 4733 DTMF digits (e.g. `1234#`) once connected.
+- `--dtmf <digits>`: Transmits DTMF digits (e.g. `1234#`) once connected.
+- `--dtmf-mode rfc4733|info`: Selects RFC 4733 RTP `telephone-event` (default) or legacy RFC 2976 SIP `INFO` (`application/dtmf-relay`).
 - `--wav-out` & `--json-report`: Saves received playout PCM16 WAV and per-call Black-Box telemetry JSON. During `--live-audio` sessions, RX WAV buffering is disabled unless `--wav-out` is passed so long calls run in constant memory.
 
 ### 1.2 `listen` — Inbound Call Receiver
@@ -124,6 +126,6 @@ Runs 12 live SIP/RTP/DTMF scenarios verifying compatibility across distinct SIP 
 All verification commands run inside `dev`:
 
 - **Unit, Simulation & Mutation Fuzz Tests (`bmsip-core`):** SIP/SDP parsers, MD5/SHA-256 Digest auth, RFC 3261 transaction timers under loss/duplication (`tests/rfc_simulation.rs`), dialog/handover/call-control FSMs (`tests/dialog_simulation.rs`), and 4,000-iteration deterministic parser mutation stress testing.
-- **Media Unit & Fuzz Tests (`bmsip-media`):** G.711 zero codes, ITU-T G.722 lowband/highband unity-gain roundtrip, Opus TOC/`fmtp`/mic-conditioning, custom `CodecRegistry` resampling, RFC 4733 DTMF deduplication, RTCP stats, adaptive jitter PLC crossfade, and 4,000-iteration zero-copy RTP/RTCP/codec fuzzing.
+- **Media Unit & Fuzz Tests (`bmsip-media`):** G.711 zero codes, ITU-T G.722 lowband/highband unity-gain roundtrip, Opus TOC/`fmtp`/mic-conditioning, custom `CodecRegistry` resampling, RFC 4733 DTMF deduplication, RFC 3389 Comfort Noise (`CN` PT 13) SID DTX synthesis, RTCP stats, adaptive jitter PLC crossfade, and 4,000-iteration zero-copy RTP/RTCP/codec fuzzing.
 - **FFI & C ABI Tests (`bmsip-ffi`):** `bmsip.udl` API parity (`udl_schema_matches_rust_sdk_surface`), C99 compilation checks with `gcc -std=c99 -Wall -Wextra -Werror` on `include/bmsip.h` and `bindings/c/minimal_phone.c`, plus live Asterisk call & hold/resume verification over `BmsipClient` and `bmsip_*` C functions (`tests/ffi_integration.rs`).
-- **Live PBX, Routing & Custom Plugin Integration Tests (`bmsip-engine`):** 8 tests in `crates/bmsip-engine/tests/asterisk_integration.rs` covering `REGISTER`/`INVITE`/`BYE`, `PCMU` Echo, `Opus 48 kHz` Echo, `Suspend`/`Resume` + Black-Box JSON, FreeSWITCH `407`/Echo + Kamailio P2P, G.722 Echo across Asterisk/FreeSWITCH, external custom `L16/16000` codec plugin calls routed via Kamailio, direct peer symmetric SIP routing + bounded/48 kHz audio ports, and live Call Hold / Resume (`re-INVITE` `a=sendonly`/`a=sendrecv`).
+- **Live PBX, Routing & Custom Plugin Integration Tests (`bmsip-engine`):** 9 tests in `crates/bmsip-engine/tests/asterisk_integration.rs` covering `REGISTER`/`INVITE`/`BYE`, `PCMU` Echo, `Opus 48 kHz` Echo, `Suspend`/`Resume` + Black-Box JSON, FreeSWITCH `407`/Echo + Kamailio P2P, G.722 Echo across Asterisk/FreeSWITCH, external custom `L16/16000` codec plugin calls routed via Kamailio, direct peer symmetric SIP routing + bounded/48 kHz audio ports, live Call Hold / Resume (`re-INVITE` `a=sendonly`/`a=sendrecv`), and live early media `183 Session Progress` + SIP `INFO` DTMF.

@@ -1693,3 +1693,171 @@ fn live_asterisk_call_hold_and_resume_mutes_and_restores_audio() {
     eng_1001.shutdown().unwrap();
     eng_1002.shutdown().unwrap();
 }
+
+#[test]
+fn live_early_media_183_audio_and_sip_info_dtmf_exchange() {
+    let dummy_registrar = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 1);
+
+    let bob_tone = WavPcm16::generate_sine_wave(8_000, 440, 1_500, 12_000);
+    let (bob_port, _) = WavAudioPort::new_with_recording(bob_tone, true, false);
+    let bob_ua = UaConfig::new(
+        "bob",
+        "pw",
+        "127.0.0.1",
+        SipUri::parse("sip:127.0.0.1:1").unwrap(),
+        "127.0.0.1",
+        0,
+    );
+    let eng_bob = SipEngine::spawn(
+        EngineConfig::new(bob_ua, dummy_registrar, IpAddr::V4(Ipv4Addr::LOCALHOST), 0),
+        Box::new(bob_port),
+    )
+    .unwrap();
+    let bob_addr = eng_bob.local_sip_addr();
+
+    let alice_silence = WavPcm16::new(8_000, vec![0; 160]);
+    let (alice_port, alice_handle) = WavAudioPort::new(alice_silence, true);
+    let alice_ua = UaConfig::new(
+        "alice",
+        "pw",
+        "127.0.0.1",
+        SipUri::parse(&format!("sip:{bob_addr}")).unwrap(),
+        "127.0.0.1",
+        0,
+    );
+    let eng_alice = SipEngine::spawn(
+        EngineConfig::new(alice_ua, bob_addr, IpAddr::V4(Ipv4Addr::LOCALHOST), 0),
+        Box::new(alice_port),
+    )
+    .unwrap();
+
+    eng_alice
+        .send_command(EngineCommand::Dial {
+            target_uri: SipUri::parse(&format!("sip:bob@{bob_addr}")).unwrap(),
+        })
+        .unwrap();
+
+    let call_alice = match wait_for_engine_event(&eng_alice, Duration::from_secs(5), |e| {
+        matches!(e, EngineEvent::OutboundCallStarted { .. })
+    })
+    .expect("OutboundCallStarted")
+    {
+        EngineEvent::OutboundCallStarted { call_id } => call_id,
+        _ => unreachable!(),
+    };
+
+    let call_bob = match wait_for_engine_event(&eng_bob, Duration::from_secs(5), |e| {
+        matches!(e, EngineEvent::IncomingCall { .. })
+    })
+    .expect("IncomingCall on bob")
+    {
+        EngineEvent::IncomingCall { call_id, .. } => call_id,
+        _ => unreachable!(),
+    };
+
+    // Bob replies with 183 Session Progress early-media SDP (no 200 OK yet).
+    eng_bob
+        .send_command(EngineCommand::RingEarlyMedia {
+            call_id: call_bob.clone(),
+        })
+        .unwrap();
+
+    assert!(
+        wait_for_engine_event(&eng_bob, Duration::from_secs(5), |e| matches!(
+            e,
+            EngineEvent::EarlyMediaStarted { .. }
+        ))
+        .is_some(),
+        "expected EarlyMediaStarted on bob"
+    );
+    assert!(
+        wait_for_engine_event(&eng_alice, Duration::from_secs(5), |e| matches!(
+            e,
+            EngineEvent::CallRinging {
+                status_code: 183,
+                ..
+            }
+        ))
+        .is_some(),
+        "expected 183 CallRinging on alice"
+    );
+    assert!(
+        wait_for_engine_event(&eng_alice, Duration::from_secs(5), |e| matches!(
+            e,
+            EngineEvent::EarlyMediaStarted { .. }
+        ))
+        .is_some(),
+        "expected EarlyMediaStarted on alice"
+    );
+
+    // Let early-media RTP stream while still in early Ringing state, then verify INFO DTMF.
+    thread::sleep(Duration::from_millis(320));
+    let early_rms = alice_handle.recorded_wav().rms_energy();
+    assert!(
+        early_rms > 1000,
+        "expected early-media 183 audio RMS > 1000 before 200 OK, got {early_rms}"
+    );
+
+    eng_alice
+        .send_command(EngineCommand::SendInfoDtmf {
+            call_id: call_alice.clone(),
+            digit: DtmfDigit::Star,
+            duration_ms: 180,
+        })
+        .unwrap();
+    assert!(
+        wait_for_engine_event(&eng_bob, Duration::from_secs(5), |e| matches!(
+            e,
+            EngineEvent::DtmfReceived {
+                digit: DtmfDigit::Star,
+                ..
+            }
+        ))
+        .is_some(),
+        "expected DtmfReceived('*') on bob via SIP INFO"
+    );
+
+    // Now transition smoothly from early media into established 200 OK reusing the same RTP socket.
+    eng_bob
+        .send_command(EngineCommand::Answer { call_id: call_bob })
+        .unwrap();
+    assert!(
+        wait_for_engine_event(&eng_alice, Duration::from_secs(5), |e| matches!(
+            e,
+            EngineEvent::CallEstablished { .. }
+        ))
+        .is_some(),
+        "expected CallEstablished on alice"
+    );
+    assert!(
+        wait_for_engine_event(&eng_bob, Duration::from_secs(5), |e| matches!(
+            e,
+            EngineEvent::CallEstablished { .. }
+        ))
+        .is_some(),
+        "expected CallEstablished on bob"
+    );
+
+    eng_alice
+        .send_command(EngineCommand::Hangup {
+            call_id: call_alice,
+        })
+        .unwrap();
+    assert!(
+        wait_for_engine_event(&eng_alice, Duration::from_secs(5), |e| matches!(
+            e,
+            EngineEvent::CallTerminated { .. }
+        ))
+        .is_some()
+    );
+    assert!(
+        wait_for_engine_event(&eng_bob, Duration::from_secs(5), |e| matches!(
+            e,
+            EngineEvent::CallTerminated { .. }
+        ))
+        .is_some()
+    );
+
+    eng_alice.shutdown().unwrap();
+    eng_bob.shutdown().unwrap();
+}

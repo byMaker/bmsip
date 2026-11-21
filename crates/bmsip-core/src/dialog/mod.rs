@@ -1,6 +1,6 @@
 //! MODULE_CONTRACT: Sans-I/O SIP User Agent (`UserAgent`), Account Registration FSM (RFC 3261 §10), and Invite Dialog FSM (RFC 3261 §9, §12–15).
-//! INVARIANTS: Zero I/O or system clock access; handles 401/407 Digest challenges on REGISTER/INVITE/BYE/UPDATE/REFER; enforces RFC 3261 §9.1 CANCEL ordering (defer CANCEL until 1xx arrives); supports Hold/Resume, UPDATE (RFC 3311), PRACK/100rel (RFC 3262), Session-Timers (RFC 4028), REFER/Replaces transfer (RFC 3515/3891), Reason (RFC 3326), and P-Asserted-Identity/Privacy (RFC 3323/3325).
-//! RFC_REFS: RFC 3261 Sections 9, 10, 12, 13, 14, 15; RFC 3262; RFC 3264; RFC 3311; RFC 3323; RFC 3325; RFC 3326; RFC 3515; RFC 3891; RFC 4028; RFC 6337.
+//! INVARIANTS: Zero I/O or system clock access; handles 401/407 Digest challenges on REGISTER/INVITE/BYE/UPDATE/REFER/INFO; enforces RFC 3261 §9.1 CANCEL ordering (defer CANCEL until 1xx arrives); supports Early Media (`183`/`180` SDP), Hold/Resume, UPDATE (RFC 3311), PRACK/100rel (RFC 3262), Session-Timers (RFC 4028), REFER/Replaces transfer (RFC 3515/3891), INFO DTMF (RFC 2976), Reason (RFC 3326), and P-Asserted-Identity/Privacy (RFC 3323/3325).
+//! RFC_REFS: RFC 2976; RFC 3261 Sections 9, 10, 12, 13, 14, 15; RFC 3262; RFC 3264; RFC 3311; RFC 3323; RFC 3325; RFC 3326; RFC 3389; RFC 3515; RFC 3891; RFC 4028; RFC 6337.
 
 use std::collections::{HashMap, VecDeque};
 use std::time::{Duration, Instant};
@@ -113,6 +113,7 @@ impl UaConfig {
             supported_codecs: vec![
                 RtpCodec::pcmu(),
                 RtpCodec::pcma(),
+                RtpCodec::cn(),
                 RtpCodec::telephone_event(101),
             ],
             timers: RfcTimers::default(),
@@ -219,6 +220,11 @@ pub enum UaEvent {
         reason: String,
         terminated: bool,
     },
+    DtmfReceived {
+        call_id: String,
+        digit: char,
+        duration_ms: u32,
+    },
     CallTerminated {
         call_id: String,
         status_code: Option<u16>,
@@ -256,6 +262,7 @@ enum CallTxKind {
     Prack,
     Refer,
     Notify,
+    Info,
 }
 
 #[derive(Debug, Clone)]
@@ -293,6 +300,7 @@ struct CallSession {
     active_update_tx: Option<TransactionId>,
     active_update_req: Option<SipRequest>,
     active_refer_uri: Option<SipUri>,
+    active_info_payload: Option<(char, u32)>,
     active_bye_tx: Option<TransactionId>,
     inbound_invite_tx: Option<TransactionId>,
     inbound_invite_req: Option<SipRequest>,
@@ -302,6 +310,7 @@ struct CallSession {
     bye_auth_attempts: u8,
     update_auth_attempts: u8,
     refer_auth_attempts: u8,
+    info_auth_attempts: u8,
     last_ack_for_2xx: Option<SipRequest>,
     awaiting_ack: Option<Pending2xxAck>,
 }
@@ -403,6 +412,23 @@ impl UserAgent {
         self.calls
             .get(call_id)
             .map(|c| (c.local_hold, c.remote_hold))
+    }
+
+    /// Returns the negotiated SDP audio codecs for `call_id`, if any have been intersected.
+    pub fn negotiated_codecs(&self, call_id: &str) -> Option<&[RtpCodec]> {
+        self.calls
+            .get(call_id)
+            .map(|c| c.negotiated_codecs.as_slice())
+    }
+
+    /// Returns the bound local RTP port associated with `call_id`, if assigned.
+    pub fn local_rtp_port(&self, call_id: &str) -> Option<u16> {
+        self.calls.get(call_id).map(|c| c.local_rtp_port)
+    }
+
+    /// Returns the most recently received remote SDP offer/answer for `call_id`, if present.
+    pub fn remote_sdp(&self, call_id: &str) -> Option<&SdpSession> {
+        self.calls.get(call_id).and_then(|c| c.remote_sdp.as_ref())
     }
 
     /// Drains queued [`UaEvent`]s emitted by synchronous command methods (`answer`, `hangup`, etc.).
@@ -519,6 +545,7 @@ impl UserAgent {
             active_update_tx: None,
             active_update_req: None,
             active_refer_uri: None,
+            active_info_payload: None,
             active_bye_tx: None,
             inbound_invite_tx: None,
             inbound_invite_req: None,
@@ -528,6 +555,7 @@ impl UserAgent {
             bye_auth_attempts: 0,
             update_auth_attempts: 0,
             refer_auth_attempts: 0,
+            info_auth_attempts: 0,
             last_ack_for_2xx: None,
             awaiting_ack: None,
         };
@@ -662,6 +690,112 @@ impl UserAgent {
         Ok(rseq)
     }
 
+    /// Sends an early-media `183 Session Progress` (or `180 Ringing`) carrying a negotiated SDP answer per RFC 3264 / RFC 3960.
+    pub fn ring_early_media(
+        &mut self,
+        call_id: &str,
+        status_code: u16,
+        local_rtp_port: u16,
+        reliable: bool,
+        now: Instant,
+    ) -> Result<SdpSession, SipError> {
+        if !(180..200).contains(&status_code) {
+            return Err(SipError::TransactionError(format!(
+                "early-media provisional status must be 180..=199, got {status_code}"
+            )));
+        }
+        if local_rtp_port == 0 {
+            return Err(SipError::TransactionError(
+                "early-media local RTP port must be non-zero".to_string(),
+            ));
+        }
+
+        let (tx_id, req, remote_sdp_opt, local_tag, sdp_sid, local_hold, peer_requires_100rel) = {
+            let call = self
+                .calls
+                .get(call_id)
+                .ok_or_else(|| SipError::TransactionError(format!("unknown call {call_id}")))?;
+            if call.direction != CallDirection::Inbound
+                || !matches!(call.state, CallState::Incoming | CallState::Ringing)
+            {
+                return Err(SipError::TransactionError(format!(
+                    "cannot send early media on call {call_id} in state {:?}",
+                    call.state
+                )));
+            }
+            let tx_id = call.inbound_invite_tx.clone().ok_or_else(|| {
+                SipError::TransactionError("missing inbound INVITE tx".to_string())
+            })?;
+            let req = call.inbound_invite_req.clone().ok_or_else(|| {
+                SipError::TransactionError("missing inbound INVITE req".to_string())
+            })?;
+            let req_100rel = req
+                .headers
+                .get("Require")
+                .is_some_and(|v| v.to_ascii_lowercase().contains("100rel"));
+            (
+                tx_id,
+                req,
+                call.remote_sdp.clone(),
+                call.local_tag.clone(),
+                call.sdp_session_id.clone(),
+                call.local_hold,
+                req_100rel,
+            )
+        };
+
+        let remote_sdp = remote_sdp_opt.ok_or_else(|| {
+            SipError::InvalidSdp("inbound INVITE lacked SDP offer for early media".to_string())
+        })?;
+        let (mut answer_sdp, negotiated) = negotiate_offer_answer(
+            &remote_sdp,
+            &self.config.supported_codecs,
+            &self.config.local_host,
+            local_rtp_port,
+        )?;
+        answer_sdp.origin_username = self.config.username.clone();
+        answer_sdp.session_id = sdp_sid;
+        answer_sdp.session_version = "1".to_string();
+        answer_sdp.direction = constrain_answer_direction(remote_sdp.direction, local_hold);
+        let remote_hold = is_remote_hold(remote_sdp.direction);
+
+        if let Some(call) = self.calls.get_mut(call_id) {
+            call.local_rtp_port = local_rtp_port;
+            call.local_sdp = Some(answer_sdp.clone());
+            call.remote_hold = remote_hold;
+            call.negotiated_codecs = negotiated;
+            call.state = CallState::Ringing;
+        }
+
+        let reason = match status_code {
+            180 => "Ringing",
+            183 => "Session Progress",
+            _ => "Provisional",
+        };
+        if reliable || peer_requires_100rel {
+            let _ =
+                self.ring_reliable(call_id, status_code, reason, Some(answer_sdp.clone()), now)?;
+            return Ok(answer_sdp);
+        }
+
+        let mut resp = req
+            .create_response(status_code, reason)?
+            .with_body("application/sdp", answer_sdp.to_string().into_bytes());
+        let mut to = resp.to()?;
+        to.tag = Some(local_tag);
+        resp.headers.set("To", to.to_string());
+        resp.headers.set(
+            "Contact",
+            NameAddr::new(self.config.contact_uri()).to_string(),
+        );
+        resp.headers.set("Allow", ALLOW_METHODS);
+        resp.headers.set("Supported", SUPPORTED_EXTENSIONS);
+
+        let tx_events = self.transactions.send_server_response(&tx_id, resp, now)?;
+        self.process_transaction_events(tx_events, now);
+        Ok(answer_sdp)
+    }
+
     /// Answers an inbound call (`200 OK` with negotiated SDP) and starts 2xx ACK retransmission timer.
     pub fn answer(
         &mut self,
@@ -669,7 +803,7 @@ impl UserAgent {
         local_rtp_port: u16,
         now: Instant,
     ) -> Result<(), SipError> {
-        let (tx_id, req, remote_sdp_opt, local_tag, sdp_sid, local_hold) = {
+        let (tx_id, req, remote_sdp_opt, local_tag, sdp_sid, local_hold, existing_port) = {
             let call = self
                 .calls
                 .get(call_id)
@@ -695,7 +829,13 @@ impl UserAgent {
                 call.local_tag.clone(),
                 call.sdp_session_id.clone(),
                 call.local_hold,
+                call.local_rtp_port,
             )
+        };
+        let effective_rtp_port = if local_rtp_port == 0 && existing_port != 0 {
+            existing_port
+        } else {
+            local_rtp_port
         };
 
         let Some(remote_sdp) = remote_sdp_opt else {
@@ -709,7 +849,7 @@ impl UserAgent {
             &remote_sdp,
             &self.config.supported_codecs,
             &self.config.local_host,
-            local_rtp_port,
+            effective_rtp_port,
         ) {
             Ok(pair) => pair,
             Err(err) => {
@@ -747,7 +887,7 @@ impl UserAgent {
         let t1 = self.config.timers.t1.max(Duration::from_millis(1));
         if let Some(call) = self.calls.get_mut(call_id) {
             call.state = CallState::Established;
-            call.local_rtp_port = local_rtp_port;
+            call.local_rtp_port = effective_rtp_port;
             call.local_sdp = Some(answer_sdp.clone());
             call.remote_sdp = Some(remote_sdp.clone());
             call.remote_hold = remote_hold;
@@ -1302,6 +1442,100 @@ impl UserAgent {
         let tx_id = self.transactions.start_client_transaction(req, now)?;
         self.tx_to_call
             .insert(tx_id, (call_id.to_string(), CallTxKind::Notify));
+        Ok(())
+    }
+
+    /// Sends a legacy RFC 2976 SIP `INFO` DTMF (`application/dtmf-relay`) digit on an early or established dialog.
+    pub fn send_info_dtmf(
+        &mut self,
+        call_id: &str,
+        digit: char,
+        duration_ms: u32,
+        now: Instant,
+    ) -> Result<(), SipError> {
+        let normalized = normalize_dtmf_char(digit).ok_or_else(|| {
+            SipError::TransactionError(format!("unsupported SIP INFO DTMF digit '{digit}'"))
+        })?;
+        let clamped_dur = duration_ms.clamp(40, 5_000);
+        if let Some(call) = self.calls.get_mut(call_id) {
+            call.info_auth_attempts = 0;
+            call.active_info_payload = Some((normalized, clamped_dur));
+        }
+        self.send_info_dtmf_with_auth(call_id, normalized, clamped_dur, None, now)
+    }
+
+    fn send_info_dtmf_with_auth(
+        &mut self,
+        call_id: &str,
+        digit: char,
+        duration_ms: u32,
+        auth_header: Option<(&'static str, String)>,
+        now: Instant,
+    ) -> Result<(), SipError> {
+        let branch = self.next_branch();
+        let req = {
+            let call = self
+                .calls
+                .get_mut(call_id)
+                .ok_or_else(|| SipError::TransactionError(format!("unknown call {call_id}")))?;
+            if !matches!(
+                call.state,
+                CallState::Ringing | CallState::Established | CallState::ReInviting
+            ) || call.remote_tag.is_none()
+            {
+                return Err(SipError::TransactionError(format!(
+                    "cannot send SIP INFO DTMF for call {call_id} in state {:?}",
+                    call.state
+                )));
+            }
+            call.local_cseq += 1;
+            if auth_header.is_some() {
+                call.info_auth_attempts = call.info_auth_attempts.saturating_add(1);
+            } else {
+                call.info_auth_attempts = 0;
+            }
+            call.active_info_payload = Some((digit, duration_ms));
+
+            let body = format!("Signal={digit}\r\nDuration={duration_ms}\r\n");
+            let mut req = SipRequest::new(Method::Info, call.remote_target.clone())
+                .with_body("application/dtmf-relay", body.into_bytes());
+            req.headers.add(
+                "Via",
+                Via::new(
+                    "UDP",
+                    format!("{}:{}", self.config.local_host, self.config.local_sip_port),
+                    branch,
+                )
+                .to_string(),
+            );
+            for route in &call.route_set {
+                req.headers
+                    .add("Route", NameAddr::new(route.clone()).to_string());
+            }
+            req.headers.set(
+                "From",
+                call.local_name_addr(self.config.display_name.as_deref())
+                    .to_string(),
+            );
+            req.headers.set("To", call.remote_name_addr().to_string());
+            req.headers.set("Call-ID", call.call_id.clone());
+            req.headers
+                .set("CSeq", CSeq::new(call.local_cseq, Method::Info).to_string());
+            req.headers.set("Max-Forwards", "70");
+            req.headers.set(
+                "Contact",
+                NameAddr::new(self.config.contact_uri()).to_string(),
+            );
+            req.headers.set("User-Agent", DEFAULT_USER_AGENT);
+            if let Some((hdr_name, hdr_val)) = auth_header {
+                req.headers.set(hdr_name, hdr_val);
+            }
+            req
+        };
+
+        let tx_id = self.transactions.start_client_transaction(req, now)?;
+        self.tx_to_call
+            .insert(tx_id, (call_id.to_string(), CallTxKind::Info));
         Ok(())
     }
 
@@ -2058,6 +2292,9 @@ impl UserAgent {
             Method::Notify => {
                 self.on_inbound_notify(tx_id, request, now);
             }
+            Method::Info => {
+                self.on_inbound_info(tx_id, request, now);
+            }
             _ => {
                 if let Ok(resp) = request.create_response(405, "Method Not Allowed") {
                     if let Ok(events) = self.transactions.send_server_response(&tx_id, resp, now) {
@@ -2314,6 +2551,7 @@ impl UserAgent {
             active_update_tx: None,
             active_update_req: None,
             active_refer_uri: None,
+            active_info_payload: None,
             active_bye_tx: None,
             inbound_invite_tx: Some(tx_id),
             inbound_invite_req: Some(request),
@@ -2323,6 +2561,7 @@ impl UserAgent {
             bye_auth_attempts: 0,
             update_auth_attempts: 0,
             refer_auth_attempts: 0,
+            info_auth_attempts: 0,
             last_ack_for_2xx: None,
             awaiting_ack: None,
         };
@@ -2954,6 +3193,56 @@ impl UserAgent {
         }
     }
 
+    fn on_inbound_info(&mut self, tx_id: TransactionId, request: SipRequest, now: Instant) {
+        let call_id = match self.check_in_dialog_request(&request) {
+            InDialogCheck::Valid(cid) => cid,
+            InDialogCheck::OutOfOrder500 => {
+                self.send_simple_server_response(
+                    &tx_id,
+                    &request,
+                    500,
+                    "Server Internal Error",
+                    now,
+                );
+                return;
+            }
+            InDialogCheck::NotFound481 => {
+                self.send_simple_server_response(
+                    &tx_id,
+                    &request,
+                    481,
+                    "Call/Transaction Does Not Exist",
+                    now,
+                );
+                return;
+            }
+        };
+
+        let media_type = request
+            .headers
+            .get("Content-Type")
+            .and_then(|v| v.split(';').next())
+            .map(|v| v.trim().to_ascii_lowercase())
+            .unwrap_or_default();
+
+        if media_type != "application/dtmf-relay" && media_type != "application/dtmf" {
+            self.send_simple_server_response(&tx_id, &request, 415, "Unsupported Media Type", now);
+            return;
+        }
+
+        let Some((digit, duration_ms)) = parse_sip_info_dtmf(&request.body, &media_type) else {
+            self.send_simple_server_response(&tx_id, &request, 400, "Bad DTMF Payload", now);
+            return;
+        };
+
+        self.send_simple_server_response(&tx_id, &request, 200, "OK", now);
+        self.pending_events.push_back(UaEvent::DtmfReceived {
+            call_id,
+            digit,
+            duration_ms,
+        });
+    }
+
     fn on_ack_for_2xx(&mut self, ack: SipRequest) {
         if let Ok(cid) = ack.call_id() {
             if let Some(call) = self.calls.get_mut(cid) {
@@ -3000,6 +3289,17 @@ impl UserAgent {
                 }
                 if let Some(ref sdp) = early_sdp {
                     call.remote_sdp = Some(sdp.clone());
+                    call.remote_hold = is_remote_hold(sdp.direction);
+                    if let Some(ref local_sdp) = call.local_sdp {
+                        call.negotiated_codecs = intersect_answer_codecs(local_sdp, sdp);
+                    } else if let Ok((_, negotiated)) = negotiate_offer_answer(
+                        sdp,
+                        &self.config.supported_codecs,
+                        &self.config.local_host,
+                        call.local_rtp_port,
+                    ) {
+                        call.negotiated_codecs = negotiated;
+                    }
                 }
 
                 // RFC 3262 §4: auto-acknowledge reliable 1xx responses carrying RSeq (with To-tag).
@@ -3125,6 +3425,9 @@ impl UserAgent {
             }
             CallTxKind::Refer => {
                 self.handle_refer_final(&call_id, response, now);
+            }
+            CallTxKind::Info => {
+                self.handle_info_final(&call_id, response, now);
             }
             CallTxKind::Bye => {
                 self.handle_bye_final(&call_id, &tx_id, response, now);
@@ -3678,6 +3981,59 @@ impl UserAgent {
             )));
     }
 
+    fn handle_info_final(&mut self, call_id: &str, response: SipResponse, now: Instant) {
+        let code = response.status_code;
+        if (200..300).contains(&code) {
+            if let Some(call) = self.calls.get_mut(call_id) {
+                call.info_auth_attempts = 0;
+                call.active_info_payload = None;
+            }
+            return;
+        }
+
+        if code == 401 || code == 407 {
+            let retry_state = self.calls.get(call_id).and_then(|c| {
+                c.active_info_payload.map(|(digit, dur)| {
+                    (
+                        c.info_auth_attempts,
+                        c.remote_target.to_string(),
+                        digit,
+                        dur,
+                    )
+                })
+            });
+            if let Some((attempts, target_uri, digit, dur)) = retry_state {
+                if let Ok((hdr_name, hdr_val, stale)) =
+                    self.compute_auth_header(&response, &Method::Info, &target_uri)
+                {
+                    let can_retry = attempts == 0 || (stale && attempts < MAX_STALE_AUTH_RETRIES);
+                    if can_retry
+                        && self
+                            .send_info_dtmf_with_auth(
+                                call_id,
+                                digit,
+                                dur,
+                                Some((hdr_name, hdr_val)),
+                                now,
+                            )
+                            .is_ok()
+                    {
+                        return;
+                    }
+                }
+            }
+        }
+
+        if let Some(call) = self.calls.get_mut(call_id) {
+            call.active_info_payload = None;
+        }
+        self.pending_events
+            .push_back(UaEvent::ProtocolWarning(format!(
+                "INFO rejected with {code} {}",
+                response.reason_phrase
+            )));
+    }
+
     fn handle_bye_final(
         &mut self,
         call_id: &str,
@@ -3761,6 +4117,14 @@ impl UserAgent {
                     }
                     self.pending_events.push_back(UaEvent::ProtocolWarning(
                         "UPDATE transaction timed out".to_string(),
+                    ));
+                }
+                CallTxKind::Info => {
+                    if let Some(call) = self.calls.get_mut(&call_id) {
+                        call.active_info_payload = None;
+                    }
+                    self.pending_events.push_back(UaEvent::ProtocolWarning(
+                        "INFO DTMF transaction timed out".to_string(),
                     ));
                 }
                 CallTxKind::Cancel | CallTxKind::Prack | CallTxKind::Refer | CallTxKind::Notify => {
@@ -4030,4 +4394,60 @@ fn parse_sipfrag_status(body: &[u8]) -> (u16, String) {
         .unwrap_or(0);
     let reason = parts.next().map(str::trim).unwrap_or("").to_string();
     (code, reason)
+}
+
+fn normalize_dtmf_char(ch: char) -> Option<char> {
+    let up = ch.to_ascii_uppercase();
+    match up {
+        '0'..='9' | '*' | '#' | 'A'..='D' => Some(up),
+        _ => None,
+    }
+}
+
+fn parse_dtmf_signal_token(raw: &str) -> Option<char> {
+    let token = raw.trim().trim_matches('"');
+    if token == "10" {
+        return Some('*');
+    }
+    if token == "11" {
+        return Some('#');
+    }
+    let mut chars = token.chars();
+    let first = chars.next()?;
+    if chars.next().is_some() {
+        return None;
+    }
+    normalize_dtmf_char(first)
+}
+
+fn parse_sip_info_dtmf(body: &[u8], media_type: &str) -> Option<(char, u32)> {
+    let text = std::str::from_utf8(body).ok()?.trim();
+    if text.is_empty() {
+        return None;
+    }
+
+    if media_type == "application/dtmf" {
+        if let Some(digit) = parse_dtmf_signal_token(text) {
+            return Some((digit, 160));
+        }
+    }
+
+    let mut signal: Option<char> = None;
+    let mut duration_ms: u32 = 160;
+    for line in text.lines() {
+        let trimmed = line.trim();
+        if trimmed.is_empty() {
+            continue;
+        }
+        let (key, val) = trimmed
+            .split_once('=')
+            .or_else(|| trimmed.split_once(':'))?;
+        let key_lc = key.trim().to_ascii_lowercase();
+        if key_lc == "signal" {
+            signal = parse_dtmf_signal_token(val);
+        } else if key_lc == "duration" {
+            duration_ms = val.trim().parse::<u32>().ok()?.clamp(40, 5_000);
+        }
+    }
+    signal.map(|d| (d, duration_ms))
 }

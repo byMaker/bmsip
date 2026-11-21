@@ -22,6 +22,24 @@ use bmsip_engine::{
 use live_audio::{LiveAudioHandle, LiveLinuxAudioPort};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum DtmfMode {
+    Rfc4733,
+    Info,
+}
+
+impl DtmfMode {
+    fn parse(raw: &str) -> Result<Self, String> {
+        match raw.to_ascii_lowercase().as_str() {
+            "rfc4733" => Ok(Self::Rfc4733),
+            "info" => Ok(Self::Info),
+            _ => Err(format!(
+                "unsupported --dtmf-mode '{raw}' (expected rfc4733 or info)"
+            )),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum CodecChoice {
     Opus,
     G722,
@@ -57,6 +75,7 @@ impl CodecChoice {
                 RtpCodec::g722(),
                 RtpCodec::pcmu(),
                 RtpCodec::pcma(),
+                RtpCodec::cn(),
                 RtpCodec::telephone_event_48k(102),
                 RtpCodec::telephone_event(101),
             ],
@@ -64,16 +83,19 @@ impl CodecChoice {
                 RtpCodec::g722(),
                 RtpCodec::pcmu(),
                 RtpCodec::pcma(),
+                RtpCodec::cn(),
                 RtpCodec::telephone_event(101),
             ],
             Self::Pcmu => vec![
                 RtpCodec::pcmu(),
                 RtpCodec::pcma(),
+                RtpCodec::cn(),
                 RtpCodec::telephone_event(101),
             ],
             Self::Pcma => vec![
                 RtpCodec::pcma(),
                 RtpCodec::pcmu(),
+                RtpCodec::cn(),
                 RtpCodec::telephone_event(101),
             ],
         }
@@ -92,6 +114,7 @@ struct CallCliArgs {
     mic_gain: f32,
     live_audio: bool,
     dtmf: Option<String>,
+    dtmf_mode: DtmfMode,
     hold_ms: Option<u64>,
     transfer: Option<String>,
     wav_in: Option<String>,
@@ -166,7 +189,8 @@ fn print_usage() {
            --mic-gain <mult>      Live microphone gain multiplier (default: 4.0)\n  \
            --live-audio           Use 48 kHz live Linux microphone/speaker via PipeWire/PulseAudio/ALSA\n  \
            --wav <path>           Input 16-bit mono WAV file for analyze subcommand\n  \
-           --dtmf <digits>        Optional RFC 4733 DTMF digits to transmit after connect (call)\n  \
+           --dtmf <digits>        Optional DTMF digits to transmit after connect (call)\n  \
+           --dtmf-mode <mode>     DTMF transport mode: rfc4733 (default) or info (SIP INFO)\n  \
            --hold-ms <ms>         Optional mid-call hold duration before resuming (call)\n  \
            --transfer <sip_uri>   Optional blind REFER transfer target prior to hangup (call)\n  \
            --wav-in <path>        Optional 16-bit mono WAV file to transmit (call)\n  \
@@ -204,6 +228,7 @@ fn parse_call_args(args: &[String]) -> Result<CallCliArgs, String> {
     let mut mic_gain: f32 = 4.0;
     let mut live_audio = false;
     let mut dtmf: Option<String> = None;
+    let mut dtmf_mode = DtmfMode::Rfc4733;
     let mut hold_ms: Option<u64> = None;
     let mut transfer: Option<String> = None;
     let mut wav_in: Option<String> = None;
@@ -236,6 +261,9 @@ fn parse_call_args(args: &[String]) -> Result<CallCliArgs, String> {
             }
             "--live-audio" => live_audio = true,
             "--dtmf" => dtmf = Some(next_arg_value(args, &mut i, "--dtmf")?),
+            "--dtmf-mode" => {
+                dtmf_mode = DtmfMode::parse(&next_arg_value(args, &mut i, "--dtmf-mode")?)?
+            }
             "--hold-ms" => {
                 let raw = next_arg_value(args, &mut i, "--hold-ms")?;
                 hold_ms = Some(
@@ -263,6 +291,7 @@ fn parse_call_args(args: &[String]) -> Result<CallCliArgs, String> {
         mic_gain,
         live_audio,
         dtmf,
+        dtmf_mode,
         hold_ms,
         transfer,
         wav_in,
@@ -516,6 +545,7 @@ fn execute_outbound_session(
     mic_gain: f32,
     live_audio: bool,
     dtmf_digits: &[DtmfDigit],
+    dtmf_mode: DtmfMode,
     hold_ms: Option<u64>,
     transfer_target: Option<&SipUri>,
     tx_wav: WavPcm16,
@@ -552,6 +582,15 @@ fn execute_outbound_session(
                 EngineEvent::OutboundCallStarted { call_id } => {
                     active_call_id = Some(call_id);
                 }
+                EngineEvent::EarlyMediaStarted {
+                    codec: neg_codec,
+                    remote_rtp,
+                    ..
+                } => {
+                    if !quiet {
+                        println!("Early media started: codec={neg_codec}, remote_rtp={remote_rtp}");
+                    }
+                }
                 EngineEvent::CallEstablished {
                     codec: neg_codec,
                     remote_rtp,
@@ -575,10 +614,18 @@ fn execute_outbound_session(
 
     let call_id = active_call_id.ok_or_else(|| "missing call_id".to_string())?;
     for &digit in dtmf_digits {
-        let _ = engine.send_command(EngineCommand::SendDtmf {
-            call_id: call_id.clone(),
-            digit,
-        });
+        let cmd = match dtmf_mode {
+            DtmfMode::Rfc4733 => EngineCommand::SendDtmf {
+                call_id: call_id.clone(),
+                digit,
+            },
+            DtmfMode::Info => EngineCommand::SendInfoDtmf {
+                call_id: call_id.clone(),
+                digit,
+                duration_ms: 160,
+            },
+        };
+        let _ = engine.send_command(cmd);
     }
 
     if let Some(hms) = hold_ms {
@@ -695,6 +742,7 @@ fn run_call(cli: CallCliArgs) -> Result<(), String> {
         cli.mic_gain,
         cli.live_audio,
         &dtmf_digits,
+        cli.dtmf_mode,
         cli.hold_ms,
         transfer_uri.as_ref(),
         tx_wav,
@@ -906,6 +954,7 @@ fn run_selftest(cli: SelftestCliArgs) -> Result<(), String> {
             4.0,
             false,
             &[],
+            DtmfMode::Rfc4733,
             None,
             None,
             tx_wav,
@@ -1305,6 +1354,7 @@ fn run_interop(cli: InteropCliArgs) -> Result<(), String> {
                     4.0,
                     false,
                     &[],
+                    DtmfMode::Rfc4733,
                     None,
                     None,
                     tx_wav,
@@ -1415,6 +1465,8 @@ mod tests {
             "--live-audio",
             "--hold-ms",
             "250",
+            "--dtmf-mode",
+            "info",
             "--transfer",
             "sip:1002@asterisk:5060",
         ]);
@@ -1427,6 +1479,7 @@ mod tests {
         assert_eq!(CodecChoice::G722.default_wav_sample_rate_hz(), 16_000);
         assert_eq!(parsed.mic_gain, 2.5);
         assert!(parsed.live_audio);
+        assert_eq!(parsed.dtmf_mode, DtmfMode::Info);
         assert_eq!(parsed.hold_ms, Some(250));
         assert_eq!(parsed.transfer.as_deref(), Some("sip:1002@asterisk:5060"));
     }

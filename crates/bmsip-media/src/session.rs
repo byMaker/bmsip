@@ -1,7 +1,8 @@
 //! MODULE_CONTRACT: Unified Sans-I/O 20 ms PCM <-> RTP/RTCP/DTMF media session pipeline (`MediaSession`).
 //! INVARIANTS: Zero OS audio or socket APIs; operates strictly on byte slices and 20 ms `i16` PCM frames; routes DTMF payload type to `DtmfDetector`, G.711, G.722, Opus, and custom plugin payload types to `AdaptiveJitterBuffer`.
-//! RFC_REFS: RFC 3550, RFC 3551, RFC 4733, RFC 7587.
+//! RFC_REFS: RFC 3389, RFC 3550, RFC 3551, RFC 4733, RFC 7587.
 
+use crate::cn::{ComfortNoiseGenerator, ComfortNoisePacket, CN_PAYLOAD_TYPE};
 use crate::codec::G711Kind;
 use crate::dtmf::{DtmfDetector, DtmfDigit, DtmfEventPayload, DtmfSender};
 use crate::error::MediaError;
@@ -76,12 +77,14 @@ pub struct MediaSession {
     rx_resampler: StreamResampler,
     dtmf_payload_type: u8,
     dtmf_clock_rate_hz: u32,
+    cn_payload_type: u8,
     frame_samples: usize,
     packetizer: RtpPacketizer,
     jitter: AdaptiveJitterBuffer,
     stats: RtpStreamStats,
     dtmf_sender: DtmfSender,
     dtmf_detector: DtmfDetector,
+    cn_generator: ComfortNoiseGenerator,
     remote_ssrc: Option<u32>,
 }
 
@@ -119,12 +122,14 @@ impl MediaSession {
             rx_resampler: StreamResampler::new(),
             dtmf_payload_type,
             dtmf_clock_rate_hz,
+            cn_payload_type: CN_PAYLOAD_TYPE,
             frame_samples,
             packetizer: RtpPacketizer::new(local_ssrc, codec.payload_type(), 1, 0),
             jitter: AdaptiveJitterBuffer::new(jitter_config),
             stats: RtpStreamStats::new(),
             dtmf_sender: DtmfSender::new(),
             dtmf_detector: DtmfDetector::new(),
+            cn_generator: ComfortNoiseGenerator::new(),
             remote_ssrc: None,
         }
     }
@@ -163,6 +168,12 @@ impl MediaSession {
         self
     }
 
+    /// Sets the negotiated RFC 3389 Comfort Noise payload type (defaults to `13`).
+    pub fn with_cn_payload_type(mut self, payload_type: u8) -> Self {
+        self.cn_payload_type = payload_type;
+        self
+    }
+
     /// Replaces the active [`OpusCodecBackend`].
     pub fn set_opus_backend(&mut self, backend: Box<dyn OpusCodecBackend>) {
         self.opus = backend;
@@ -181,6 +192,16 @@ impl MediaSession {
     /// Returns the configured RFC 4733 DTMF RTP clock rate in Hz.
     pub fn dtmf_clock_rate_hz(&self) -> u32 {
         self.dtmf_clock_rate_hz
+    }
+
+    /// Returns the configured RFC 3389 Comfort Noise (`CN`) payload type.
+    pub fn cn_payload_type(&self) -> u8 {
+        self.cn_payload_type
+    }
+
+    /// Returns `true` when inbound RFC 3389 Comfort Noise synthesis is active for DTX pauses.
+    pub fn is_comfort_noise_active(&self) -> bool {
+        self.cn_generator.is_active()
     }
 
     /// Returns the last observed remote RTP SSRC, if any packet has been received.
@@ -300,6 +321,32 @@ impl MediaSession {
         out
     }
 
+    /// Encodes a 20 ms silence/noise PCM frame as an RFC 3389 Comfort Noise (`CN`) RTP SID packet.
+    pub fn encode_comfort_noise_frame(&mut self, pcm: &[i16]) -> Result<Vec<u8>, MediaError> {
+        if pcm.len() != self.frame_samples {
+            return Err(MediaError::BufferError(format!(
+                "expected {} PCM samples for CN SID, got {}",
+                self.frame_samples,
+                pcm.len()
+            )));
+        }
+        let sid = ComfortNoisePacket::from_pcm_frame(pcm);
+        Ok(self.build_comfort_noise_packet(sid.noise_level_dbov, &sid.spectral_params))
+    }
+
+    /// Builds an outbound RFC 3389 Comfort Noise (`CN`) RTP SID packet with explicit `-dBov` and spectral parameters.
+    pub fn build_comfort_noise_packet(
+        &mut self,
+        noise_level_dbov: u8,
+        spectral_params: &[u8],
+    ) -> Vec<u8> {
+        let sid = ComfortNoisePacket::new(noise_level_dbov)
+            .with_spectral_params(spectral_params.to_vec());
+        let ts = self.packetizer.current_timestamp();
+        self.packetizer
+            .build_custom_packet_bytes(self.cn_payload_type, ts, false, &sid.to_bytes())
+    }
+
     /// Processes an inbound RTP packet without intermediate payload allocations, updating RTCP stats and pushing decoded PCM or detecting DTMF.
     pub fn receive_rtp(
         &mut self,
@@ -313,6 +360,7 @@ impl MediaSession {
                 self.stats.reset();
                 self.jitter.reset();
                 self.dtmf_detector.reset();
+                self.cn_generator.deactivate();
             }
         }
         self.remote_ssrc = Some(pkt.ssrc);
@@ -326,6 +374,17 @@ impl MediaSession {
             let ev = DtmfEventPayload::parse(pkt.payload)?;
             return Ok(self.dtmf_detector.feed(pkt.timestamp, ev));
         }
+
+        if pkt.payload_type == self.cn_payload_type || pkt.payload_type == CN_PAYLOAD_TYPE {
+            let cn_pkt = ComfortNoisePacket::parse(pkt.payload)?;
+            self.cn_generator.update_from_packet(&cn_pkt);
+            let cn_pcm = self.cn_generator.generate_frame(self.frame_samples);
+            self.jitter
+                .push(pkt.sequence_number, cn_pcm, self.stats.jitter());
+            return Ok(None);
+        }
+
+        self.cn_generator.deactivate();
 
         let pcm = if let Some(plugin) = self.custom_plugin.as_mut() {
             if pkt.payload_type == self.codec.payload_type() {
@@ -395,9 +454,20 @@ impl MediaSession {
         Ok(count)
     }
 
-    /// Pops the next 20 ms playout frame from the adaptive jitter buffer.
+    /// Pops the next 20 ms playout frame from the adaptive jitter buffer (synthesizing RFC 3389 comfort noise when DTX SID is active).
     pub fn pop_playout_frame(&mut self) -> PlayoutFrame {
-        self.jitter.pop()
+        let frame = self.jitter.pop();
+        if self.cn_generator.is_active()
+            && matches!(
+                frame,
+                PlayoutFrame::Buffering(_) | PlayoutFrame::Concealed(_)
+            )
+        {
+            return PlayoutFrame::ComfortNoise(
+                self.cn_generator.generate_frame(self.frame_samples),
+            );
+        }
+        frame
     }
 
     /// Builds an RTCP Receiver Report (`RR`) packet and advances RFC 3550 §6.4.1 interval loss counters.
@@ -781,5 +851,51 @@ mod tests {
         assert_eq!(p1.header.payload_type, 111);
         assert_eq!(session.dtmf_payload_type(), 102);
         assert_eq!(session.dtmf_clock_rate_hz(), 48_000);
+    }
+
+    #[test]
+    fn comfort_noise_rfc3389_sid_activates_dtx_synthesis_and_resumes_voice() {
+        let cfg = JitterBufferConfig {
+            min_depth_frames: 2,
+            max_depth_frames: 8,
+            initial_depth_frames: 2,
+            frame_samples: 160,
+        };
+        let mut tx = MediaSession::new(G711Kind::Pcmu, 101, 0xaaaa_1001, cfg);
+        let mut rx = MediaSession::new(G711Kind::Pcmu, 101, 0xbbbb_2002, cfg);
+        assert_eq!(rx.cn_payload_type(), CN_PAYLOAD_TYPE);
+        assert!(!rx.is_comfort_noise_active());
+
+        // 1. Initial talkspurt of 3 voice frames primes the jitter buffer.
+        let voice = WavPcm16::generate_sine_wave(8000, 440, 60, 8000);
+        let mut ts = 0u32;
+        for frame in voice.samples.as_chunks::<160>().0 {
+            let pkt = tx.encode_pcm_frame(frame).unwrap();
+            assert_eq!(rx.receive_rtp(&pkt, ts).unwrap(), None);
+            ts += 160;
+        }
+        assert!(matches!(rx.pop_playout_frame(), PlayoutFrame::Normal(_)));
+        assert!(matches!(rx.pop_playout_frame(), PlayoutFrame::Normal(_)));
+        assert!(matches!(rx.pop_playout_frame(), PlayoutFrame::Normal(_)));
+
+        // 2. Talkspurt ends -> sender transmits an RFC 3389 CN SID packet (-38 dBov).
+        let cn_wire = tx.build_comfort_noise_packet(38, &[0x90]);
+        let cn_parsed = RtpPacket::parse(&cn_wire).unwrap();
+        assert_eq!(cn_parsed.header.payload_type, CN_PAYLOAD_TYPE);
+        assert_eq!(rx.receive_rtp(&cn_wire, ts).unwrap(), None);
+        assert!(rx.is_comfort_noise_active());
+
+        // Drain queued SID frame, then pump DTX silence gap where no RTP arrives -> ComfortNoise frames.
+        let _ = rx.pop_playout_frame();
+        let cn1 = rx.pop_playout_frame();
+        let cn2 = rx.pop_playout_frame();
+        assert!(matches!(cn1, PlayoutFrame::ComfortNoise(_)));
+        assert!(matches!(cn2, PlayoutFrame::ComfortNoise(_)));
+        assert!(WavPcm16::new(8000, cn1.samples().to_vec()).rms_energy() > 50);
+
+        // 3. New voice frame arrives -> deactivates CN and returns Normal playout.
+        let next_voice = tx.encode_pcm_frame(&voice.samples[..160]).unwrap();
+        rx.receive_rtp(&next_voice, ts + 480).unwrap();
+        assert!(!rx.is_comfort_noise_active());
     }
 }

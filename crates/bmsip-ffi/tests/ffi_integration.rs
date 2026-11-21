@@ -10,8 +10,9 @@ use bmsip_ffi::{
     bmsip_client_attended_transfer, bmsip_client_audio_sample_rate_hz, bmsip_client_dial,
     bmsip_client_free, bmsip_client_hangup, bmsip_client_hold, bmsip_client_new,
     bmsip_client_new_ex, bmsip_client_poll_event_json, bmsip_client_pop_pcm, bmsip_client_push_pcm,
-    bmsip_client_register, bmsip_client_resume_call, bmsip_client_transfer,
-    bmsip_client_unregister, bmsip_string_free, BmsipClient, FfiConfig, FfiEvent, FfiEventKind,
+    bmsip_client_register, bmsip_client_resume_call, bmsip_client_ring_early_media,
+    bmsip_client_send_info_dtmf, bmsip_client_transfer, bmsip_client_unregister, bmsip_string_free,
+    BmsipClient, FfiConfig, FfiEvent, FfiEventKind,
 };
 
 #[test]
@@ -30,6 +31,7 @@ fn udl_schema_matches_rust_sdk_surface() {
         "unregister_account()",
         "dial(string target_uri)",
         "ring(string call_id)",
+        "ring_early_media(string call_id)",
         "answer(string call_id)",
         "hangup(string call_id)",
         "hold(string call_id)",
@@ -37,6 +39,7 @@ fn udl_schema_matches_rust_sdk_surface() {
         "transfer(string call_id, string target_uri)",
         "attended_transfer(string call_id, string target_call_id)",
         "send_dtmf(string call_id, string digit)",
+        "send_info_dtmf(string call_id, string digit, u32 duration_ms)",
         "notify_network_changed(string bind_ip, u16 sip_port)",
         "suspend()",
         "resume()",
@@ -55,6 +58,7 @@ fn udl_schema_matches_rust_sdk_surface() {
         FfiEventKind::OutboundCallStarted,
         FfiEventKind::IncomingCall,
         FfiEventKind::CallRinging,
+        FfiEventKind::EarlyMediaStarted,
         FfiEventKind::CallEstablished,
         FfiEventKind::CallMediaUpdated,
         FfiEventKind::CallHoldChanged,
@@ -278,6 +282,11 @@ fn sdk_and_c_api_live_asterisk_call_pcm_bridge_and_telemetry() {
     // 2. C99 ABI (`bmsip_client_*`) safety and live Asterisk call test.
     unsafe {
         assert_eq!(bmsip_client_register(ptr::null()), -1);
+        assert_eq!(bmsip_client_ring_early_media(ptr::null(), ptr::null()), -1);
+        assert_eq!(
+            bmsip_client_send_info_dtmf(ptr::null(), ptr::null(), b'5' as _, 160),
+            -1
+        );
         assert_eq!(bmsip_client_hold(ptr::null(), ptr::null()), -1);
         assert_eq!(bmsip_client_resume_call(ptr::null(), ptr::null()), -1);
         assert_eq!(

@@ -31,12 +31,14 @@ This document describes `bmsip`'s audio pipeline (`bmsip-media` and `bmsip-engin
 
 ---
 
-## 2. RFC 4733 DTMF Telephone-Event Handling
+## 2. DTMF Signaling (`RFC 4733` & `RFC 2976`) & Comfort Noise (`RFC 3389`)
 
-- **Dual Clock Rates & Duration Scaling:** `RtpCodec::telephone_event(101)` (`8000 Hz`, paired with G.711/G.722) and `RtpCodec::telephone_event_48k(102)` (`48000 Hz`, paired with Opus for strict servers like FreeSWITCH `mod_sofia`).
-- `SipEngine::on_call_established` (and `CallMediaUpdated` on `re-INVITE`) automatically selects both the matching payload type and exact RTP clock rate (`MediaSession::with_dtmf_clock_rate`), scaling 100 ms RFC 4733 tone durations to `800` ticks at `8000 Hz` or `4800` ticks at `48000 Hz`.
+- **Dual Clock Rates & Duration Scaling (RFC 4733):** `RtpCodec::telephone_event(101)` (`8000 Hz`, paired with G.711/G.722) and `RtpCodec::telephone_event_48k(102)` (`48000 Hz`, paired with Opus for strict servers like FreeSWITCH `mod_sofia`).
+- `SipEngine` automatically selects both the matching payload type and exact RTP clock rate (`MediaSession::with_dtmf_clock_rate`), scaling 100 ms RFC 4733 tone durations to `800` ticks at `8000 Hz` or `4800` ticks at `48000 Hz`.
 - **Paced Transmission:** `DtmfSender` generates the 20 ms RFC 4733 event progression + 3 redundant end (`E=1`) packets, which `SipEngine::pump_media_tick` paces at 1 packet per 20 ms frame after the initial audio packets establish SSRC/clock baseline.
+- **Legacy SIP `INFO` DTMF (RFC 2976):** `EngineCommand::SendInfoDtmf` / `UserAgent::send_info_dtmf` transmits `application/dtmf-relay` (`Signal=<digit>\r\nDuration=<ms>`); inbound `application/dtmf-relay` and `application/dtmf` requests emit the same unified `EngineEvent::DtmfReceived`.
 - **Deduplicating Reception:** `DtmfDetector` emits `EngineEvent::DtmfReceived { call_id, digit }` once per key press and resets automatically if the remote RTP SSRC changes mid-call.
+- **Comfort Noise (`CN`, PT 13, RFC 3389):** `RtpCodec::cn()` negotiates static payload type `13` (`8000 Hz`); `ComfortNoisePacket` encodes `-dBov` SID levels (`MediaSession::encode_comfort_noise_frame` / `build_comfort_noise_packet`), and inbound SID frames trigger shaped background noise synthesis (`PlayoutFrame::ComfortNoise`) across DTX/VAD gaps until voice RTP resumes.
 
 ---
 

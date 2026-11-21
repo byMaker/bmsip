@@ -79,12 +79,14 @@ let ua_cfg = ua_cfg
 | `Register` / `Unregister` | Starts or terminates RFC 3261 `REGISTER` with automatic 401/407 Digest retry and 80%-expiry refresh |
 | `Dial { target_uri }` | Binds an ephemeral RTP UDP socket and sends `INVITE` with negotiated SDP offer |
 | `Ring { call_id }` | Sends `180 Ringing` on an inbound call |
-| `Answer { call_id }` | Binds RTP socket and replies `200 OK` with intersected SDP answer |
+| `RingEarlyMedia { call_id }` | Sends `183 Session Progress` with negotiated SDP and starts early RTP TX/RX before `200 OK` |
+| `Answer { call_id }` | Binds (or reuses early-media) RTP socket and replies `200 OK` with intersected SDP answer |
 | `Hangup { call_id }` | Sends `CANCEL` (deferred until `1xx` per RFC 3261 §9.1) or `BYE` on established dialogs |
 | `Hold { call_id }` / `ResumeCall { call_id }` | Sends in-dialog `re-INVITE` toggling `a=sendonly`/`a=inactive` (hold, muting outbound RTP TX) and `a=sendrecv` (resume) |
 | `Transfer { call_id, target_uri }` | Initiates a blind transfer (`REFER`, RFC 3515) to `target_uri` |
 | `AttendedTransfer { call_id, target_call_id }` | Initiates an attended transfer (`REFER` with `?Replaces=...`, RFC 3891) bridging `call_id` to `target_call_id` |
 | `SendDtmf { call_id, digit }` | Enqueues an RFC 4733 `telephone-event` digit (`0`–`9`, `*`, `#`, `A`–`D`), paced 1 packet per 20 ms tick |
+| `SendInfoDtmf { call_id, digit, duration_ms }` | Sends a legacy RFC 2976 SIP `INFO` (`application/dtmf-relay`) DTMF request (`40`–`5000` ms) |
 | `NetworkChanged { new_bind_ip, new_sip_port }` | Rebinds SIP and active RTP/RTCP sockets, updates `local_sip_addr`, refreshes `REGISTER`, and sends in-dialog `re-INVITE` with updated IP/RTP ports |
 | `Suspend` / `Resume` | Pauses active RTP TX/RX when backgrounded; re-registers on foreground wakeup if previously registered |
 | `ExportTelemetry { call_id }` | Emits `EngineEvent::TelemetryExported` with global or per-call JSON trace |
@@ -98,6 +100,7 @@ Drain events with `engine.try_recv_event()` or `engine.recv_event_timeout(timeou
 - `OutboundCallStarted { call_id }`
 - `IncomingCall { call_id, from, to }`
 - `CallRinging { call_id, status_code }`
+- `EarlyMediaStarted { call_id, codec, remote_rtp }`
 - `CallEstablished { call_id, codec, remote_rtp }`
 - `CallMediaUpdated { call_id, remote_rtp }`
 - `CallHoldChanged { call_id, local_hold, remote_hold }`
@@ -131,13 +134,13 @@ When integrating into custom async runtimes or deterministic simulators:
 Defined in [`crates/bmsip-ffi/src/bmsip.udl`](../crates/bmsip-ffi/src/bmsip.udl):
 
 - **Configuration (`FfiConfig`):** `username`, `password`, `domain`, `registrar_addr`, `bind_ip`, `sip_port`, `enable_opus`.
-  When `enable_opus` is `true`, `BmsipClient` offers `[Opus, G722, PCMU, PCMA, telephone-event/48000, telephone-event/8000]`; when `false`, it offers `[G722, PCMU, PCMA, telephone-event/8000]`.
+  When `enable_opus` is `true`, `BmsipClient` offers `[Opus, G722, PCMU, PCMA, CN, telephone-event/48000, telephone-event/8000]`; when `false`, it offers `[G722, PCMU, PCMA, CN, telephone-event/8000]`.
 - **Sample Rate Selection:** Default `BmsipClient(config)` uses an `8000` Hz (`160` samples/20 ms) bridge; use `BmsipClient.with_sample_rate(config, 16000 | 48000)` for native wideband G.722 (`320` samples) or fullband Opus (`960` samples) without downsampling, and inspect the active rate via `audio_sample_rate_hz()`.
 - **Audio Exchange:**
   - `push_captured_pcm(samples)` — pushes one 20 ms (`160` @ 8 kHz, `320` @ 16 kHz, or `960` @ 48 kHz) mono PCM frame captured from OS audio.
   - `pop_playout_pcm() -> sequence<i16>?` — pops the next decoded 20 ms frame sized for `audio_sample_rate_hz()`.
 - **Event Polling:** `poll_event(timeout_ms) -> FfiEvent?` returns structured `FfiEventKind`, `call_id`, `detail`, `status_code`, and `black_box_json`.
-- **Call Control Methods:** `hold(call_id)`, `resume_call(call_id)`, `transfer(call_id, target_uri)`, and `attended_transfer(call_id, target_call_id)` map directly to `EngineCommand::{Hold, ResumeCall, Transfer, AttendedTransfer}` and report state updates via `FfiEventKind::{CallHoldChanged, CallTransferRequested, TransferStatus}`.
+- **Call Control Methods:** `ring_early_media(call_id)`, `hold(call_id)`, `resume_call(call_id)`, `transfer(call_id, target_uri)`, `attended_transfer(call_id, target_call_id)`, and `send_info_dtmf(call_id, digit, duration_ms)` map directly to `EngineCommand` and report state updates via `FfiEventKind::{EarlyMediaStarted, CallHoldChanged, CallTransferRequested, TransferStatus, DtmfReceived}`.
 - **Errors (`FfiError`):** `"InvalidArgument"`, `"RuntimeError"`, `"Closed"`.
 
 ### 3.2 iOS Swift Reference (`BmsipIosAudioBridge.swift`)
@@ -161,7 +164,7 @@ Defined in [`crates/bmsip-ffi/src/bmsip.udl`](../crates/bmsip-ffi/src/bmsip.udl)
 [`crates/bmsip-ffi/include/bmsip.h`](../crates/bmsip-ffi/include/bmsip.h) provides an opaque pointer ABI (`BmsipClientHandle *`):
 
 - **Constructors:** `bmsip_client_new(...)` creates an 8 kHz client (G.722/PCMU/PCMA); `bmsip_client_new_ex(..., enable_opus, sample_rate_hz)` enables Opus (`enable_opus != 0`) and selects `8000`, `16000`, or `48000` Hz PCM framing (queryable via `bmsip_client_audio_sample_rate_hz`).
-- **Return Convention:** Action functions (`bmsip_client_register`, `bmsip_client_dial`, `bmsip_client_answer`, `bmsip_client_hangup`, `bmsip_client_hold`, `bmsip_client_resume_call`, `bmsip_client_transfer`, `bmsip_client_attended_transfer`, `bmsip_client_send_dtmf`, etc.) return `0` on success or `-1` on error.
+- **Return Convention:** Action functions (`bmsip_client_register`, `bmsip_client_dial`, `bmsip_client_ring_early_media`, `bmsip_client_answer`, `bmsip_client_hangup`, `bmsip_client_hold`, `bmsip_client_resume_call`, `bmsip_client_transfer`, `bmsip_client_attended_transfer`, `bmsip_client_send_dtmf`, `bmsip_client_send_info_dtmf`, etc.) return `0` on success or `-1` on error.
 - **PCM Functions:**
   - `bmsip_client_push_pcm(client, samples, len)` returns `0` on success (`-1` if `len` does not match the 20 ms frame length for the configured sample rate: `160`, `320`, or `960`).
   - `bmsip_client_pop_pcm(client, out_samples, capacity)` returns the number of copied samples (`160`/`320`/`960`), `0` if empty, or `-1` on error.

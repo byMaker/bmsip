@@ -23,6 +23,7 @@ Legacy C/C++ SIP stacks often suffer from hidden global state, callback re-entra
 - **Adaptive Jitter Buffer & Microphone DSP:** 16-bit RTP sequence rollover handling, jitter-driven buffering depth, smooth zero-click PLC crossfade on recovered frames, and frame-level microphone noise gate / gain / soft limiter (`condition_mic_frame`).
 - **First-Class Mobile Lifecycle & Black-Box Flight Recorder:** Built-in `NetworkChanged` (Wi-Fi <-> LTE handover with `REGISTER` refresh + `re-INVITE`), `Suspend` / `Resume` (PushKit / FCM background wakeup), and a bounded per-call JSON flight recorder.
 - **Complete Softphone Call Control:** Call Hold / Resume (`re-INVITE` `a=sendonly`/`inactive`/`sendrecv`), Blind (`REFER` + `NOTIFY message/sipfrag`) & Attended (`Replaces`) Transfer, early/in-dialog `UPDATE`, `PRACK` (`100rel`), `Session-Timers` (RFC 4028 with `422` auto-retry), `Reason` (RFC 3326), and `P-Asserted-Identity` / `Privacy` Caller-ID (RFC 3323 / RFC 3325).
+- **Early Media, Dual-Mode DTMF & Comfort Noise:** Early-media `183`/`180` SDP RTP activation before `200 OK` (RFC 3960), paced RFC 4733 `telephone-event` + legacy SIP `INFO` (`application/dtmf-relay`, RFC 2976) DTMF, and RFC 3389 Comfort Noise (`CN` PT 13) SID DTX synthesis.
 - **Cross-Platform FFI (`bmsip-ffi`):** Unified UniFFI `.udl` contract (`BmsipClient`) for **Swift (iOS)** and **Kotlin (Android)** plus a C99 `extern "C"` ABI (`bmsip.h`), with reference OS audio/AEC adapters under `bindings/`.
 
 ---

@@ -68,6 +68,9 @@ pub enum EngineCommand {
     Ring {
         call_id: String,
     },
+    RingEarlyMedia {
+        call_id: String,
+    },
     Answer {
         call_id: String,
     },
@@ -91,6 +94,11 @@ pub enum EngineCommand {
     SendDtmf {
         call_id: String,
         digit: DtmfDigit,
+    },
+    SendInfoDtmf {
+        call_id: String,
+        digit: DtmfDigit,
+        duration_ms: u32,
     },
     NetworkChanged {
         new_bind_ip: IpAddr,
@@ -119,6 +127,11 @@ pub enum EngineEvent {
     CallRinging {
         call_id: String,
         status_code: u16,
+    },
+    EarlyMediaStarted {
+        call_id: String,
+        codec: String,
+        remote_rtp: SocketAddr,
     },
     CallEstablished {
         call_id: String,
