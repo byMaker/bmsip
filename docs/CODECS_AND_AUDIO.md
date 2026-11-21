@@ -133,3 +133,17 @@ engine_cfg.register_custom_codec(factory);
 2. **Per-Call State Isolation (`CodecRegistry`):** Calls `factory.create()` when each call establishes so encoder/decoder predictor states never leak across concurrent calls.
 3. **Sample Rate Adaptation (`AudioCodecPlugin::encode_20ms` / `decode_20ms`):** Automatically converts between your `AudioPort` rate (`8`/`16`/`48` kHz) and your codec's `pcm_sample_rate_hz`.
 4. **RTP Clock & Jitter Scaling (`MediaSession::new_with_plugin`):** Advances RTP timestamps by `rtp_clock_rate_hz / 50` and scales RFC 3550 jitter estimates into PCM frame units for `AdaptiveJitterBuffer`.
+
+---
+
+## 5. SRTP & SRTCP Media Encryption (`RFC 3711`, `SDES`, `DTLS-SRTP`)
+
+[`crates/bmsip-media/src/srtp.rs`](../crates/bmsip-media/src/srtp.rs) implements RFC 3711 SRTP & SRTCP completely in Pure Safe Rust (`#![forbid(unsafe_code)]`, zero external crate dependencies):
+
+- **Cryptographic Suites (`SrtpSuite`):**
+  - `AES_CM_128_HMAC_SHA1_80` (16-byte master key, 14-byte master salt, 80-bit / 10-byte RTP & SRTCP HMAC-SHA1 tags)
+  - `AES_CM_128_HMAC_SHA1_32` (16-byte master key, 14-byte master salt, 32-bit / 4-byte RTP tag, 80-bit / 10-byte SRTCP tag)
+- **RFC 3711 §4.3.1 KDF & Replay Protection:** Derives separate session cipher, auth, and salt keys for RTP and RTCP (verified against RFC 3711 Appendix B.3 test vectors), tracks the 32-bit Rollover Counter (`ROC`), enforces a 64-packet sliding replay window, and compares MAC tags in constant time.
+- **Key Exchange Modes (`SrtpMode`):**
+  - `SrtpMode::SdesRequired` / `SrtpMode::SdesOptional` (RFC 4568): Negotiates `RTP/SAVP` with `a=crypto:<tag> <suite> inline:<base64>` in SDP and preserves master keys across mid-call `re-INVITE` / `UPDATE`.
+  - `SrtpMode::DtlsSrtp` (RFC 5763 / RFC 5764): Negotiates `UDP/TLS/RTP/SAVP` with `a=fingerprint:sha-256` and `a=setup:actpass`/`active`/`passive`, demultiplexes DTLS handshake records (`20..=63`) from RTP/SRTP (`128..=191`) on the RTP UDP socket, verifies both peers' X.509 certificate fingerprints against SDP, and derives 60-byte SRTP keys via RFC 5705 `"EXTRACTOR-dtls_srtp"`.

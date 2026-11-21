@@ -1756,3 +1756,135 @@ fn tcp_and_tls_transport_sets_via_contact_and_skips_udp_retransmits() {
         );
     }
 }
+
+#[test]
+fn sdes_srtp_and_dtls_srtp_dialog_negotiation_and_hold_reinvite() {
+    use bmsip_core::sdp::{
+        DtlsFingerprint, DtlsSetupRole, NegotiatedSrtp, SdpMediaProfile, SrtpMode, SrtpSuite,
+    };
+
+    let t0 = Instant::now();
+    let reg = SipUri::parse("sip:pbx.local:5060").unwrap();
+
+    // 1. SDES-SRTP (`SrtpMode::SdesRequired`) dialog + mid-call Hold re-INVITE key continuity.
+    let mut alice = UserAgent::new(
+        UaConfig::new("alice", "pw", "pbx.local", reg.clone(), "10.0.0.1", 5060)
+            .with_instance_seed(0x1111)
+            .with_srtp_mode(SrtpMode::SdesRequired),
+    );
+    let mut bob = UserAgent::new(
+        UaConfig::new("bob", "pw", "pbx.local", reg.clone(), "10.0.0.2", 5062)
+            .with_instance_seed(0x2222)
+            .with_srtp_mode(SrtpMode::SdesRequired),
+    );
+
+    let cid = alice
+        .dial(SipUri::parse("sip:bob@10.0.0.2:5062").unwrap(), 40000, t0)
+        .unwrap();
+    let inv_pkt = alice.poll_transmit().remove(0);
+    let b_evs = bob.receive_datagram(&inv_pkt, t0);
+    let _ = bob.poll_transmit(); // 100 Trying
+    assert!(b_evs.iter().any(|e| matches!(
+        e,
+        UaEvent::IncomingCall {
+            remote_sdp: Some(sdp),
+            ..
+        } if sdp.profile == SdpMediaProfile::RtpSavp && sdp.crypto.len() == 2
+    )));
+
+    bob.answer(&cid, 50000, t0).unwrap();
+    let _ = bob.drain_events();
+    let ok_pkt = bob.poll_transmit().remove(0);
+    let a_evs = alice.receive_datagram(&ok_pkt, t0);
+    let ack_pkt = alice.poll_transmit().remove(0);
+    let _ = bob.receive_datagram(&ack_pkt, t0);
+    assert!(a_evs
+        .iter()
+        .any(|e| matches!(e, UaEvent::CallEstablished { .. })));
+
+    let (a_tx, a_rx) = match alice.negotiated_srtp(&cid).expect("alice SDES") {
+        NegotiatedSrtp::Sdes {
+            suite,
+            local_key_salt,
+            remote_key_salt,
+        } => {
+            assert_eq!(*suite, SrtpSuite::AesCm128HmacSha1_80);
+            (*local_key_salt, *remote_key_salt)
+        }
+        other => panic!("unexpected alice SRTP: {other:?}"),
+    };
+    let (b_tx, b_rx) = match bob.negotiated_srtp(&cid).expect("bob SDES") {
+        NegotiatedSrtp::Sdes {
+            suite,
+            local_key_salt,
+            remote_key_salt,
+        } => {
+            assert_eq!(*suite, SrtpSuite::AesCm128HmacSha1_80);
+            (*local_key_salt, *remote_key_salt)
+        }
+        other => panic!("unexpected bob SRTP: {other:?}"),
+    };
+    assert_eq!(a_tx, b_rx);
+    assert_eq!(b_tx, a_rx);
+    assert_ne!(a_tx, b_tx);
+
+    // Mid-call Hold re-INVITE must preserve the exact same SDES master keys (RFC 4568 §6.1.3).
+    alice.hold(&cid, t0 + Duration::from_secs(1)).unwrap();
+    let _ = alice.drain_events();
+    let reinv_pkt = alice.poll_transmit().remove(0);
+    let _ = bob.receive_datagram(&reinv_pkt, t0 + Duration::from_secs(1));
+    let reinv_ok = bob
+        .poll_transmit()
+        .into_iter()
+        .last()
+        .expect("200 OK to re-INVITE");
+    let _ = alice.receive_datagram(&reinv_ok, t0 + Duration::from_secs(1));
+    let _ = alice.poll_transmit();
+    assert_eq!(
+        alice.negotiated_srtp(&cid),
+        Some(&NegotiatedSrtp::Sdes {
+            suite: SrtpSuite::AesCm128HmacSha1_80,
+            local_key_salt: a_tx,
+            remote_key_salt: a_rx,
+        })
+    );
+
+    // 2. DTLS-SRTP (`SrtpMode::DtlsSrtp`) dialog negotiation.
+    let fp_a = DtlsFingerprint::sha256_from_der(b"alice-dtls-cert");
+    let fp_b = DtlsFingerprint::sha256_from_der(b"bob-dtls-cert");
+    let mut dtls_alice = UserAgent::new(
+        UaConfig::new("alice", "pw", "pbx.local", reg.clone(), "10.0.0.1", 5060)
+            .with_srtp_mode(SrtpMode::DtlsSrtp)
+            .with_dtls_fingerprint(fp_a.clone()),
+    );
+    let mut dtls_bob = UserAgent::new(
+        UaConfig::new("bob", "pw", "pbx.local", reg, "10.0.0.2", 5062)
+            .with_srtp_mode(SrtpMode::DtlsSrtp)
+            .with_dtls_fingerprint(fp_b.clone()),
+    );
+
+    let dcid = dtls_alice
+        .dial(SipUri::parse("sip:bob@10.0.0.2:5062").unwrap(), 40100, t0)
+        .unwrap();
+    let dinv = dtls_alice.poll_transmit().remove(0);
+    let _ = dtls_bob.receive_datagram(&dinv, t0);
+    let _ = dtls_bob.poll_transmit();
+    dtls_bob.answer(&dcid, 50100, t0).unwrap();
+    let dok = dtls_bob.poll_transmit().remove(0);
+    let _ = dtls_alice.receive_datagram(&dok, t0);
+
+    assert_eq!(
+        dtls_alice.negotiated_srtp(&dcid),
+        Some(&NegotiatedSrtp::Dtls {
+            local_role: DtlsSetupRole::Passive,
+            remote_fingerprint: fp_b,
+        })
+    );
+    assert_eq!(
+        dtls_bob.negotiated_srtp(&dcid),
+        Some(&NegotiatedSrtp::Dtls {
+            local_role: DtlsSetupRole::Active,
+            remote_fingerprint: fp_a,
+        })
+    );
+}

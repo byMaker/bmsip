@@ -1,8 +1,8 @@
 #![forbid(unsafe_code)]
 
-//! MODULE_CONTRACT: Hardware-agnostic RTP/RTCP, G.711 codecs, RFC 4733 DTMF, RFC 3389 Comfort Noise, adaptive jitter buffer, and in-memory WAV pipeline (`bmsip-media`).
+//! MODULE_CONTRACT: Hardware-agnostic RTP/RTCP, RFC 3711 SRTP/SRTCP, G.711/G.722/Opus codecs, RFC 4733 DTMF, RFC 3389 Comfort Noise, adaptive jitter buffer, and in-memory WAV pipeline (`bmsip-media`).
 //! INVARIANTS: `#![forbid(unsafe_code)]`; zero OS audio device APIs (ALSA, PipeWire, CoreAudio, Oboe); zero `std::net`, `std::thread`, `std::fs`, `Instant::now()`, or `SystemTime::now()`; no `.unwrap()`/`.expect()` outside tests.
-//! RFC_REFS: RFC 3389 (Comfort Noise), RFC 3550 (RTP/RTCP), RFC 3551 (G.711), RFC 4733 (DTMF), RFC 6716 / RFC 7587 (Opus).
+//! RFC_REFS: RFC 3389 (Comfort Noise), RFC 3550 (RTP/RTCP), RFC 3551 (G.711/G.722), RFC 3711 (SRTP/SRTCP), RFC 4733 (DTMF), RFC 5764 (DTLS-SRTP), RFC 6716 / RFC 7587 (Opus).
 
 pub mod cn;
 pub mod codec;
@@ -15,6 +15,7 @@ pub mod plugin;
 pub mod rtcp;
 pub mod rtp;
 pub mod session;
+pub mod srtp;
 pub mod wav;
 
 pub use bmsip_core::core_version;
@@ -44,4 +45,8 @@ pub use plugin::{
 pub use rtcp::{ReceptionReportBlock, RtcpPacket, RtcpSenderInfo, RtpStreamStats};
 pub use rtp::{RtpExtensionHeader, RtpHeader, RtpPacket, RtpPacketRef, RtpPacketizer};
 pub use session::{MediaSession, SessionCodec};
+pub use srtp::{
+    aes128_encrypt_block, derive_srtp_session_keys, hmac_sha1, sha1, DerivedSrtpKeys, SrtpContext,
+    SrtpKeyMaterial,
+};
 pub use wav::WavPcm16;

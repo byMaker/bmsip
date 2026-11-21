@@ -1,6 +1,6 @@
 FROM alpine:3.20
 
-RUN apk add --no-cache asterisk openssl \
+RUN apk add --no-cache asterisk asterisk-srtp openssl \
     && mkdir -p /etc/asterisk/keys \
     && openssl req -x509 -newkey rsa:2048 -nodes \
        -keyout /etc/asterisk/keys/asterisk.key \

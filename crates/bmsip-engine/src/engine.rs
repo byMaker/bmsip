@@ -10,7 +10,7 @@ use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use bmsip_core::dialog::{CallState, RegistrationState, UaEvent, UserAgent};
-use bmsip_core::sdp::RtpCodec;
+use bmsip_core::sdp::{NegotiatedSrtp, RtpCodec};
 use bmsip_core::sip::{Method, NameAddr, SipMessage, SipTransport, SipUri};
 use bmsip_media::{
     AudioCodecPlugin, BuiltInOpusCodec, CodecRegistry, G711Kind, JitterBufferConfig, MediaSession,
@@ -20,6 +20,7 @@ use bmsip_media::{
 
 use crate::audio::AudioPort;
 use crate::command::{EngineCommand, EngineConfig, EngineEvent};
+use crate::dtls::{is_dtls_datagram, DtlsIdentity, DtlsSrtpSession};
 use crate::error::EngineError;
 use crate::opus_native::LibOpusCodec;
 use crate::telemetry::{FlightRecorder, TelemetryCategory};
@@ -65,6 +66,8 @@ struct CallMediaRuntime {
     next_rtcp_at: Instant,
     local_hold: bool,
     remote_hold: bool,
+    dtls_session: Option<DtlsSrtpSession>,
+    dtls_required: bool,
 }
 
 struct SharedState {
@@ -104,6 +107,10 @@ impl SipEngine {
         if config.ua_config.instance_seed == 0 {
             config.ua_config.instance_seed = generate_instance_seed(actual_port);
         }
+        let dtls_identity = DtlsIdentity::generate()?;
+        if config.ua_config.dtls_fingerprint.is_none() {
+            config.ua_config.dtls_fingerprint = Some(dtls_identity.fingerprint.clone());
+        }
 
         let shared = Arc::new(SharedState {
             commands: Mutex::new(VecDeque::new()),
@@ -120,6 +127,7 @@ impl SipEngine {
                 run_worker(
                     config,
                     sip_transport,
+                    dtls_identity,
                     advertised_addr,
                     audio_port,
                     worker_shared,
@@ -195,6 +203,7 @@ struct WorkerCtx {
     bind_ip: IpAddr,
     local_sip_addr: SocketAddr,
     sip_transport: SipTransportDriver,
+    dtls_identity: DtlsIdentity,
     ua: UserAgent,
     codec_registry: CodecRegistry,
     audio_port: Box<dyn AudioPort>,
@@ -697,12 +706,25 @@ impl WorkerCtx {
         let (session_codec, codec_name, custom_plugin, dtmf_pt, dtmf_clock_rate_hz, cn_pt) =
             self.select_media_codecs(negotiated_codecs);
         let (local_hold, remote_hold) = self.ua.hold_state(call_id).unwrap_or((false, false));
+        let negotiated_srtp = self.ua.negotiated_srtp(call_id).cloned();
 
         if let Some(media) = self.active_media.get_mut(call_id) {
             media.remote_rtp = remote_rtp;
             media.remote_rtcp = remote_rtcp;
             media.local_hold = local_hold;
             media.remote_hold = remote_hold;
+            if let Some(NegotiatedSrtp::Sdes {
+                suite,
+                local_key_salt,
+                remote_key_salt,
+            }) = &negotiated_srtp
+            {
+                if !media.session.is_srtp_active() {
+                    media
+                        .session
+                        .set_srtp_keys(*suite, local_key_salt, remote_key_salt);
+                }
+            }
             if media.session.codec() != session_codec
                 || media.session.dtmf_payload_type() != dtmf_pt
                 || media.session.dtmf_clock_rate_hz() != dtmf_clock_rate_hz
@@ -748,6 +770,53 @@ impl WorkerCtx {
         if let Some(plugin) = custom_plugin {
             session = session.with_codec_plugin(plugin);
         }
+
+        let mut dtls_session = None;
+        let mut dtls_required = false;
+        match negotiated_srtp {
+            Some(NegotiatedSrtp::Sdes {
+                suite,
+                local_key_salt,
+                remote_key_salt,
+            }) => {
+                session.set_srtp_keys(suite, &local_key_salt, &remote_key_salt);
+                self.recorder.record(
+                    now,
+                    TelemetryCategory::DialogFsm,
+                    Some(call_id),
+                    format!("SRTP (SDES) enabled suite={suite}"),
+                );
+            }
+            Some(NegotiatedSrtp::Dtls {
+                local_role,
+                remote_fingerprint,
+            }) => {
+                dtls_required = true;
+                match DtlsSrtpSession::new(&self.dtls_identity, local_role, remote_fingerprint, now)
+                {
+                    Ok(mut ds) => {
+                        if let Ok(pkts) = ds.poll_transmit(now) {
+                            for pkt in pkts {
+                                let _ = rtp_socket.send_to(&pkt, remote_rtp);
+                            }
+                        }
+                        dtls_session = Some(ds);
+                    }
+                    Err(err) => {
+                        let msg = format!("DTLS-SRTP init failed: {err}");
+                        self.recorder.record(
+                            now,
+                            TelemetryCategory::Warning,
+                            Some(call_id),
+                            msg.clone(),
+                        );
+                        self.push_event(EngineEvent::Warning(msg));
+                    }
+                }
+            }
+            None => {}
+        }
+
         self.active_media.insert(
             call_id.to_string(),
             CallMediaRuntime {
@@ -762,6 +831,8 @@ impl WorkerCtx {
                 next_rtcp_at: now + Duration::from_millis(RTCP_REPORT_INTERVAL_MS),
                 local_hold,
                 remote_hold,
+                dtls_session,
+                dtls_required,
             },
         );
         if !self.call_order.iter().any(|id| id == call_id) {
@@ -1187,6 +1258,8 @@ impl WorkerCtx {
         let call_ids: Vec<String> = self.active_media.keys().cloned().collect();
         let mut dtmf_events: Vec<(String, bmsip_media::DtmfDigit)> = Vec::new();
         let mut stats_updates: Vec<(String, u32, u32, i32, u32)> = Vec::new();
+        let mut dtls_warnings: Vec<(String, String)> = Vec::new();
+        let mut dtls_established: Vec<(String, String)> = Vec::new();
 
         for call_id in &call_ids {
             let Some(media) = self.active_media.get_mut(call_id) else {
@@ -1199,15 +1272,54 @@ impl WorkerCtx {
                 continue;
             }
 
-            let mut rtp_buf = [0u8; 2048];
+            if let Some(dtls) = media.dtls_session.as_mut() {
+                if let Ok(pkts) = dtls.poll_transmit(now) {
+                    for pkt in pkts {
+                        let _ = media.rtp_socket.send_to(&pkt, media.remote_rtp);
+                    }
+                }
+            }
+
+            let mut rtp_buf = [0u8; 4096];
             loop {
                 match media.rtp_socket.recv_from(&mut rtp_buf) {
                     Ok((len, _)) => {
+                        let pkt_slice = &rtp_buf[..len];
+                        if is_dtls_datagram(pkt_slice) {
+                            if let Some(dtls) = media.dtls_session.as_mut() {
+                                match dtls.receive_datagram(pkt_slice, now) {
+                                    Ok(step) => {
+                                        for out_pkt in step.outbound_packets {
+                                            let _ = media
+                                                .rtp_socket
+                                                .send_to(&out_pkt, media.remote_rtp);
+                                        }
+                                        if let Some((suite, tx_key, rx_key)) = step.established_keys
+                                        {
+                                            media.session.set_srtp_keys(suite, &tx_key, &rx_key);
+                                            dtls_established.push((
+                                                call_id.clone(),
+                                                format!(
+                                                    "DTLS-SRTP handshake established suite={suite}"
+                                                ),
+                                            ));
+                                        }
+                                    }
+                                    Err(err) => {
+                                        dtls_warnings.push((call_id.clone(), err));
+                                    }
+                                }
+                            }
+                            continue;
+                        }
+                        if media.dtls_required && !media.session.is_srtp_active() {
+                            continue;
+                        }
                         let samples_per_ms = media.session.clock_rate_hz() / 1000;
                         let arrival_samples = (media.started_at.elapsed().as_millis() as u32)
                             .saturating_mul(samples_per_ms);
                         if let Ok(Some(digit)) =
-                            media.session.receive_rtp(&rtp_buf[..len], arrival_samples)
+                            media.session.receive_rtp(pkt_slice, arrival_samples)
                         {
                             dtmf_events.push((call_id.clone(), digit));
                         }
@@ -1252,6 +1364,16 @@ impl WorkerCtx {
                 st.cumulative_lost(),
                 st.jitter(),
             ));
+        }
+
+        for (cid, msg) in dtls_established {
+            self.recorder
+                .record(now, TelemetryCategory::DialogFsm, Some(&cid), msg);
+        }
+        for (cid, warn) in dtls_warnings {
+            self.recorder
+                .record(now, TelemetryCategory::Warning, Some(&cid), warn.clone());
+            self.push_event(EngineEvent::Warning(warn));
         }
 
         for (cid, digit) in dtmf_events {
@@ -1299,9 +1421,10 @@ impl WorkerCtx {
             if !primary_served {
                 primary_served = true;
                 // Always capture from the audio port to keep host capture buffers fresh,
-                // but skip outbound RTP media transmission while the call is on hold.
+                // but skip outbound RTP media transmission while the call is on hold or awaiting DTLS-SRTP keys.
                 let tx_pcm = self.audio_port.capture_frame_20ms();
-                if !(media.local_hold || media.remote_hold) {
+                let srtp_ready = !media.dtls_required || media.session.is_srtp_active();
+                if !(media.local_hold || media.remote_hold) && srtp_ready {
                     if let Ok(pkt) = media.session.encode_pcm_frame(&tx_pcm) {
                         if media.rtp_socket.send_to(&pkt, media.remote_rtp).is_ok() {
                             media.rtp_packets_sent = media.rtp_packets_sent.saturating_add(1);
@@ -1375,6 +1498,7 @@ impl WorkerCtx {
 fn run_worker(
     config: EngineConfig,
     sip_transport: SipTransportDriver,
+    dtls_identity: DtlsIdentity,
     local_sip_addr: SocketAddr,
     audio_port: Box<dyn AudioPort>,
     shared: Arc<SharedState>,
@@ -1385,6 +1509,7 @@ fn run_worker(
         bind_ip: config.bind_ip,
         local_sip_addr,
         sip_transport,
+        dtls_identity,
         ua: UserAgent::new(config.ua_config),
         codec_registry: config.codec_registry,
         audio_port,

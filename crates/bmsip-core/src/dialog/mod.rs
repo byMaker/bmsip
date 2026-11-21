@@ -7,7 +7,11 @@ use std::time::{Duration, Instant};
 
 use crate::auth::{DigestChallenge, DigestCredentials};
 use crate::error::SipError;
-use crate::sdp::{negotiate_offer_answer, Direction, RtpCodec, SdpSession};
+use crate::sdp::{
+    negotiate_offer_answer_with_srtp, resolve_outbound_answer_srtp, Direction, DtlsFingerprint,
+    DtlsSetupRole, NegotiatedSrtp, RtpCodec, SdesCryptoAttr, SdpMediaProfile, SdpSession, SrtpMode,
+    SrtpSuite,
+};
 use crate::sip::{
     CSeq, CallerIdentity, Method, NameAddr, RAck, ReasonHeader, ReplacesHeader, SessionExpires,
     SessionRefresher, SipMessage, SipRequest, SipResponse, SipTransport, SipUri, Via,
@@ -91,6 +95,10 @@ pub struct UaConfig {
     pub asserted_identity: Option<NameAddr>,
     /// Optional privacy directive attached via `Privacy` (RFC 3323, e.g., `"id"`).
     pub privacy: Option<String>,
+    /// SRTP media encryption policy (`Disabled`, `SdesOptional`, `SdesRequired`, or `DtlsSrtp`).
+    pub srtp_mode: SrtpMode,
+    /// Optional local X.509 certificate SHA-256 fingerprint advertised in `a=fingerprint:` when `srtp_mode` is `DtlsSrtp`.
+    pub dtls_fingerprint: Option<DtlsFingerprint>,
 }
 
 impl UaConfig {
@@ -125,6 +133,8 @@ impl UaConfig {
             min_se_secs: 90,
             asserted_identity: None,
             privacy: None,
+            srtp_mode: SrtpMode::Disabled,
+            dtls_fingerprint: None,
         }
     }
 
@@ -159,6 +169,18 @@ impl UaConfig {
     ) -> Self {
         self.asserted_identity = asserted_identity;
         self.privacy = privacy;
+        self
+    }
+
+    /// Configures the SRTP media encryption mode (`Disabled`, `SdesOptional`, `SdesRequired`, or `DtlsSrtp`).
+    pub fn with_srtp_mode(mut self, srtp_mode: SrtpMode) -> Self {
+        self.srtp_mode = srtp_mode;
+        self
+    }
+
+    /// Sets the local certificate fingerprint advertised in `a=fingerprint:` for DTLS-SRTP offers and answers.
+    pub fn with_dtls_fingerprint(mut self, fingerprint: DtlsFingerprint) -> Self {
+        self.dtls_fingerprint = Some(fingerprint);
         self
     }
 
@@ -293,6 +315,8 @@ struct CallSession {
     local_sdp: Option<SdpSession>,
     remote_sdp: Option<SdpSession>,
     negotiated_codecs: Vec<RtpCodec>,
+    local_crypto: Vec<SdesCryptoAttr>,
+    negotiated_srtp: Option<NegotiatedSrtp>,
     local_hold: bool,
     remote_hold: bool,
     local_rseq: u32,
@@ -445,6 +469,74 @@ impl UserAgent {
         self.calls.get(call_id).and_then(|c| c.remote_sdp.as_ref())
     }
 
+    /// Returns the negotiated SRTP security parameters (SDES keys or DTLS-SRTP role/fingerprint) for `call_id`, if active.
+    pub fn negotiated_srtp(&self, call_id: &str) -> Option<&NegotiatedSrtp> {
+        self.calls
+            .get(call_id)
+            .and_then(|c| c.negotiated_srtp.as_ref())
+    }
+
+    fn generate_sdes_candidates(&mut self, call_id: &str) -> Vec<SdesCryptoAttr> {
+        let s1 = format!(
+            "bmsip-sdes-1-{}-{call_id}-{}-{}:{}",
+            self.config.instance_seed,
+            self.id_counter,
+            self.config.local_host,
+            self.config.local_sip_port
+        );
+        self.id_counter = self.id_counter.wrapping_add(1);
+        let s2 = format!(
+            "bmsip-sdes-2-{}-{call_id}-{}-{}:{}",
+            self.config.instance_seed,
+            self.id_counter,
+            self.config.local_host,
+            self.config.local_sip_port
+        );
+        self.id_counter = self.id_counter.wrapping_add(1);
+        vec![
+            SdesCryptoAttr::from_seed(1, SrtpSuite::AesCm128HmacSha1_80, s1.as_bytes()),
+            SdesCryptoAttr::from_seed(2, SrtpSuite::AesCm128HmacSha1_32, s2.as_bytes()),
+        ]
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn build_local_offer_sdp(
+        &self,
+        sdp_sid: &str,
+        sdp_version: u64,
+        ip: &str,
+        rtp_port: u16,
+        direction: Direction,
+        codecs: Vec<RtpCodec>,
+        local_crypto: &[SdesCryptoAttr],
+    ) -> SdpSession {
+        let (profile, crypto, dtls_fingerprint, dtls_setup) = match self.config.srtp_mode {
+            SrtpMode::Disabled => (SdpMediaProfile::RtpAvp, Vec::new(), None, None),
+            SrtpMode::SdesOptional => (SdpMediaProfile::RtpAvp, local_crypto.to_vec(), None, None),
+            SrtpMode::SdesRequired => (SdpMediaProfile::RtpSavp, local_crypto.to_vec(), None, None),
+            SrtpMode::DtlsSrtp => (
+                SdpMediaProfile::UdpTlsRtpSavp,
+                Vec::new(),
+                self.config.dtls_fingerprint.clone(),
+                Some(DtlsSetupRole::ActPass),
+            ),
+        };
+        SdpSession {
+            origin_username: self.config.username.clone(),
+            session_id: sdp_sid.to_string(),
+            session_version: sdp_version.to_string(),
+            connection_ip: ip.to_string(),
+            audio_port: rtp_port,
+            profile,
+            direction,
+            codecs,
+            ptime: Some(20),
+            crypto,
+            dtls_fingerprint,
+            dtls_setup,
+        }
+    }
+
     /// Drains queued [`UaEvent`]s emitted by synchronous command methods (`answer`, `hangup`, etc.).
     pub fn drain_events(&mut self) -> Vec<UaEvent> {
         self.pending_events.drain(..).collect()
@@ -508,17 +600,24 @@ impl UserAgent {
         let local_tag = self.next_tag();
         let sdp_sid = self.next_numeric_id();
         let sdp_version = 1;
-
-        let local_sdp = SdpSession {
-            origin_username: self.config.username.clone(),
-            session_id: sdp_sid.clone(),
-            session_version: sdp_version.to_string(),
-            connection_ip: self.config.local_host.clone(),
-            audio_port: local_rtp_port,
-            direction: Direction::SendRecv,
-            codecs: self.config.supported_codecs.clone(),
-            ptime: Some(20),
+        let local_crypto = if matches!(
+            self.config.srtp_mode,
+            SrtpMode::SdesOptional | SrtpMode::SdesRequired
+        ) {
+            self.generate_sdes_candidates(&call_id)
+        } else {
+            Vec::new()
         };
+
+        let local_sdp = self.build_local_offer_sdp(
+            &sdp_sid,
+            sdp_version,
+            &self.config.local_host,
+            local_rtp_port,
+            Direction::SendRecv,
+            self.config.supported_codecs.clone(),
+            &local_crypto,
+        );
 
         let init_se = self
             .config
@@ -543,6 +642,8 @@ impl UserAgent {
             local_sdp: Some(local_sdp.clone()),
             remote_sdp: None,
             negotiated_codecs: Vec::new(),
+            local_crypto,
+            negotiated_srtp: None,
             local_hold: false,
             remote_hold: false,
             local_rseq: 0,
@@ -761,11 +862,18 @@ impl UserAgent {
         let remote_sdp = remote_sdp_opt.ok_or_else(|| {
             SipError::InvalidSdp("inbound INVITE lacked SDP offer for early media".to_string())
         })?;
-        let (mut answer_sdp, negotiated) = negotiate_offer_answer(
+        let local_candidates = match self.calls.get(call_id) {
+            Some(c) if !c.local_crypto.is_empty() => c.local_crypto.clone(),
+            _ => self.generate_sdes_candidates(call_id),
+        };
+        let (mut answer_sdp, negotiated, negotiated_srtp) = negotiate_offer_answer_with_srtp(
             &remote_sdp,
             &self.config.supported_codecs,
             &self.config.local_host,
             local_rtp_port,
+            self.config.srtp_mode,
+            &local_candidates,
+            self.config.dtls_fingerprint.as_ref(),
         )?;
         answer_sdp.origin_username = self.config.username.clone();
         answer_sdp.session_id = sdp_sid;
@@ -776,6 +884,10 @@ impl UserAgent {
         if let Some(call) = self.calls.get_mut(call_id) {
             call.local_rtp_port = local_rtp_port;
             call.local_sdp = Some(answer_sdp.clone());
+            if !answer_sdp.crypto.is_empty() {
+                call.local_crypto = answer_sdp.crypto.clone();
+            }
+            call.negotiated_srtp = negotiated_srtp;
             call.remote_hold = remote_hold;
             call.negotiated_codecs = negotiated;
             call.state = CallState::Ringing;
@@ -859,13 +971,20 @@ impl UserAgent {
             ));
         };
 
-        let (mut answer_sdp, negotiated) = match negotiate_offer_answer(
+        let local_candidates = match self.calls.get(call_id) {
+            Some(c) if !c.local_crypto.is_empty() => c.local_crypto.clone(),
+            _ => self.generate_sdes_candidates(call_id),
+        };
+        let (mut answer_sdp, negotiated, negotiated_srtp) = match negotiate_offer_answer_with_srtp(
             &remote_sdp,
             &self.config.supported_codecs,
             &self.config.local_host,
             effective_rtp_port,
+            self.config.srtp_mode,
+            &local_candidates,
+            self.config.dtls_fingerprint.as_ref(),
         ) {
-            Ok(pair) => pair,
+            Ok(triple) => triple,
             Err(err) => {
                 self.reject_inbound_invite_488(call_id, &tx_id, &req, &local_tag, now);
                 return Err(err);
@@ -904,6 +1023,10 @@ impl UserAgent {
             call.local_rtp_port = effective_rtp_port;
             call.local_sdp = Some(answer_sdp.clone());
             call.remote_sdp = Some(remote_sdp.clone());
+            if !answer_sdp.crypto.is_empty() {
+                call.local_crypto = answer_sdp.crypto.clone();
+            }
+            call.negotiated_srtp = negotiated_srtp;
             call.remote_hold = remote_hold;
             call.negotiated_codecs = negotiated.clone();
             call.inbound_invite_tx = None;
@@ -1113,7 +1236,21 @@ impl UserAgent {
         now: Instant,
     ) -> Result<(), SipError> {
         let branch = self.next_branch();
-        let (req, new_sdp) = {
+        if self
+            .calls
+            .get(call_id)
+            .is_some_and(|c| c.local_crypto.is_empty())
+            && matches!(
+                self.config.srtp_mode,
+                SrtpMode::SdesOptional | SrtpMode::SdesRequired
+            )
+        {
+            let cands = self.generate_sdes_candidates(call_id);
+            if let Some(c) = self.calls.get_mut(call_id) {
+                c.local_crypto = cands;
+            }
+        }
+        let (sdp_sid, sdp_version, codecs, local_crypto) = {
             let call = self
                 .calls
                 .get_mut(call_id)
@@ -1135,20 +1272,29 @@ impl UserAgent {
             } else {
                 call.negotiated_codecs.clone()
             };
-            let sdp = SdpSession {
-                origin_username: self.config.username.clone(),
-                session_id: call.sdp_session_id.clone(),
-                session_version: call.sdp_version.to_string(),
-                connection_ip: new_local_ip.to_string(),
-                audio_port: new_local_rtp_port,
-                direction,
+            (
+                call.sdp_session_id.clone(),
+                call.sdp_version,
                 codecs,
-                ptime: Some(20),
-            };
-            call.local_sdp = Some(sdp.clone());
-
-            let req = Self::build_in_dialog_invite(&self.config, call, &branch, &sdp, None);
-            (req, sdp)
+                call.local_crypto.clone(),
+            )
+        };
+        let new_sdp = self.build_local_offer_sdp(
+            &sdp_sid,
+            sdp_version,
+            new_local_ip,
+            new_local_rtp_port,
+            direction,
+            codecs,
+            &local_crypto,
+        );
+        let req = {
+            let call = self
+                .calls
+                .get_mut(call_id)
+                .ok_or_else(|| SipError::TransactionError(format!("unknown call {call_id}")))?;
+            call.local_sdp = Some(new_sdp.clone());
+            Self::build_in_dialog_invite(&self.config, call, &branch, &new_sdp, None)
         };
 
         let tx_id = self
@@ -1173,7 +1319,21 @@ impl UserAgent {
         now: Instant,
     ) -> Result<(), SipError> {
         let branch = self.next_branch();
-        let req = {
+        if self
+            .calls
+            .get(call_id)
+            .is_some_and(|c| c.local_crypto.is_empty())
+            && matches!(
+                self.config.srtp_mode,
+                SrtpMode::SdesOptional | SrtpMode::SdesRequired
+            )
+        {
+            let cands = self.generate_sdes_candidates(call_id);
+            if let Some(c) = self.calls.get_mut(call_id) {
+                c.local_crypto = cands;
+            }
+        }
+        let (sdp_sid, sdp_version, ip, port, dir, codecs, local_crypto) = {
             let call = self
                 .calls
                 .get_mut(call_id)
@@ -1209,18 +1369,31 @@ impl UserAgent {
             } else {
                 Direction::SendRecv
             };
-            let sdp = SdpSession {
-                origin_username: self.config.username.clone(),
-                session_id: call.sdp_session_id.clone(),
-                session_version: call.sdp_version.to_string(),
-                connection_ip: ip,
-                audio_port: port,
-                direction: dir,
+            (
+                call.sdp_session_id.clone(),
+                call.sdp_version,
+                ip,
+                port,
+                dir,
                 codecs,
-                ptime: Some(20),
-            };
+                call.local_crypto.clone(),
+            )
+        };
+        let sdp = self.build_local_offer_sdp(
+            &sdp_sid,
+            sdp_version,
+            &ip,
+            port,
+            dir,
+            codecs,
+            &local_crypto,
+        );
+        let req = {
+            let call = self
+                .calls
+                .get_mut(call_id)
+                .ok_or_else(|| SipError::TransactionError(format!("unknown call {call_id}")))?;
             call.local_sdp = Some(sdp.clone());
-
             Self::build_in_dialog_update(&self.config, call, &branch, Some(&sdp), None)
         };
 
@@ -2547,6 +2720,8 @@ impl UserAgent {
             local_sdp: None,
             remote_sdp: remote_sdp.clone(),
             negotiated_codecs: Vec::new(),
+            local_crypto: Vec::new(),
+            negotiated_srtp: None,
             local_hold: false,
             remote_hold: remote_sdp
                 .as_ref()
@@ -2640,14 +2815,21 @@ impl UserAgent {
                 None => return,
             };
 
-        let negotiated_res = negotiate_offer_answer(
+        let local_candidates = match self.calls.get(call_id) {
+            Some(c) if !c.local_crypto.is_empty() => c.local_crypto.clone(),
+            _ => self.generate_sdes_candidates(call_id),
+        };
+        let negotiated_res = negotiate_offer_answer_with_srtp(
             &remote_sdp,
             &self.config.supported_codecs,
             &self.config.local_host,
             local_rtp_port,
+            self.config.srtp_mode,
+            &local_candidates,
+            self.config.dtls_fingerprint.as_ref(),
         );
-        let (mut answer_sdp, negotiated) = match negotiated_res {
-            Ok(pair) => pair,
+        let (mut answer_sdp, negotiated, negotiated_srtp) = match negotiated_res {
+            Ok(triple) => triple,
             Err(_) => {
                 if let Ok(resp) = request.create_response(488, "Not Acceptable Here") {
                     if let Ok(events) = self.transactions.send_server_response(&tx_id, resp, now) {
@@ -2686,6 +2868,10 @@ impl UserAgent {
         if let Some(call) = self.calls.get_mut(call_id) {
             call.local_sdp = Some(answer_sdp.clone());
             call.remote_sdp = Some(remote_sdp.clone());
+            if !answer_sdp.crypto.is_empty() {
+                call.local_crypto = answer_sdp.crypto.clone();
+            }
+            call.negotiated_srtp = negotiated_srtp;
             call.remote_hold = new_remote_hold;
             call.negotiated_codecs = negotiated.clone();
             if let Ok(Some(c)) = request.contact() {
@@ -2961,11 +3147,18 @@ impl UserAgent {
                 None => return,
             };
 
-        let Ok((mut answer_sdp, negotiated)) = negotiate_offer_answer(
+        let local_candidates = match self.calls.get(&call_id) {
+            Some(c) if !c.local_crypto.is_empty() => c.local_crypto.clone(),
+            _ => self.generate_sdes_candidates(&call_id),
+        };
+        let Ok((mut answer_sdp, negotiated, negotiated_srtp)) = negotiate_offer_answer_with_srtp(
             &remote_sdp,
             &self.config.supported_codecs,
             &self.config.local_host,
             local_rtp_port,
+            self.config.srtp_mode,
+            &local_candidates,
+            self.config.dtls_fingerprint.as_ref(),
         ) else {
             self.send_simple_server_response(&tx_id, &request, 488, "Not Acceptable Here", now);
             return;
@@ -2995,6 +3188,10 @@ impl UserAgent {
         if let Some(call) = self.calls.get_mut(&call_id) {
             call.local_sdp = Some(answer_sdp.clone());
             call.remote_sdp = Some(remote_sdp.clone());
+            if !answer_sdp.crypto.is_empty() {
+                call.local_crypto = answer_sdp.crypto.clone();
+            }
+            call.negotiated_srtp = negotiated_srtp;
             call.remote_hold = new_remote_hold;
             call.negotiated_codecs = negotiated.clone();
             if let Ok(Some(c)) = request.contact() {
@@ -3306,13 +3503,36 @@ impl UserAgent {
                     call.remote_hold = is_remote_hold(sdp.direction);
                     if let Some(ref local_sdp) = call.local_sdp {
                         call.negotiated_codecs = intersect_answer_codecs(local_sdp, sdp);
-                    } else if let Ok((_, negotiated)) = negotiate_offer_answer(
+                        if let Ok(srtp) =
+                            resolve_outbound_answer_srtp(local_sdp, sdp, self.config.srtp_mode)
+                        {
+                            if let Some(NegotiatedSrtp::Sdes {
+                                suite,
+                                local_key_salt,
+                                ..
+                            }) = &srtp
+                            {
+                                if let Some(ans_c) = sdp.crypto.first() {
+                                    call.local_crypto = vec![SdesCryptoAttr::new(
+                                        ans_c.tag,
+                                        *suite,
+                                        *local_key_salt,
+                                    )];
+                                }
+                            }
+                            call.negotiated_srtp = srtp;
+                        }
+                    } else if let Ok((_, negotiated, srtp)) = negotiate_offer_answer_with_srtp(
                         sdp,
                         &self.config.supported_codecs,
                         &self.config.local_host,
                         call.local_rtp_port,
+                        self.config.srtp_mode,
+                        &call.local_crypto,
+                        self.config.dtls_fingerprint.as_ref(),
                     ) {
                         call.negotiated_codecs = negotiated;
+                        call.negotiated_srtp = srtp;
                     }
                 }
 
@@ -3557,18 +3777,46 @@ impl UserAgent {
                     cancelling_race = true;
                 } else if let Some(remote_sdp) = parse_optional_sdp(&response.body) {
                     if let Some(local_sdp) = call.local_sdp.clone() {
-                        let negotiated = intersect_answer_codecs(&local_sdp, &remote_sdp);
-                        let prev_remote_hold = call.remote_hold;
-                        let new_remote_hold = is_remote_hold(remote_sdp.direction);
-                        call.remote_sdp = Some(remote_sdp.clone());
-                        call.remote_hold = new_remote_hold;
-                        call.negotiated_codecs = negotiated.clone();
-                        call.state = CallState::Established;
-                        established_payload = Some((local_sdp, remote_sdp, negotiated));
-                        if (is_reinvite && new_remote_hold != prev_remote_hold)
-                            || (!is_reinvite && new_remote_hold)
-                        {
-                            hold_change_payload = Some((call.local_hold, new_remote_hold));
+                        match resolve_outbound_answer_srtp(
+                            &local_sdp,
+                            &remote_sdp,
+                            self.config.srtp_mode,
+                        ) {
+                            Ok(srtp) => {
+                                if let Some(NegotiatedSrtp::Sdes {
+                                    suite,
+                                    local_key_salt,
+                                    ..
+                                }) = &srtp
+                                {
+                                    if let Some(ans_c) = remote_sdp.crypto.first() {
+                                        call.local_crypto = vec![SdesCryptoAttr::new(
+                                            ans_c.tag,
+                                            *suite,
+                                            *local_key_salt,
+                                        )];
+                                    }
+                                }
+                                call.negotiated_srtp = srtp;
+                                let negotiated = intersect_answer_codecs(&local_sdp, &remote_sdp);
+                                let prev_remote_hold = call.remote_hold;
+                                let new_remote_hold = is_remote_hold(remote_sdp.direction);
+                                call.remote_sdp = Some(remote_sdp.clone());
+                                call.remote_hold = new_remote_hold;
+                                call.negotiated_codecs = negotiated.clone();
+                                call.state = CallState::Established;
+                                established_payload = Some((local_sdp, remote_sdp, negotiated));
+                                if (is_reinvite && new_remote_hold != prev_remote_hold)
+                                    || (!is_reinvite && new_remote_hold)
+                                {
+                                    hold_change_payload = Some((call.local_hold, new_remote_hold));
+                                }
+                            }
+                            Err(err) => {
+                                self.pending_events
+                                    .push_back(UaEvent::ProtocolWarning(err.to_string()));
+                                cancelling_race = true;
+                            }
                         }
                     }
                 }
@@ -3802,6 +4050,13 @@ impl UserAgent {
                     if let (Some(local_sdp), Some(remote_sdp)) =
                         (call.local_sdp.clone(), parse_optional_sdp(&response.body))
                     {
+                        if let Ok(srtp) = resolve_outbound_answer_srtp(
+                            &local_sdp,
+                            &remote_sdp,
+                            self.config.srtp_mode,
+                        ) {
+                            call.negotiated_srtp = srtp;
+                        }
                         let negotiated = intersect_answer_codecs(&local_sdp, &remote_sdp);
                         let prev_remote_hold = call.remote_hold;
                         let new_remote_hold = is_remote_hold(remote_sdp.direction);

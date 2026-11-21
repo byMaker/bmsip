@@ -10,7 +10,7 @@ use std::sync::Mutex;
 use std::time::Duration;
 
 use bmsip_engine::bmsip_core::dialog::{RegistrationState, UaConfig};
-use bmsip_engine::bmsip_core::sdp::RtpCodec;
+use bmsip_engine::bmsip_core::sdp::{RtpCodec, SrtpMode};
 use bmsip_engine::bmsip_core::sip::{SipTransport, SipUri};
 use bmsip_engine::bmsip_media::DtmfDigit;
 use bmsip_engine::{
@@ -62,6 +62,36 @@ impl FfiTransport {
             Self::Udp => SipTransport::Udp,
             Self::Tcp => SipTransport::Tcp,
             Self::Tls => SipTransport::Tls,
+        }
+    }
+}
+
+/// SRTP media encryption mode matching `FfiSrtpMode` in `bmsip.udl`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FfiSrtpMode {
+    Disabled,
+    SdesOptional,
+    SdesRequired,
+    DtlsSrtp,
+}
+
+impl FfiSrtpMode {
+    /// Parses a case-insensitive SRTP mode string (`"off"`, `"optional"`, `"sdes"`, `"dtls"`).
+    pub fn parse_str(raw: &str) -> Option<Self> {
+        match SrtpMode::parse(raw).ok()? {
+            SrtpMode::Disabled => Some(Self::Disabled),
+            SrtpMode::SdesOptional => Some(Self::SdesOptional),
+            SrtpMode::SdesRequired => Some(Self::SdesRequired),
+            SrtpMode::DtlsSrtp => Some(Self::DtlsSrtp),
+        }
+    }
+
+    fn to_srtp_mode(self) -> SrtpMode {
+        match self {
+            Self::Disabled => SrtpMode::Disabled,
+            Self::SdesOptional => SrtpMode::SdesOptional,
+            Self::SdesRequired => SrtpMode::SdesRequired,
+            Self::DtlsSrtp => SrtpMode::DtlsSrtp,
         }
     }
 }
@@ -182,6 +212,27 @@ impl BmsipClient {
         tls_ca_pem: Option<String>,
         tls_insecure: bool,
     ) -> Result<Self, FfiError> {
+        Self::new_with_security(
+            config,
+            sample_rate_hz,
+            transport,
+            FfiSrtpMode::Disabled,
+            tls_ca_pem,
+            tls_insecure,
+        )
+    }
+
+    /// Creates and starts a new [`BmsipClient`] with explicit PCM bridge rate, SIP transport (`Udp`/`Tcp`/`Tls`),
+    /// SRTP media encryption mode (`Disabled`/`SdesOptional`/`SdesRequired`/`DtlsSrtp`), optional PEM CA trust bundle,
+    /// and optional insecure TLS bypass flag.
+    pub fn new_with_security(
+        config: FfiConfig,
+        sample_rate_hz: u32,
+        transport: FfiTransport,
+        srtp_mode: FfiSrtpMode,
+        tls_ca_pem: Option<String>,
+        tls_insecure: bool,
+    ) -> Result<Self, FfiError> {
         if !matches!(sample_rate_hz, 8_000 | 16_000 | 48_000) {
             return Err(FfiError::InvalidArgument(format!(
                 "unsupported audio sample_rate_hz {sample_rate_hz} (expected 8000, 16000, or 48000)"
@@ -203,7 +254,8 @@ impl BmsipClient {
             config.bind_ip,
             config.sip_port,
         )
-        .with_transport(transport.to_sip_transport());
+        .with_transport(transport.to_sip_transport())
+        .with_srtp_mode(srtp_mode.to_srtp_mode());
         if config.enable_opus {
             ua_cfg.supported_codecs = vec![
                 RtpCodec::opus(),

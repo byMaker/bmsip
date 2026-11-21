@@ -13,6 +13,13 @@ enum FfiTransport {
     "Tls",
 };
 
+enum FfiSrtpMode {
+    "Disabled",
+    "SdesOptional",
+    "SdesRequired",
+    "DtlsSrtp",
+};
+
 dictionary FfiConfig {
     string username;
     string password;
@@ -64,6 +71,16 @@ interface BmsipClient {
         FfiConfig config,
         u32 sample_rate_hz,
         FfiTransport transport,
+        string? tls_ca_pem,
+        boolean tls_insecure
+    );
+
+    [Name=with_security, Throws=FfiError]
+    constructor(
+        FfiConfig config,
+        u32 sample_rate_hz,
+        FfiTransport transport,
+        FfiSrtpMode srtp_mode,
         string? tls_ca_pem,
         boolean tls_insecure
     );

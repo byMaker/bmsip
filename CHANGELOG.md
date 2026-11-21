@@ -5,6 +5,16 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.13.0] - 2026-11-21
+
+### Added
+- **SRTP & SRTCP (RFC 3711) with SDES (RFC 4568) & DTLS-SRTP (RFC 5763 / RFC 5764) (`bmsip-core`, `bmsip-media`, `bmsip-engine`, `bmsip-ffi`, `bmsip-cli`):**
+  - Added SDP media profiles (`SdpMediaProfile`: `RTP/AVP`, `RTP/SAVP`, `UDP/TLS/RTP/SAVP`), SRTP suites (`SrtpSuite`: `AES_CM_128_HMAC_SHA1_80`, `AES_CM_128_HMAC_SHA1_32`), RFC 4568 SDES `a=crypto:` parser/generator (`SdesCryptoAttr` with pure-Rust Base64 and deterministic SHA-256 seed derivation), RFC 4145/5763 `a=setup:` (`DtlsSetupRole`), RFC 4572/5763 `a=fingerprint:sha-256` (`DtlsFingerprint::sha256_from_der`), `SrtpMode` (`Disabled`, `SdesOptional`, `SdesRequired`, `DtlsSrtp`), and `negotiate_offer_answer_with_srtp` / `resolve_outbound_answer_srtp` in `bmsip-core::sdp`.
+  - Implemented 100% pure Safe Rust (`#![forbid(unsafe_code)]`, zero external crate dependencies) RFC 3711 SRTP & SRTCP engine (`bmsip_media::srtp`: FIPS 197 AES-128 block & counter-mode cipher, FIPS 180-4 SHA-1, RFC 2104 HMAC-SHA1, RFC 3711 §4.3.1 KDF verified against RFC 3711 Appendix B.3 test vectors, 48-bit ROC estimation, 64-packet sliding replay window, constant-time tag verification, and RFC 5764 §4.2 60-byte DTLS-SRTP exporter key splitter) wired directly into `MediaSession`.
+  - Implemented pure-Rust DTLS-SRTP media handshake (`bmsip_engine::dtls`: `DtlsIdentity`, `DtlsSrtpSession`, RFC 5764 §5.1.2 UDP media port demultiplexing `20..=63` vs `128..=191`, mutual X.509 certificate SHA-256 fingerprint verification against SDP `a=fingerprint:`, and RFC 5705 `"EXTRACTOR-dtls_srtp"` key derivation) in `bmsip-engine`.
+  - Exposed `FfiSrtpMode` (`Disabled`, `SdesOptional`, `SdesRequired`, `DtlsSrtp`) and `BmsipClient::new_with_security` (`[Name=with_security]` in `bmsip.udl`), C99 `bmsip_client_new_secure` in `include/bmsip.h`, and `--srtp off|optional|sdes|dtls` in `bmsip-cli call` and `bmsip-cli listen`.
+  - Enabled `asterisk-srtp` (`res_srtp.so`) and dedicated SDES-SRTP endpoint `1004` (`media_encryption=sdes`) in the Docker Compose `asterisk` lab container, verified with live Asterisk TLS + SDES-SRTP Echo calls and P2P DTLS-SRTP calls (including MITM fingerprint mismatch rejection).
+
 ## [0.12.0] - 2026-11-21
 
 ### Added

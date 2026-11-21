@@ -2,6 +2,8 @@
 //! INVARIANTS: Zero OS audio or socket APIs; operates strictly on byte slices and 20 ms `i16` PCM frames; routes DTMF payload type to `DtmfDetector`, G.711, G.722, Opus, and custom plugin payload types to `AdaptiveJitterBuffer`.
 //! RFC_REFS: RFC 3389, RFC 3550, RFC 3551, RFC 4733, RFC 7587.
 
+use bmsip_core::sdp::SrtpSuite;
+
 use crate::cn::{ComfortNoiseGenerator, ComfortNoisePacket, CN_PAYLOAD_TYPE};
 use crate::codec::G711Kind;
 use crate::dtmf::{DtmfDetector, DtmfDigit, DtmfEventPayload, DtmfSender};
@@ -18,6 +20,7 @@ use crate::opus::{
 use crate::plugin::AudioCodecPlugin;
 use crate::rtcp::{RtcpPacket, RtpStreamStats};
 use crate::rtp::{RtpPacketRef, RtpPacketizer};
+use crate::srtp::SrtpContext;
 
 /// Active audio codec selected for [`MediaSession`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -86,6 +89,8 @@ pub struct MediaSession {
     dtmf_detector: DtmfDetector,
     cn_generator: ComfortNoiseGenerator,
     remote_ssrc: Option<u32>,
+    srtp_tx: Option<SrtpContext>,
+    srtp_rx: Option<SrtpContext>,
 }
 
 impl MediaSession {
@@ -131,6 +136,8 @@ impl MediaSession {
             dtmf_detector: DtmfDetector::new(),
             cn_generator: ComfortNoiseGenerator::new(),
             remote_ssrc: None,
+            srtp_tx: None,
+            srtp_rx: None,
         }
     }
 
@@ -172,6 +179,44 @@ impl MediaSession {
     pub fn with_cn_payload_type(mut self, payload_type: u8) -> Self {
         self.cn_payload_type = payload_type;
         self
+    }
+
+    /// Configures outbound TX and inbound RX RFC 3711 SRTP/SRTCP keys using builder style.
+    pub fn with_srtp_keys(
+        mut self,
+        suite: SrtpSuite,
+        tx_key_salt: &[u8; 30],
+        rx_key_salt: &[u8; 30],
+    ) -> Self {
+        self.set_srtp_keys(suite, tx_key_salt, rx_key_salt);
+        self
+    }
+
+    /// Installs or updates outbound TX and inbound RX RFC 3711 SRTP/SRTCP contexts (e.g., from SDES or DTLS-SRTP).
+    pub fn set_srtp_keys(
+        &mut self,
+        suite: SrtpSuite,
+        tx_key_salt: &[u8; 30],
+        rx_key_salt: &[u8; 30],
+    ) {
+        self.srtp_tx = Some(SrtpContext::from_key_salt(suite, tx_key_salt));
+        self.srtp_rx = Some(SrtpContext::from_key_salt(suite, rx_key_salt));
+    }
+
+    /// Clears any installed SRTP/SRTCP keys, reverting to plain RTP/RTCP.
+    pub fn clear_srtp(&mut self) {
+        self.srtp_tx = None;
+        self.srtp_rx = None;
+    }
+
+    /// Returns `true` when SRTP media encryption is active on this session.
+    pub fn is_srtp_active(&self) -> bool {
+        self.srtp_tx.is_some() && self.srtp_rx.is_some()
+    }
+
+    /// Returns the active [`SrtpSuite`] if SRTP is enabled on this session.
+    pub fn srtp_suite(&self) -> Option<SrtpSuite> {
+        self.srtp_tx.as_ref().map(SrtpContext::suite)
     }
 
     /// Replaces the active [`OpusCodecBackend`].
@@ -287,9 +332,14 @@ impl MediaSession {
                 }
             }
         };
-        Ok(self
+        let rtp_pkt = self
             .packetizer
-            .next_packet_bytes(&encoded, ts_advance, false))
+            .next_packet_bytes(&encoded, ts_advance, false);
+        if let Some(srtp) = self.srtp_tx.as_mut() {
+            srtp.protect_rtp(&rtp_pkt)
+        } else {
+            Ok(rtp_pkt)
+        }
     }
 
     /// Queues an outbound RFC 4733 DTMF tone at the current media timestamp scaled by `dtmf_clock_rate_hz`.
@@ -299,16 +349,20 @@ impl MediaSession {
             .queue_digit_with_clock_rate(digit, ts, self.dtmf_clock_rate_hz);
     }
 
-    /// Pops the next queued RFC 4733 DTMF RTP datagram for paced 20 ms transmission.
+    /// Pops the next queued RFC 4733 DTMF RTP (or SRTP) datagram for paced 20 ms transmission.
     pub fn pop_dtmf_packet(&mut self) -> Option<Vec<u8>> {
-        self.dtmf_sender.pop_packet().map(|spec| {
+        self.dtmf_sender.pop_packet().and_then(|spec| {
             let payload = spec.payload.to_bytes();
-            self.packetizer.build_custom_packet_bytes(
+            let raw = self.packetizer.build_custom_packet_bytes(
                 self.dtmf_payload_type,
                 spec.timestamp,
                 spec.marker,
                 &payload,
-            )
+            );
+            match self.srtp_tx.as_mut() {
+                Some(srtp) => srtp.protect_rtp(&raw).ok(),
+                None => Some(raw),
+            }
         })
     }
 
@@ -334,7 +388,7 @@ impl MediaSession {
         Ok(self.build_comfort_noise_packet(sid.noise_level_dbov, &sid.spectral_params))
     }
 
-    /// Builds an outbound RFC 3389 Comfort Noise (`CN`) RTP SID packet with explicit `-dBov` and spectral parameters.
+    /// Builds an outbound RFC 3389 Comfort Noise (`CN`) RTP (or SRTP) SID packet with explicit `-dBov` and spectral parameters.
     pub fn build_comfort_noise_packet(
         &mut self,
         noise_level_dbov: u8,
@@ -343,17 +397,32 @@ impl MediaSession {
         let sid = ComfortNoisePacket::new(noise_level_dbov)
             .with_spectral_params(spectral_params.to_vec());
         let ts = self.packetizer.current_timestamp();
-        self.packetizer
-            .build_custom_packet_bytes(self.cn_payload_type, ts, false, &sid.to_bytes())
+        let raw = self.packetizer.build_custom_packet_bytes(
+            self.cn_payload_type,
+            ts,
+            false,
+            &sid.to_bytes(),
+        );
+        match self.srtp_tx.as_mut() {
+            Some(srtp) => srtp.protect_rtp(&raw).unwrap_or(raw),
+            None => raw,
+        }
     }
 
-    /// Processes an inbound RTP packet without intermediate payload allocations, updating RTCP stats and pushing decoded PCM or detecting DTMF.
+    /// Processes an inbound RTP (or SRTP) packet without intermediate payload allocations, updating RTCP stats and pushing decoded PCM or detecting DTMF.
     pub fn receive_rtp(
         &mut self,
         raw: &[u8],
         arrival_timestamp_samples: u32,
     ) -> Result<Option<DtmfDigit>, MediaError> {
-        let pkt = RtpPacketRef::parse(raw)?;
+        let decrypted_buf;
+        let rtp_bytes = if let Some(srtp) = self.srtp_rx.as_mut() {
+            decrypted_buf = srtp.unprotect_rtp(raw)?;
+            decrypted_buf.as_slice()
+        } else {
+            raw
+        };
+        let pkt = RtpPacketRef::parse(rtp_bytes)?;
         // RFC 3550: a mid-call SSRC change (e.g., PBX bridge/transfer) starts a fresh sequence/timestamp domain.
         if let Some(prev_ssrc) = self.remote_ssrc {
             if prev_ssrc != pkt.ssrc {
@@ -442,9 +511,16 @@ impl MediaSession {
         Ok(None)
     }
 
-    /// Processes an inbound compound RTCP datagram, recording any Sender Report NTP timestamps (`LSR`).
+    /// Processes an inbound compound RTCP (or SRTCP) datagram, recording any Sender Report NTP timestamps (`LSR`).
     pub fn receive_rtcp(&mut self, raw: &[u8]) -> Result<usize, MediaError> {
-        let packets = RtcpPacket::parse_compound(raw)?;
+        let decrypted_buf;
+        let rtcp_bytes = if let Some(srtp) = self.srtp_rx.as_mut() {
+            decrypted_buf = srtp.unprotect_rtcp(raw)?;
+            decrypted_buf.as_slice()
+        } else {
+            raw
+        };
+        let packets = RtcpPacket::parse_compound(rtcp_bytes)?;
         let count = packets.len();
         for pkt in packets {
             if let RtcpPacket::SenderReport { sender_info, .. } = pkt {
@@ -470,17 +546,21 @@ impl MediaSession {
         frame
     }
 
-    /// Builds an RTCP Receiver Report (`RR`) packet and advances RFC 3550 §6.4.1 interval loss counters.
+    /// Builds an RTCP (or SRTCP when SRTP is active) Receiver Report (`RR`) packet and advances RFC 3550 §6.4.1 interval loss counters.
     pub fn build_rtcp_receiver_report(&mut self) -> Vec<u8> {
         let reports = match self.remote_ssrc {
             Some(rssrc) => vec![self.stats.build_reception_report(rssrc)],
             None => Vec::new(),
         };
-        RtcpPacket::ReceiverReport {
+        let raw = RtcpPacket::ReceiverReport {
             ssrc: self.packetizer.ssrc(),
             reports,
         }
-        .to_bytes()
+        .to_bytes();
+        match self.srtp_tx.as_mut() {
+            Some(srtp) => srtp.protect_rtcp(&raw).unwrap_or(raw),
+            None => raw,
+        }
     }
 
     /// Builds a non-mutating snapshot RTCP Receiver Report (`RR`) packet without advancing interval counters.

@@ -9,11 +9,11 @@ use bmsip_ffi::bmsip_engine::bmsip_media::WavPcm16;
 use bmsip_ffi::{
     bmsip_client_attended_transfer, bmsip_client_audio_sample_rate_hz, bmsip_client_dial,
     bmsip_client_free, bmsip_client_hangup, bmsip_client_hold, bmsip_client_new,
-    bmsip_client_new_ex, bmsip_client_new_transport, bmsip_client_poll_event_json,
-    bmsip_client_pop_pcm, bmsip_client_push_pcm, bmsip_client_register, bmsip_client_resume_call,
-    bmsip_client_ring_early_media, bmsip_client_send_info_dtmf, bmsip_client_transfer,
-    bmsip_client_unregister, bmsip_string_free, BmsipClient, FfiConfig, FfiEvent, FfiEventKind,
-    FfiTransport,
+    bmsip_client_new_ex, bmsip_client_new_secure, bmsip_client_new_transport,
+    bmsip_client_poll_event_json, bmsip_client_pop_pcm, bmsip_client_push_pcm,
+    bmsip_client_register, bmsip_client_resume_call, bmsip_client_ring_early_media,
+    bmsip_client_send_info_dtmf, bmsip_client_transfer, bmsip_client_unregister, bmsip_string_free,
+    BmsipClient, FfiConfig, FfiEvent, FfiEventKind, FfiSrtpMode, FfiTransport,
 };
 
 #[test]
@@ -23,12 +23,14 @@ fn udl_schema_matches_rust_sdk_surface() {
         "namespace bmsip",
         "enum FfiError",
         "enum FfiTransport",
+        "enum FfiSrtpMode",
         "dictionary FfiConfig",
         "enum FfiEventKind",
         "dictionary FfiEvent",
         "interface BmsipClient",
         "with_sample_rate",
         "with_transport",
+        "with_security",
         "audio_sample_rate_hz()",
         "register_account()",
         "unregister_account()",
@@ -706,5 +708,93 @@ fn ffi_and_c_api_tls_transport_live_asterisk_call() {
             }
         }
         bmsip_client_free(handle);
+
+        // 3. C99 ABI `bmsip_client_new_secure` with TLS + SDES-SRTP on Asterisk endpoint 1004.
+        let u4 = CString::new("1004").unwrap();
+        let p4 = CString::new("secret1004").unwrap();
+        let r_tls = CString::new("asterisk:5061").unwrap();
+        let tls_t = CString::new("tls").unwrap();
+        let srtp_sdes = CString::new("sdes").unwrap();
+        let bad_srtp = CString::new("unknown_srtp").unwrap();
+        assert!(bmsip_client_new_secure(
+            u4.as_ptr(),
+            p4.as_ptr(),
+            d.as_ptr(),
+            r_tls.as_ptr(),
+            b.as_ptr(),
+            0,
+            1,
+            8_000,
+            tls_t.as_ptr(),
+            bad_srtp.as_ptr(),
+            ptr::null(),
+            1,
+        )
+        .is_null());
+
+        let sec_handle = bmsip_client_new_secure(
+            u4.as_ptr(),
+            p4.as_ptr(),
+            d.as_ptr(),
+            r_tls.as_ptr(),
+            b.as_ptr(),
+            0,
+            1,
+            8_000,
+            tls_t.as_ptr(),
+            srtp_sdes.as_ptr(),
+            ptr::null(),
+            1,
+        );
+        assert!(!sec_handle.is_null());
+        bmsip_client_free(sec_handle);
     }
+
+    // 4. Safe Rust / UniFFI `BmsipClient::new_with_security` (TLS + SDES-SRTP) against Asterisk 1004 -> 601 Echo.
+    let srtp_client = BmsipClient::new_with_security(
+        FfiConfig {
+            username: "1004".to_string(),
+            password: "secret1004".to_string(),
+            domain: "asterisk".to_string(),
+            registrar_addr: "asterisk:5061".to_string(),
+            bind_ip: "0.0.0.0".to_string(),
+            sip_port: 0,
+            enable_opus: true,
+        },
+        8_000,
+        FfiTransport::Tls,
+        FfiSrtpMode::SdesRequired,
+        None,
+        true,
+    )
+    .unwrap();
+    srtp_client.register_account().unwrap();
+    let mut srtp_reg = false;
+    let sdl = Instant::now() + Duration::from_secs(10);
+    while Instant::now() < sdl {
+        if let Some(ev) = srtp_client.poll_event(50) {
+            if ev.kind == FfiEventKind::RegistrationChanged
+                && ev
+                    .detail
+                    .as_deref()
+                    .is_some_and(|d| d.starts_with("Registered"))
+            {
+                srtp_reg = true;
+                break;
+            }
+        }
+    }
+    assert!(srtp_reg, "BmsipClient 1004 TLS+SRTP failed to register");
+    srtp_client.unregister_account().unwrap();
+    let udl = Instant::now() + Duration::from_secs(4);
+    while Instant::now() < udl {
+        if let Some(ev) = srtp_client.poll_event(50) {
+            if ev.kind == FfiEventKind::RegistrationChanged
+                && ev.detail.as_deref() == Some("Unregistered")
+            {
+                break;
+            }
+        }
+    }
+    srtp_client.shutdown();
 }

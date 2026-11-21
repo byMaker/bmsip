@@ -13,7 +13,7 @@ use std::thread;
 use std::time::{Duration, Instant};
 
 use bmsip_engine::bmsip_core::dialog::{RegistrationState, UaConfig};
-use bmsip_engine::bmsip_core::sdp::RtpCodec;
+use bmsip_engine::bmsip_core::sdp::{RtpCodec, SrtpMode};
 use bmsip_engine::bmsip_core::sip::{SipTransport, SipUri};
 use bmsip_engine::bmsip_media::{DtmfDigit, WavPcm16};
 use bmsip_engine::{
@@ -141,6 +141,7 @@ struct CallCliArgs {
     password: String,
     target: String,
     transport: SipTransport,
+    srtp_mode: SrtpMode,
     tls_ca: Option<String>,
     tls_server_name: Option<String>,
     tls_insecure: bool,
@@ -164,6 +165,7 @@ struct ListenCliArgs {
     user: String,
     password: String,
     transport: SipTransport,
+    srtp_mode: SrtpMode,
     tls_ca: Option<String>,
     tls_server_name: Option<String>,
     tls_insecure: bool,
@@ -224,6 +226,7 @@ fn print_usage() {
            bmsip-cli interop [--asterisk <host:port>] [--freeswitch <host:port>] [--kamailio <host:port>] [--duration-ms <ms>]\n\n\
          OPTIONS:\n  \
            --transport <proto>    SIP signaling transport: udp (default), tcp, or tls\n  \
+           --srtp <mode>          SRTP media encryption: off (default), optional, sdes, or dtls\n  \
            --tls-ca <path>        PEM CA certificate bundle for TLS server verification\n  \
            --tls-server-name <hn> Explicit TLS SNI / certificate hostname override\n  \
            --tls-insecure         Disable TLS certificate verification (lab/self-signed servers only)\n  \
@@ -267,6 +270,7 @@ fn parse_call_args(args: &[String]) -> Result<CallCliArgs, String> {
     let mut password: Option<String> = None;
     let mut target: Option<String> = None;
     let mut transport = SipTransport::Udp;
+    let mut srtp_mode = SrtpMode::Disabled;
     let mut tls_ca: Option<String> = None;
     let mut tls_server_name: Option<String> = None;
     let mut tls_insecure = false;
@@ -293,6 +297,10 @@ fn parse_call_args(args: &[String]) -> Result<CallCliArgs, String> {
             "--target" => target = Some(next_arg_value(args, &mut i, "--target")?),
             "--transport" => {
                 transport = parse_transport_arg(&next_arg_value(args, &mut i, "--transport")?)?
+            }
+            "--srtp" => {
+                srtp_mode = SrtpMode::parse(&next_arg_value(args, &mut i, "--srtp")?)
+                    .map_err(|e| e.to_string())?
             }
             "--tls-ca" => tls_ca = Some(next_arg_value(args, &mut i, "--tls-ca")?),
             "--tls-server-name" => {
@@ -342,6 +350,7 @@ fn parse_call_args(args: &[String]) -> Result<CallCliArgs, String> {
         password: password.ok_or_else(|| "missing --password".to_string())?,
         target: target.ok_or_else(|| "missing --target".to_string())?,
         transport,
+        srtp_mode,
         tls_ca,
         tls_server_name,
         tls_insecure,
@@ -365,6 +374,7 @@ fn parse_listen_args(args: &[String]) -> Result<ListenCliArgs, String> {
     let mut user: Option<String> = None;
     let mut password: Option<String> = None;
     let mut transport = SipTransport::Udp;
+    let mut srtp_mode = SrtpMode::Disabled;
     let mut tls_ca: Option<String> = None;
     let mut tls_server_name: Option<String> = None;
     let mut tls_insecure = false;
@@ -384,6 +394,10 @@ fn parse_listen_args(args: &[String]) -> Result<ListenCliArgs, String> {
             "--password" => password = Some(next_arg_value(args, &mut i, "--password")?),
             "--transport" => {
                 transport = parse_transport_arg(&next_arg_value(args, &mut i, "--transport")?)?
+            }
+            "--srtp" => {
+                srtp_mode = SrtpMode::parse(&next_arg_value(args, &mut i, "--srtp")?)
+                    .map_err(|e| e.to_string())?
             }
             "--tls-ca" => tls_ca = Some(next_arg_value(args, &mut i, "--tls-ca")?),
             "--tls-server-name" => {
@@ -413,6 +427,7 @@ fn parse_listen_args(args: &[String]) -> Result<ListenCliArgs, String> {
         user: user.ok_or_else(|| "missing --user".to_string())?,
         password: password.ok_or_else(|| "missing --password".to_string())?,
         transport,
+        srtp_mode,
         tls_ca,
         tls_server_name,
         tls_insecure,
@@ -617,6 +632,7 @@ fn execute_outbound_session(
     password: &str,
     target: &str,
     transport: SipTransport,
+    srtp_mode: SrtpMode,
     tls_config: TlsConfig,
     duration_ms: u64,
     codec: CodecChoice,
@@ -638,7 +654,8 @@ fn execute_outbound_session(
     let target_uri = SipUri::parse(target).map_err(|e| e.to_string())?;
 
     let mut ua_cfg = UaConfig::new(user, password, server_host, registrar_uri, "0.0.0.0", 0)
-        .with_transport(transport);
+        .with_transport(transport)
+        .with_srtp_mode(srtp_mode);
     ua_cfg.supported_codecs = codec.supported_codecs();
     let eng_cfg = EngineConfig::new(ua_cfg, registrar_addr, IpAddr::V4(Ipv4Addr::UNSPECIFIED), 0)
         .with_tls_config(tls_config);
@@ -824,6 +841,7 @@ fn run_call(cli: CallCliArgs) -> Result<(), String> {
         &cli.password,
         &cli.target,
         cli.transport,
+        cli.srtp_mode,
         tls_config,
         cli.duration_ms,
         cli.codec,
@@ -860,7 +878,8 @@ fn run_listen(cli: ListenCliArgs) -> Result<(), String> {
         "0.0.0.0",
         0,
     )
-    .with_transport(cli.transport);
+    .with_transport(cli.transport)
+    .with_srtp_mode(cli.srtp_mode);
     ua_cfg.supported_codecs = cli.codec.supported_codecs();
     let eng_cfg = EngineConfig::new(ua_cfg, registrar_addr, IpAddr::V4(Ipv4Addr::UNSPECIFIED), 0)
         .with_tls_config(tls_config);
@@ -1045,6 +1064,7 @@ fn run_selftest(cli: SelftestCliArgs) -> Result<(), String> {
             &cli.password,
             &target,
             SipTransport::Udp,
+            SrtpMode::Disabled,
             TlsConfig::default(),
             cli.duration_ms,
             case.codec,
@@ -1447,6 +1467,7 @@ fn run_interop(cli: InteropCliArgs) -> Result<(), String> {
                     "secret1001",
                     &target,
                     SipTransport::Udp,
+                    SrtpMode::Disabled,
                     TlsConfig::default(),
                     cli.duration_ms,
                     codec,
@@ -1570,6 +1591,8 @@ mod tests {
             "sip:1002@asterisk:5060",
             "--transport",
             "tls",
+            "--srtp",
+            "sdes",
             "--tls-ca",
             "/etc/ssl/ca.pem",
             "--tls-server-name",
@@ -1580,6 +1603,7 @@ mod tests {
         assert_eq!(parsed.server, "asterisk:5060");
         assert_eq!(parsed.user, "1001");
         assert_eq!(parsed.transport, SipTransport::Tls);
+        assert_eq!(parsed.srtp_mode, SrtpMode::SdesRequired);
         assert_eq!(parsed.tls_ca.as_deref(), Some("/etc/ssl/ca.pem"));
         assert_eq!(parsed.tls_server_name.as_deref(), Some("asterisk"));
         assert!(parsed.tls_insecure);

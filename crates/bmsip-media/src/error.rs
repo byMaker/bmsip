@@ -14,6 +14,7 @@ pub enum MediaError {
     UnsupportedCodec(String),
     InvalidWav(String),
     BufferError(String),
+    SrtpError(String),
 }
 
 impl fmt::Display for MediaError {
@@ -26,6 +27,7 @@ impl fmt::Display for MediaError {
             Self::UnsupportedCodec(msg) => write!(f, "unsupported media codec: {msg}"),
             Self::InvalidWav(msg) => write!(f, "invalid WAV data: {msg}"),
             Self::BufferError(msg) => write!(f, "media buffer error: {msg}"),
+            Self::SrtpError(msg) => write!(f, "SRTP/SRTCP error: {msg}"),
         }
     }
 }

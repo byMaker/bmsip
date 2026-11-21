@@ -7,7 +7,7 @@ use std::os::raw::c_char;
 use std::ptr;
 use std::slice;
 
-use crate::client::{BmsipClient, FfiConfig, FfiTransport};
+use crate::client::{BmsipClient, FfiConfig, FfiSrtpMode, FfiTransport};
 
 /// Opaque C handle representing a [`BmsipClient`] instance.
 pub struct BmsipClientHandle {
@@ -121,6 +121,46 @@ pub unsafe extern "C" fn bmsip_client_new_transport(
     tls_ca_pem: *const c_char,
     tls_insecure: i32,
 ) -> *mut BmsipClientHandle {
+    unsafe {
+        bmsip_client_new_secure(
+            username,
+            password,
+            domain,
+            registrar_addr,
+            bind_ip,
+            sip_port,
+            enable_opus,
+            sample_rate_hz,
+            transport,
+            ptr::null(),
+            tls_ca_pem,
+            tls_insecure,
+        )
+    }
+}
+
+/// Allocates and starts a new SIP client handle with explicit SIP transport (`"udp"`, `"tcp"`, `"tls"`),
+/// SRTP media encryption mode (`"off"`, `"optional"`, `"sdes"`, `"dtls"`, nullable -> `"off"`),
+/// optional PEM CA certificate bundle (`tls_ca_pem`, nullable), and optional insecure TLS bypass (`tls_insecure != 0`).
+///
+/// # Safety
+/// All non-null string pointers must be valid null-terminated UTF-8 C strings.
+#[no_mangle]
+#[allow(clippy::too_many_arguments)]
+pub unsafe extern "C" fn bmsip_client_new_secure(
+    username: *const c_char,
+    password: *const c_char,
+    domain: *const c_char,
+    registrar_addr: *const c_char,
+    bind_ip: *const c_char,
+    sip_port: u16,
+    enable_opus: i32,
+    sample_rate_hz: u32,
+    transport: *const c_char,
+    srtp_mode: *const c_char,
+    tls_ca_pem: *const c_char,
+    tls_insecure: i32,
+) -> *mut BmsipClientHandle {
     let (Some(u), Some(p), Some(d), Some(r), Some(b)) = (
         unsafe { cstr_to_string(username) },
         unsafe { cstr_to_string(password) },
@@ -138,6 +178,17 @@ pub unsafe extern "C" fn bmsip_client_new_transport(
             return ptr::null_mut();
         };
         let Some(parsed) = FfiTransport::parse_str(&t_str) else {
+            return ptr::null_mut();
+        };
+        parsed
+    };
+    let srtp = if srtp_mode.is_null() {
+        FfiSrtpMode::Disabled
+    } else {
+        let Some(s_str) = (unsafe { cstr_to_string(srtp_mode) }) else {
+            return ptr::null_mut();
+        };
+        let Some(parsed) = FfiSrtpMode::parse_str(&s_str) else {
             return ptr::null_mut();
         };
         parsed
@@ -161,10 +212,11 @@ pub unsafe extern "C" fn bmsip_client_new_transport(
         enable_opus: enable_opus != 0,
     };
 
-    match BmsipClient::new_with_transport(
+    match BmsipClient::new_with_security(
         cfg,
         sample_rate_hz,
         transport_mode,
+        srtp,
         ca_pem,
         tls_insecure != 0,
     ) {
