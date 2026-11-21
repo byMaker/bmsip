@@ -58,7 +58,7 @@ Built-in adapters: `NullAudioPort`, `WavAudioPort`/`WavAudioHandle` (supports `8
 
 - **Out-of-Order Reordering, Non-Audio Sequence Skipping & Mid-Call SSRC Changes:** Handles 16-bit RTP sequence rollover (RFC 3550 §5.1), skips non-audio RTP sequence numbers (`mark_non_audio_seq`, e.g., RFC 4733 DTMF) without synthesizing false PLC frames, and automatically resets sequence/jitter state when the remote RTP SSRC changes mid-call.
 - **Dynamic Depth Adaptation & Excess-Depth Shrinking:** Scales buffered target depth between `[min_depth_frames, max_depth_frames]` using RFC 3550 jitter estimates (`scaled_jitter` adjusted when `AudioPort` sample rate differs from RTP clock rate) and smoothly drains buffered frames exceeding `target_depth_frames + 2` after transient bursts subside.
-- **Decayed PLC & Boundary Crossfade:** Missing frames replay an attenuated copy (`7/8` exponential decay) of the last good frame; normal and concealed boundaries crossfade smoothly over up to 24 samples from `last_emitted_sample` to prevent audible phase clicks.
+- **Decayed PLC & Boundary Crossfade:** Missing frames replay an attenuated copy (`3/4` per-frame amplitude decay) of the last good frame; normal and concealed boundaries crossfade smoothly over up to 32 samples (`(frame_samples / 8).min(32)`) from `last_emitted_sample` to prevent audible phase clicks.
 
 ---
 

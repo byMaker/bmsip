@@ -36,31 +36,32 @@ impl Default for RfcTimers {
 
 impl RfcTimers {
     fn safe_t1(self) -> Duration {
-        self.t1.max(Duration::from_millis(1))
+        self.t1
+            .clamp(Duration::from_millis(1), Duration::from_secs(60))
     }
 
     fn safe_t2(self) -> Duration {
-        self.t2.max(self.safe_t1())
+        self.t2.max(self.safe_t1()).min(Duration::from_secs(300))
     }
 
     fn timer_b(self) -> Duration {
-        self.safe_t1() * 64
+        self.safe_t1().saturating_mul(64)
     }
 
     fn timer_f(self) -> Duration {
-        self.safe_t1() * 64
+        self.safe_t1().saturating_mul(64)
     }
 
     fn timer_h(self) -> Duration {
-        self.safe_t1() * 64
+        self.safe_t1().saturating_mul(64)
     }
 
     fn timer_j(self) -> Duration {
-        self.safe_t1() * 64
+        self.safe_t1().saturating_mul(64)
     }
 
     fn timer_l(self) -> Duration {
-        self.safe_t1() * 64
+        self.safe_t1().saturating_mul(64)
     }
 }
 
@@ -918,11 +919,7 @@ impl TransactionManager {
                 let tx = if req.method == Method::Invite {
                     ServerTx::Invite(ServerInviteTransaction::new(reliable))
                 } else {
-                    ServerTx::NonInvite(ServerNonInviteTransaction::new(
-                        reliable,
-                        now,
-                        self.timers,
-                    ))
+                    ServerTx::NonInvite(ServerNonInviteTransaction::new(reliable, now, self.timers))
                 };
                 self.server_txs.insert(tx_id.clone(), tx);
                 events.push(TransactionEvent::ServerRequest {
@@ -1175,7 +1172,9 @@ mod tests {
 
         let _ = server.receive_message(SipMessage::Request(opt_req), t0);
         assert_eq!(server.active_server_count(), 1);
-        let dl = server.poll_timeout().expect("expected NIST lifetime deadline");
+        let dl = server
+            .poll_timeout()
+            .expect("expected NIST lifetime deadline");
         let term_evs = server.handle_timeout(dl);
         assert!(term_evs
             .iter()

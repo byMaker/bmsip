@@ -5,6 +5,19 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.15.1] - 2026-11-21
+
+### Fixed
+- **Panic Isolation Across Thread & C-API Boundaries (`bmsip-ffi`, `bmsip-engine`):**
+  - Wrapped every `#[no_mangle] pub unsafe extern "C" fn` entrypoint in [`c_api.rs`](crates/bmsip-ffi/src/c_api.rs) with `std::panic::catch_unwind` (`ffi_guard_*`), guaranteeing Rust panics never unwind across FFI boundaries into C/C++/Swift/Kotlin hosts.
+  - Wrapped `run_worker` inside `SipEngine::spawn` with `catch_unwind`; if the worker thread ever panics, it safely emits `EngineEvent::Warning` + `EngineEvent::Stopped`, wakes receivers (recovering cleanly from poisoned event mutexes), and marks the command channel closed so subsequent `SipEngine::send_command` calls return `Err(EngineError::ChannelClosed)` cleanly.
+- **Debug-Safe Arithmetic & Timer Clamping (`bmsip-core`, `bmsip-media`):**
+  - Replaced potential overflowing `cycles + seq` / `+ 1` arithmetic in `RtpStreamStats` ([rtcp.rs](crates/bmsip-media/src/rtcp.rs)) and `AdaptiveJitterBuffer` ([jitter.rs](crates/bmsip-media/src/jitter.rs)) with `wrapping_*` / `saturating_*` operations.
+  - Clamped `RfcTimers` bounds (`safe_t1` `1 ms..=60 s`, `safe_t2` up to `300 s`) and switched `timer_b/f/h/j/l` and UAS `2xx` ACK deadlines in [transaction/mod.rs](crates/bmsip-core/src/transaction/mod.rs) and [dialog/mod.rs](crates/bmsip-core/src/dialog/mod.rs) to `.saturating_mul(64)`.
+
+### Documentation
+- Finalized [ARCHITECTURE.md](ARCHITECTURE.md) (`v0.15.0`/`v0.15.1` release history, removed resolved `TODO` markers and documented explicit PBX/SBC deployment scope), [README.md](README.md) (`0.15.1`), [docs/SDK_GUIDE.md](docs/SDK_GUIDE.md) (Production Deployment Checklist), [docs/CODECS_AND_AUDIO.md](docs/CODECS_AND_AUDIO.md) (exact `3/4` PLC decay and `32`-sample crossfade parameters), and [docs/CLI_AND_TESTING.md](docs/CLI_AND_TESTING.md) (current integration suite coverage).
+
 ## [0.15.0] - 2026-11-21
 
 ### Added

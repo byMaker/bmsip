@@ -97,7 +97,7 @@ impl AdaptiveJitterBuffer {
         let highest_low16 = (self.highest_ext_seq & 0xffff) as u16;
         let diff = seq.wrapping_sub(highest_low16) as i16;
         if diff >= 0 {
-            let candidate = self.highest_ext_seq + u32::from(diff as u16);
+            let candidate = self.highest_ext_seq.saturating_add(u32::from(diff as u16));
             self.highest_ext_seq = candidate;
             candidate
         } else {
@@ -112,7 +112,7 @@ impl AdaptiveJitterBuffer {
                 self.skipped_seqs.remove(&first);
             } else if first == self.next_playout_seq {
                 self.skipped_seqs.remove(&first);
-                self.next_playout_seq += 1;
+                self.next_playout_seq = self.next_playout_seq.saturating_add(1);
             } else {
                 break;
             }
@@ -147,7 +147,7 @@ impl AdaptiveJitterBuffer {
         if !self.initialized {
             self.initialized = true;
             // Anchor around 0x0001_0000 so slightly out-of-order negative offsets stay non-negative.
-            let anchor = 0x0001_0000u32 + u32::from(seq);
+            let anchor = 0x0001_0000u32.saturating_add(u32::from(seq));
             self.highest_ext_seq = anchor;
             self.next_playout_seq = anchor;
             self.frames.insert(anchor, pcm_frame);
@@ -157,11 +157,11 @@ impl AdaptiveJitterBuffer {
         let ext_seq = self.extend_seq(seq);
 
         if ext_seq < self.next_playout_seq {
-            self.late_drops += 1;
+            self.late_drops = self.late_drops.saturating_add(1);
             return;
         }
         if self.frames.contains_key(&ext_seq) {
-            self.duplicate_drops += 1;
+            self.duplicate_drops = self.duplicate_drops.saturating_add(1);
             return;
         }
         self.skipped_seqs.remove(&ext_seq);
@@ -173,7 +173,7 @@ impl AdaptiveJitterBuffer {
             if let Some((&oldest_seq, _)) = self.frames.iter().next() {
                 self.frames.remove(&oldest_seq);
                 if oldest_seq >= self.next_playout_seq {
-                    self.next_playout_seq = oldest_seq + 1;
+                    self.next_playout_seq = oldest_seq.saturating_add(1);
                 }
             } else {
                 break;
@@ -206,7 +206,7 @@ impl AdaptiveJitterBuffer {
                 if let Some(&oldest_seq) = self.frames.keys().next() {
                     self.frames.remove(&oldest_seq);
                     if oldest_seq >= self.next_playout_seq {
-                        self.next_playout_seq = oldest_seq + 1;
+                        self.next_playout_seq = oldest_seq.saturating_add(1);
                         self.advance_skipped_seqs();
                     }
                 }
@@ -216,7 +216,7 @@ impl AdaptiveJitterBuffer {
         }
 
         if let Some(mut pcm) = self.frames.remove(&self.next_playout_seq) {
-            self.next_playout_seq += 1;
+            self.next_playout_seq = self.next_playout_seq.saturating_add(1);
             self.last_good_frame = pcm.clone();
             if self.consecutive_concealed > 0 && self.config.frame_samples >= 16 {
                 let fade_len = (self.config.frame_samples / 8).min(32);
@@ -233,9 +233,9 @@ impl AdaptiveJitterBuffer {
             return PlayoutFrame::Buffering(vec![0; self.config.frame_samples]);
         }
 
-        self.next_playout_seq += 1;
-        self.consecutive_concealed += 1;
-        self.concealed_frames += 1;
+        self.next_playout_seq = self.next_playout_seq.saturating_add(1);
+        self.consecutive_concealed = self.consecutive_concealed.saturating_add(1);
+        self.concealed_frames = self.concealed_frames.saturating_add(1);
 
         for sample in &mut self.last_good_frame {
             *sample = ((*sample as i32 * 3) / 4) as i16;

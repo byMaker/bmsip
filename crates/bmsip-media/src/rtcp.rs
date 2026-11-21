@@ -495,9 +495,9 @@ impl RtpStreamStats {
         if !self.initialized {
             return 0;
         }
-        let extended_max = self.cycles + u32::from(self.max_seq);
-        let expected = extended_max.saturating_sub(self.base_seq) + 1;
-        expected as i32 - self.received as i32
+        let extended_max = self.cycles.wrapping_add(u32::from(self.max_seq));
+        let expected = extended_max.wrapping_sub(self.base_seq).saturating_add(1);
+        (i64::from(expected) - i64::from(self.received)).clamp(-8_388_608, 8_388_607) as i32
     }
 
     /// Builds a non-mutating [`ReceptionReportBlock`] snapshot for `source_ssrc` with `DLSR = 0`.
@@ -512,12 +512,12 @@ impl RtpStreamStats {
         now_ms: Option<u64>,
     ) -> ReceptionReportBlock {
         let extended_max = if self.initialized {
-            self.cycles + u32::from(self.max_seq)
+            self.cycles.wrapping_add(u32::from(self.max_seq))
         } else {
             0
         };
         let expected = if self.initialized {
-            extended_max.saturating_sub(self.base_seq) + 1
+            extended_max.wrapping_sub(self.base_seq).saturating_add(1)
         } else {
             0
         };
@@ -561,7 +561,10 @@ impl RtpStreamStats {
     ) -> ReceptionReportBlock {
         let block = self.snapshot_reception_report_at(source_ssrc, now_ms);
         if self.initialized {
-            self.expected_prior = block.extended_highest_seq.saturating_sub(self.base_seq) + 1;
+            self.expected_prior = block
+                .extended_highest_seq
+                .wrapping_sub(self.base_seq)
+                .saturating_add(1);
             self.received_prior = self.received;
         }
         block
@@ -654,5 +657,22 @@ mod tests {
         let report = stats.build_reception_report_at(0x5555, Some(2_500));
         assert_eq!(report.lsr, 0x0304_0506);
         assert_eq!(report.dlsr, 98_304);
+    }
+
+    #[test]
+    fn stream_stats_cycles_near_u32_max_do_not_overflow_in_debug() {
+        let mut stats = RtpStreamStats {
+            initialized: true,
+            base_seq: 10,
+            max_seq: 65_530,
+            cycles: u32::MAX - 0x0001_0000,
+            received: 1_000,
+            ..RtpStreamStats::new()
+        };
+        // Wraps past u32::MAX cycles without debug panic on +1 or extended_max.
+        stats.record_packet(2, 320, 320);
+        let report = stats.build_reception_report(0x7777);
+        assert_eq!(report.extended_highest_seq, 0x0000_0001);
+        let _ = stats.cumulative_lost();
     }
 }

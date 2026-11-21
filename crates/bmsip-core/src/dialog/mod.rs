@@ -1157,7 +1157,7 @@ impl UserAgent {
                 response: resp,
                 next_send_at: now + t1,
                 interval: t1,
-                deadline: now + t1 * 64,
+                deadline: now + t1.min(Duration::from_secs(60)).saturating_mul(64),
             });
         }
 
@@ -2494,7 +2494,12 @@ impl UserAgent {
         reason: Option<ReasonHeader>,
         now: Instant,
     ) -> Result<(), SipError> {
-        let cancel_dl = now + self.config.timers.t1.max(Duration::from_millis(1)) * 64;
+        let cancel_t1 = self
+            .config
+            .timers
+            .t1
+            .clamp(Duration::from_millis(1), Duration::from_secs(60));
+        let cancel_dl = now + cancel_t1.saturating_mul(64);
         let orig_req = {
             let call = self
                 .calls
@@ -3090,7 +3095,7 @@ impl UserAgent {
                 response: resp,
                 next_send_at: now + t1,
                 interval: t1,
-                deadline: now + t1 * 64,
+                deadline: now + t1.min(Duration::from_secs(60)).saturating_mul(64),
             });
         }
 

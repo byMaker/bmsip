@@ -236,3 +236,12 @@ When backgrounded on iOS or Android:
   ]
 }
 ```
+
+---
+
+## 6. Production Deployment Checklist
+
+- **Release Builds:** Compile production binaries and `.so`/`.a` FFI libraries with `cargo build --release` (all internal queues and RTP hot paths run zero-panic, with `extern "C"` entrypoints and the worker loop isolated via `catch_unwind`).
+- **PBX / SBC Settings:** Because `bmsip` targets PBX/SBC deployments without client-side STUN/TURN/ICE, enable symmetric RTP, rport, and contact rewriting (`rtp_symmetric=yes`, `rewrite_contact=yes`, `force_rport=yes` on Asterisk `pjsip.conf` or equivalent SBC settings).
+- **20 ms Audio Framing:** Keep `a=ptime:20` on trunks and implement `AudioPort` / `push_captured_pcm` with fixed 20 ms mono `i16` frames matching `8000`, `16000`, or `48000` Hz.
+- **Graceful Teardown:** Before calling `SipEngine::shutdown` or `bmsip_client_free`, send `Hangup` for active calls and `Unregister` if registered so remote legs terminate immediately instead of waiting for session/RTP timeouts.

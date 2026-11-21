@@ -82,18 +82,18 @@ pub struct EngineEventReceiver {
 impl EngineEventReceiver {
     /// Pops the next available [`EngineEvent`] without blocking.
     pub fn try_recv(&self) -> Option<EngineEvent> {
-        let mut guard = self.shared.events.lock().ok()?;
+        let mut guard = self.shared.events.lock().unwrap_or_else(|e| e.into_inner());
         guard.0.pop_front()
     }
 
     /// Waits up to `timeout` for the next [`EngineEvent`].
     pub fn recv_timeout(&self, timeout: Duration) -> Option<EngineEvent> {
-        let guard = self.shared.events.lock().ok()?;
+        let guard = self.shared.events.lock().unwrap_or_else(|e| e.into_inner());
         let (mut guard, _) = self
             .shared
             .event_cv
             .wait_timeout_while(guard, timeout, |state| state.0.is_empty() && !state.1)
-            .ok()?;
+            .unwrap_or_else(|e| e.into_inner());
         guard.0.pop_front()
     }
 }
@@ -157,17 +157,32 @@ impl SipEngine {
         });
 
         let worker_shared = Arc::clone(&shared);
+        let panic_shared = Arc::clone(&shared);
         let worker = thread::Builder::new()
             .name("bmsip-engine".to_string())
             .spawn(move || {
-                run_worker(
-                    config,
-                    sip_transport,
-                    advertised_addr,
-                    audio_port,
-                    opus_available,
-                    worker_shared,
-                );
+                let res = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                    run_worker(
+                        config,
+                        sip_transport,
+                        advertised_addr,
+                        audio_port,
+                        opus_available,
+                        worker_shared,
+                    );
+                }));
+                if res.is_err() {
+                    let mut guard = panic_shared
+                        .events
+                        .lock()
+                        .unwrap_or_else(|e| e.into_inner());
+                    guard.0.push_back(EngineEvent::Warning(
+                        "engine worker panicked and stopped".to_string(),
+                    ));
+                    guard.0.push_back(EngineEvent::Stopped);
+                    guard.1 = true;
+                    panic_shared.event_cv.notify_all();
+                }
             })
             .map_err(|e| EngineError::Io(e.to_string()))?;
 
@@ -186,11 +201,29 @@ impl SipEngine {
 
     /// Enqueues a non-blocking command to the engine worker and wakes it immediately.
     pub fn send_command(&self, cmd: EngineCommand) -> Result<(), EngineError> {
+        if self
+            .shared
+            .events
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .1
+        {
+            return Err(EngineError::ChannelClosed);
+        }
         let mut guard = self
             .shared
             .commands
             .lock()
             .map_err(|_| EngineError::ChannelClosed)?;
+        if self
+            .shared
+            .events
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .1
+        {
+            return Err(EngineError::ChannelClosed);
+        }
         guard.push_back(cmd);
         self.shared.cmd_cv.notify_one();
         Ok(())
@@ -198,18 +231,18 @@ impl SipEngine {
 
     /// Pops the next available [`EngineEvent`] without blocking.
     pub fn try_recv_event(&self) -> Option<EngineEvent> {
-        let mut guard = self.shared.events.lock().ok()?;
+        let mut guard = self.shared.events.lock().unwrap_or_else(|e| e.into_inner());
         guard.0.pop_front()
     }
 
     /// Waits up to `timeout` for the next [`EngineEvent`].
     pub fn recv_event_timeout(&self, timeout: Duration) -> Option<EngineEvent> {
-        let guard = self.shared.events.lock().ok()?;
+        let guard = self.shared.events.lock().unwrap_or_else(|e| e.into_inner());
         let (mut guard, _) = self
             .shared
             .event_cv
             .wait_timeout_while(guard, timeout, |state| state.0.is_empty() && !state.1)
-            .ok()?;
+            .unwrap_or_else(|e| e.into_inner());
         guard.0.pop_front()
     }
 
@@ -1639,9 +1672,7 @@ impl WorkerCtx {
                 let rx_count = media.session.stats().received_count();
                 if rx_count >= 20 && (!media.initial_rtcp_sent || now >= media.next_rtcp_at) {
                     let now_ms = now.saturating_duration_since(media.started_at).as_millis() as u64;
-                    let rr = media
-                        .session
-                        .build_rtcp_receiver_report_at(Some(now_ms));
+                    let rr = media.session.build_rtcp_receiver_report_at(Some(now_ms));
                     if rtcp_sock.send_to(&rr, media.remote_rtcp).is_ok() {
                         media.initial_rtcp_sent = true;
                         media.next_rtcp_at = now + Duration::from_millis(RTCP_REPORT_INTERVAL_MS);
@@ -1813,9 +1844,8 @@ fn bind_rtp_socket(
         }
         fallback = Some((rtp_sock, port));
     }
-    let (rtp_sock, port) = fallback.ok_or_else(|| {
-        EngineError::Io("failed to bind ephemeral RTP UDP socket".to_string())
-    })?;
+    let (rtp_sock, port) = fallback
+        .ok_or_else(|| EngineError::Io("failed to bind ephemeral RTP UDP socket".to_string()))?;
     let rtcp_sock = port
         .checked_add(1)
         .and_then(|rtcp_port| UdpSocket::bind((target_ip, rtcp_port)).ok())

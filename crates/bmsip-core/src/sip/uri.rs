@@ -103,7 +103,9 @@ impl SipUri {
                 .next()
                 .map(str::trim)
                 .filter(|s| !s.is_empty())
-                .ok_or_else(|| SipError::InvalidUri(format!("empty tel subscriber in '{trimmed}'")))?;
+                .ok_or_else(|| {
+                    SipError::InvalidUri(format!("empty tel subscriber in '{trimmed}'"))
+                })?;
             if subscriber.chars().any(char::is_whitespace) || subscriber.contains('?') {
                 return Err(SipError::InvalidUri(format!(
                     "invalid tel subscriber '{subscriber}' in '{trimmed}'"
@@ -399,10 +401,7 @@ mod tests {
         assert_eq!(uri.port, None);
         assert_eq!(uri.param("phone-context"), Some(Some("+1")));
         assert_eq!(uri.param("isub"), Some(Some("123")));
-        assert_eq!(
-            uri.to_string(),
-            "tel:+1-555-0100;phone-context=+1;isub=123"
-        );
+        assert_eq!(uri.to_string(), "tel:+1-555-0100;phone-context=+1;isub=123");
         assert!(SipUri::parse("tel:").is_err());
         assert!(SipUri::parse("tel:;phone-context=+1").is_err());
     }

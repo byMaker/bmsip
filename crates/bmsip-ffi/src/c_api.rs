@@ -4,10 +4,27 @@
 
 use std::ffi::{CStr, CString};
 use std::os::raw::c_char;
+use std::panic::{catch_unwind, AssertUnwindSafe};
 use std::ptr;
 use std::slice;
 
 use crate::client::{BmsipClient, FfiConfig, FfiSrtpMode, FfiTransport};
+
+fn ffi_guard_i32(f: impl FnOnce() -> i32) -> i32 {
+    catch_unwind(AssertUnwindSafe(f)).unwrap_or(-1)
+}
+
+fn ffi_guard_u32(f: impl FnOnce() -> u32) -> u32 {
+    catch_unwind(AssertUnwindSafe(f)).unwrap_or(0)
+}
+
+fn ffi_guard_ptr<T>(f: impl FnOnce() -> *mut T) -> *mut T {
+    catch_unwind(AssertUnwindSafe(f)).unwrap_or(ptr::null_mut())
+}
+
+fn ffi_guard_unit(f: impl FnOnce()) {
+    let _ = catch_unwind(AssertUnwindSafe(f));
+}
 
 /// Opaque C handle representing a [`BmsipClient`] instance.
 pub struct BmsipClientHandle {
@@ -46,7 +63,7 @@ pub unsafe extern "C" fn bmsip_client_new(
     bind_ip: *const c_char,
     sip_port: u16,
 ) -> *mut BmsipClientHandle {
-    unsafe {
+    ffi_guard_ptr(|| unsafe {
         bmsip_client_new_ex(
             username,
             password,
@@ -57,7 +74,7 @@ pub unsafe extern "C" fn bmsip_client_new(
             0,
             8_000,
         )
-    }
+    })
 }
 
 /// Allocates and starts a new SIP client handle with explicit Opus toggle and PCM bridge sample rate (`8000`, `16000`, or `48000` Hz).
@@ -75,30 +92,32 @@ pub unsafe extern "C" fn bmsip_client_new_ex(
     enable_opus: i32,
     sample_rate_hz: u32,
 ) -> *mut BmsipClientHandle {
-    let (Some(u), Some(p), Some(d), Some(r), Some(b)) = (
-        unsafe { cstr_to_string(username) },
-        unsafe { cstr_to_string(password) },
-        unsafe { cstr_to_string(domain) },
-        unsafe { cstr_to_string(registrar_addr) },
-        unsafe { cstr_to_string(bind_ip) },
-    ) else {
-        return ptr::null_mut();
-    };
+    ffi_guard_ptr(|| {
+        let (Some(u), Some(p), Some(d), Some(r), Some(b)) = (
+            unsafe { cstr_to_string(username) },
+            unsafe { cstr_to_string(password) },
+            unsafe { cstr_to_string(domain) },
+            unsafe { cstr_to_string(registrar_addr) },
+            unsafe { cstr_to_string(bind_ip) },
+        ) else {
+            return ptr::null_mut();
+        };
 
-    let cfg = FfiConfig {
-        username: u,
-        password: p,
-        domain: d,
-        registrar_addr: r,
-        bind_ip: b,
-        sip_port,
-        enable_opus: enable_opus != 0,
-    };
+        let cfg = FfiConfig {
+            username: u,
+            password: p,
+            domain: d,
+            registrar_addr: r,
+            bind_ip: b,
+            sip_port,
+            enable_opus: enable_opus != 0,
+        };
 
-    match BmsipClient::new_with_sample_rate(cfg, sample_rate_hz) {
-        Ok(client) => Box::into_raw(Box::new(BmsipClientHandle { inner: client })),
-        Err(_) => ptr::null_mut(),
-    }
+        match BmsipClient::new_with_sample_rate(cfg, sample_rate_hz) {
+            Ok(client) => Box::into_raw(Box::new(BmsipClientHandle { inner: client })),
+            Err(_) => ptr::null_mut(),
+        }
+    })
 }
 
 /// Allocates and starts a new SIP client handle with explicit SIP transport (`"udp"`, `"tcp"`, `"tls"`),
@@ -121,7 +140,7 @@ pub unsafe extern "C" fn bmsip_client_new_transport(
     tls_ca_pem: *const c_char,
     tls_insecure: i32,
 ) -> *mut BmsipClientHandle {
-    unsafe {
+    ffi_guard_ptr(|| unsafe {
         bmsip_client_new_secure(
             username,
             password,
@@ -136,7 +155,7 @@ pub unsafe extern "C" fn bmsip_client_new_transport(
             tls_ca_pem,
             tls_insecure,
         )
-    }
+    })
 }
 
 /// Allocates and starts a new SIP client handle with explicit SIP transport (`"udp"`, `"tcp"`, `"tls"`),
@@ -161,68 +180,70 @@ pub unsafe extern "C" fn bmsip_client_new_secure(
     tls_ca_pem: *const c_char,
     tls_insecure: i32,
 ) -> *mut BmsipClientHandle {
-    let (Some(u), Some(p), Some(d), Some(r), Some(b)) = (
-        unsafe { cstr_to_string(username) },
-        unsafe { cstr_to_string(password) },
-        unsafe { cstr_to_string(domain) },
-        unsafe { cstr_to_string(registrar_addr) },
-        unsafe { cstr_to_string(bind_ip) },
-    ) else {
-        return ptr::null_mut();
-    };
+    ffi_guard_ptr(|| {
+        let (Some(u), Some(p), Some(d), Some(r), Some(b)) = (
+            unsafe { cstr_to_string(username) },
+            unsafe { cstr_to_string(password) },
+            unsafe { cstr_to_string(domain) },
+            unsafe { cstr_to_string(registrar_addr) },
+            unsafe { cstr_to_string(bind_ip) },
+        ) else {
+            return ptr::null_mut();
+        };
 
-    let transport_mode = if transport.is_null() {
-        FfiTransport::Udp
-    } else {
-        let Some(t_str) = (unsafe { cstr_to_string(transport) }) else {
-            return ptr::null_mut();
+        let transport_mode = if transport.is_null() {
+            FfiTransport::Udp
+        } else {
+            let Some(t_str) = (unsafe { cstr_to_string(transport) }) else {
+                return ptr::null_mut();
+            };
+            let Some(parsed) = FfiTransport::parse_str(&t_str) else {
+                return ptr::null_mut();
+            };
+            parsed
         };
-        let Some(parsed) = FfiTransport::parse_str(&t_str) else {
-            return ptr::null_mut();
+        let srtp = if srtp_mode.is_null() {
+            FfiSrtpMode::Disabled
+        } else {
+            let Some(s_str) = (unsafe { cstr_to_string(srtp_mode) }) else {
+                return ptr::null_mut();
+            };
+            let Some(parsed) = FfiSrtpMode::parse_str(&s_str) else {
+                return ptr::null_mut();
+            };
+            parsed
         };
-        parsed
-    };
-    let srtp = if srtp_mode.is_null() {
-        FfiSrtpMode::Disabled
-    } else {
-        let Some(s_str) = (unsafe { cstr_to_string(srtp_mode) }) else {
-            return ptr::null_mut();
+        let ca_pem = if tls_ca_pem.is_null() {
+            None
+        } else {
+            match unsafe { cstr_to_string(tls_ca_pem) } {
+                Some(s) => Some(s),
+                None => return ptr::null_mut(),
+            }
         };
-        let Some(parsed) = FfiSrtpMode::parse_str(&s_str) else {
-            return ptr::null_mut();
+
+        let cfg = FfiConfig {
+            username: u,
+            password: p,
+            domain: d,
+            registrar_addr: r,
+            bind_ip: b,
+            sip_port,
+            enable_opus: enable_opus != 0,
         };
-        parsed
-    };
-    let ca_pem = if tls_ca_pem.is_null() {
-        None
-    } else {
-        match unsafe { cstr_to_string(tls_ca_pem) } {
-            Some(s) => Some(s),
-            None => return ptr::null_mut(),
+
+        match BmsipClient::new_with_security(
+            cfg,
+            sample_rate_hz,
+            transport_mode,
+            srtp,
+            ca_pem,
+            tls_insecure != 0,
+        ) {
+            Ok(client) => Box::into_raw(Box::new(BmsipClientHandle { inner: client })),
+            Err(_) => ptr::null_mut(),
         }
-    };
-
-    let cfg = FfiConfig {
-        username: u,
-        password: p,
-        domain: d,
-        registrar_addr: r,
-        bind_ip: b,
-        sip_port,
-        enable_opus: enable_opus != 0,
-    };
-
-    match BmsipClient::new_with_security(
-        cfg,
-        sample_rate_hz,
-        transport_mode,
-        srtp,
-        ca_pem,
-        tls_insecure != 0,
-    ) {
-        Ok(client) => Box::into_raw(Box::new(BmsipClientHandle { inner: client })),
-        Err(_) => ptr::null_mut(),
-    }
+    })
 }
 
 /// Returns the configured mono PCM bridge sample rate in Hz (`8000`, `16000`, or `48000`), or `0` if `client` is null.
@@ -233,10 +254,12 @@ pub unsafe extern "C" fn bmsip_client_new_secure(
 pub unsafe extern "C" fn bmsip_client_audio_sample_rate_hz(
     client: *const BmsipClientHandle,
 ) -> u32 {
-    let Some(c) = (unsafe { client_ref(client) }) else {
-        return 0;
-    };
-    c.audio_sample_rate_hz()
+    ffi_guard_u32(|| {
+        let Some(c) = (unsafe { client_ref(client) }) else {
+            return 0;
+        };
+        c.audio_sample_rate_hz()
+    })
 }
 
 /// Triggers account registration (`0` on success, `-1` on error).
@@ -245,14 +268,16 @@ pub unsafe extern "C" fn bmsip_client_audio_sample_rate_hz(
 /// `client` must be a valid handle created by `bmsip_client_new`.
 #[no_mangle]
 pub unsafe extern "C" fn bmsip_client_register(client: *const BmsipClientHandle) -> i32 {
-    let Some(c) = (unsafe { client_ref(client) }) else {
-        return -1;
-    };
-    if c.register_account().is_ok() {
-        0
-    } else {
-        -1
-    }
+    ffi_guard_i32(|| {
+        let Some(c) = (unsafe { client_ref(client) }) else {
+            return -1;
+        };
+        if c.register_account().is_ok() {
+            0
+        } else {
+            -1
+        }
+    })
 }
 
 /// Triggers account de-registration (`0` on success, `-1` on error).
@@ -261,14 +286,16 @@ pub unsafe extern "C" fn bmsip_client_register(client: *const BmsipClientHandle)
 /// `client` must be a valid handle created by `bmsip_client_new`.
 #[no_mangle]
 pub unsafe extern "C" fn bmsip_client_unregister(client: *const BmsipClientHandle) -> i32 {
-    let Some(c) = (unsafe { client_ref(client) }) else {
-        return -1;
-    };
-    if c.unregister_account().is_ok() {
-        0
-    } else {
-        -1
-    }
+    ffi_guard_i32(|| {
+        let Some(c) = (unsafe { client_ref(client) }) else {
+            return -1;
+        };
+        if c.unregister_account().is_ok() {
+            0
+        } else {
+            -1
+        }
+    })
 }
 
 /// Dials a target SIP URI (`0` on success, `-1` on error).
@@ -280,16 +307,18 @@ pub unsafe extern "C" fn bmsip_client_dial(
     client: *const BmsipClientHandle,
     target_uri: *const c_char,
 ) -> i32 {
-    let (Some(c), Some(uri)) = (unsafe { client_ref(client) }, unsafe {
-        cstr_to_string(target_uri)
-    }) else {
-        return -1;
-    };
-    if c.dial(uri).is_ok() {
-        0
-    } else {
-        -1
-    }
+    ffi_guard_i32(|| {
+        let (Some(c), Some(uri)) = (unsafe { client_ref(client) }, unsafe {
+            cstr_to_string(target_uri)
+        }) else {
+            return -1;
+        };
+        if c.dial(uri).is_ok() {
+            0
+        } else {
+            -1
+        }
+    })
 }
 
 /// Sends `180 Ringing` on an inbound call (`0` on success, `-1` on error).
@@ -301,16 +330,18 @@ pub unsafe extern "C" fn bmsip_client_ring(
     client: *const BmsipClientHandle,
     call_id: *const c_char,
 ) -> i32 {
-    let (Some(c), Some(cid)) = (unsafe { client_ref(client) }, unsafe {
-        cstr_to_string(call_id)
-    }) else {
-        return -1;
-    };
-    if c.ring(cid).is_ok() {
-        0
-    } else {
-        -1
-    }
+    ffi_guard_i32(|| {
+        let (Some(c), Some(cid)) = (unsafe { client_ref(client) }, unsafe {
+            cstr_to_string(call_id)
+        }) else {
+            return -1;
+        };
+        if c.ring(cid).is_ok() {
+            0
+        } else {
+            -1
+        }
+    })
 }
 
 /// Answers an inbound call (`0` on success, `-1` on error).
@@ -322,16 +353,18 @@ pub unsafe extern "C" fn bmsip_client_answer(
     client: *const BmsipClientHandle,
     call_id: *const c_char,
 ) -> i32 {
-    let (Some(c), Some(cid)) = (unsafe { client_ref(client) }, unsafe {
-        cstr_to_string(call_id)
-    }) else {
-        return -1;
-    };
-    if c.answer(cid).is_ok() {
-        0
-    } else {
-        -1
-    }
+    ffi_guard_i32(|| {
+        let (Some(c), Some(cid)) = (unsafe { client_ref(client) }, unsafe {
+            cstr_to_string(call_id)
+        }) else {
+            return -1;
+        };
+        if c.answer(cid).is_ok() {
+            0
+        } else {
+            -1
+        }
+    })
 }
 
 /// Rejects, cancels, or hangs up a call (`0` on success, `-1` on error).
@@ -343,16 +376,18 @@ pub unsafe extern "C" fn bmsip_client_hangup(
     client: *const BmsipClientHandle,
     call_id: *const c_char,
 ) -> i32 {
-    let (Some(c), Some(cid)) = (unsafe { client_ref(client) }, unsafe {
-        cstr_to_string(call_id)
-    }) else {
-        return -1;
-    };
-    if c.hangup(cid).is_ok() {
-        0
-    } else {
-        -1
-    }
+    ffi_guard_i32(|| {
+        let (Some(c), Some(cid)) = (unsafe { client_ref(client) }, unsafe {
+            cstr_to_string(call_id)
+        }) else {
+            return -1;
+        };
+        if c.hangup(cid).is_ok() {
+            0
+        } else {
+            -1
+        }
+    })
 }
 
 /// Places an established call on local hold (`a=sendonly` / `a=inactive`) (`0` on success, `-1` on error).
@@ -364,16 +399,18 @@ pub unsafe extern "C" fn bmsip_client_hold(
     client: *const BmsipClientHandle,
     call_id: *const c_char,
 ) -> i32 {
-    let (Some(c), Some(cid)) = (unsafe { client_ref(client) }, unsafe {
-        cstr_to_string(call_id)
-    }) else {
-        return -1;
-    };
-    if c.hold(cid).is_ok() {
-        0
-    } else {
-        -1
-    }
+    ffi_guard_i32(|| {
+        let (Some(c), Some(cid)) = (unsafe { client_ref(client) }, unsafe {
+            cstr_to_string(call_id)
+        }) else {
+            return -1;
+        };
+        if c.hold(cid).is_ok() {
+            0
+        } else {
+            -1
+        }
+    })
 }
 
 /// Resumes a call from local hold (`a=sendrecv`) (`0` on success, `-1` on error).
@@ -385,16 +422,18 @@ pub unsafe extern "C" fn bmsip_client_resume_call(
     client: *const BmsipClientHandle,
     call_id: *const c_char,
 ) -> i32 {
-    let (Some(c), Some(cid)) = (unsafe { client_ref(client) }, unsafe {
-        cstr_to_string(call_id)
-    }) else {
-        return -1;
-    };
-    if c.resume_call(cid).is_ok() {
-        0
-    } else {
-        -1
-    }
+    ffi_guard_i32(|| {
+        let (Some(c), Some(cid)) = (unsafe { client_ref(client) }, unsafe {
+            cstr_to_string(call_id)
+        }) else {
+            return -1;
+        };
+        if c.resume_call(cid).is_ok() {
+            0
+        } else {
+            -1
+        }
+    })
 }
 
 /// Initiates a blind call transfer (`REFER`) to `target_uri` (`0` on success, `-1` on error).
@@ -407,18 +446,20 @@ pub unsafe extern "C" fn bmsip_client_transfer(
     call_id: *const c_char,
     target_uri: *const c_char,
 ) -> i32 {
-    let (Some(c), Some(cid), Some(uri)) = (
-        unsafe { client_ref(client) },
-        unsafe { cstr_to_string(call_id) },
-        unsafe { cstr_to_string(target_uri) },
-    ) else {
-        return -1;
-    };
-    if c.transfer(cid, uri).is_ok() {
-        0
-    } else {
-        -1
-    }
+    ffi_guard_i32(|| {
+        let (Some(c), Some(cid), Some(uri)) = (
+            unsafe { client_ref(client) },
+            unsafe { cstr_to_string(call_id) },
+            unsafe { cstr_to_string(target_uri) },
+        ) else {
+            return -1;
+        };
+        if c.transfer(cid, uri).is_ok() {
+            0
+        } else {
+            -1
+        }
+    })
 }
 
 /// Initiates an attended call transfer (`REFER` with `?Replaces=...`) bridging `call_id` to `target_call_id` (`0` on success, `-1` on error).
@@ -431,18 +472,20 @@ pub unsafe extern "C" fn bmsip_client_attended_transfer(
     call_id: *const c_char,
     target_call_id: *const c_char,
 ) -> i32 {
-    let (Some(c), Some(cid), Some(tcid)) = (
-        unsafe { client_ref(client) },
-        unsafe { cstr_to_string(call_id) },
-        unsafe { cstr_to_string(target_call_id) },
-    ) else {
-        return -1;
-    };
-    if c.attended_transfer(cid, tcid).is_ok() {
-        0
-    } else {
-        -1
-    }
+    ffi_guard_i32(|| {
+        let (Some(c), Some(cid), Some(tcid)) = (
+            unsafe { client_ref(client) },
+            unsafe { cstr_to_string(call_id) },
+            unsafe { cstr_to_string(target_call_id) },
+        ) else {
+            return -1;
+        };
+        if c.attended_transfer(cid, tcid).is_ok() {
+            0
+        } else {
+            -1
+        }
+    })
 }
 
 /// Transmits an RFC 4733 DTMF digit (`'0'..'9'`, `'*'`, `'#'`, `'A'..'D'`).
@@ -455,17 +498,19 @@ pub unsafe extern "C" fn bmsip_client_send_dtmf(
     call_id: *const c_char,
     digit: c_char,
 ) -> i32 {
-    let (Some(c), Some(cid)) = (unsafe { client_ref(client) }, unsafe {
-        cstr_to_string(call_id)
-    }) else {
-        return -1;
-    };
-    let ch = (digit as u8) as char;
-    if c.send_dtmf(cid, ch.to_string()).is_ok() {
-        0
-    } else {
-        -1
-    }
+    ffi_guard_i32(|| {
+        let (Some(c), Some(cid)) = (unsafe { client_ref(client) }, unsafe {
+            cstr_to_string(call_id)
+        }) else {
+            return -1;
+        };
+        let ch = (digit as u8) as char;
+        if c.send_dtmf(cid, ch.to_string()).is_ok() {
+            0
+        } else {
+            -1
+        }
+    })
 }
 
 /// Sends an RFC 2976 SIP `INFO` (`application/dtmf-relay`) DTMF digit (`'0'..'9'`, `'*'`, `'#'`, `'A'..'D'`).
@@ -479,17 +524,19 @@ pub unsafe extern "C" fn bmsip_client_send_info_dtmf(
     digit: c_char,
     duration_ms: u32,
 ) -> i32 {
-    let (Some(c), Some(cid)) = (unsafe { client_ref(client) }, unsafe {
-        cstr_to_string(call_id)
-    }) else {
-        return -1;
-    };
-    let ch = (digit as u8) as char;
-    if c.send_info_dtmf(cid, ch.to_string(), duration_ms).is_ok() {
-        0
-    } else {
-        -1
-    }
+    ffi_guard_i32(|| {
+        let (Some(c), Some(cid)) = (unsafe { client_ref(client) }, unsafe {
+            cstr_to_string(call_id)
+        }) else {
+            return -1;
+        };
+        let ch = (digit as u8) as char;
+        if c.send_info_dtmf(cid, ch.to_string(), duration_ms).is_ok() {
+            0
+        } else {
+            -1
+        }
+    })
 }
 
 /// Sends `183 Session Progress` with negotiated early-media SDP on an incoming call (`0` on success, `-1` on error).
@@ -501,16 +548,18 @@ pub unsafe extern "C" fn bmsip_client_ring_early_media(
     client: *const BmsipClientHandle,
     call_id: *const c_char,
 ) -> i32 {
-    let (Some(c), Some(cid)) = (unsafe { client_ref(client) }, unsafe {
-        cstr_to_string(call_id)
-    }) else {
-        return -1;
-    };
-    if c.ring_early_media(cid).is_ok() {
-        0
-    } else {
-        -1
-    }
+    ffi_guard_i32(|| {
+        let (Some(c), Some(cid)) = (unsafe { client_ref(client) }, unsafe {
+            cstr_to_string(call_id)
+        }) else {
+            return -1;
+        };
+        if c.ring_early_media(cid).is_ok() {
+            0
+        } else {
+            -1
+        }
+    })
 }
 
 /// Notifies the engine of a local IP/port handover (`Wi-Fi <-> LTE`).
@@ -523,16 +572,18 @@ pub unsafe extern "C" fn bmsip_client_notify_network_changed(
     bind_ip: *const c_char,
     sip_port: u16,
 ) -> i32 {
-    let (Some(c), Some(ip)) = (unsafe { client_ref(client) }, unsafe {
-        cstr_to_string(bind_ip)
-    }) else {
-        return -1;
-    };
-    if c.notify_network_changed(ip, sip_port).is_ok() {
-        0
-    } else {
-        -1
-    }
+    ffi_guard_i32(|| {
+        let (Some(c), Some(ip)) = (unsafe { client_ref(client) }, unsafe {
+            cstr_to_string(bind_ip)
+        }) else {
+            return -1;
+        };
+        if c.notify_network_changed(ip, sip_port).is_ok() {
+            0
+        } else {
+            -1
+        }
+    })
 }
 
 /// Suspends background media/refresh timers.
@@ -541,14 +592,16 @@ pub unsafe extern "C" fn bmsip_client_notify_network_changed(
 /// `client` must be a valid handle created by `bmsip_client_new`.
 #[no_mangle]
 pub unsafe extern "C" fn bmsip_client_suspend(client: *const BmsipClientHandle) -> i32 {
-    let Some(c) = (unsafe { client_ref(client) }) else {
-        return -1;
-    };
-    if c.suspend().is_ok() {
-        0
-    } else {
-        -1
-    }
+    ffi_guard_i32(|| {
+        let Some(c) = (unsafe { client_ref(client) }) else {
+            return -1;
+        };
+        if c.suspend().is_ok() {
+            0
+        } else {
+            -1
+        }
+    })
 }
 
 /// Resumes background timers and refreshes registration.
@@ -557,14 +610,16 @@ pub unsafe extern "C" fn bmsip_client_suspend(client: *const BmsipClientHandle) 
 /// `client` must be a valid handle created by `bmsip_client_new`.
 #[no_mangle]
 pub unsafe extern "C" fn bmsip_client_resume(client: *const BmsipClientHandle) -> i32 {
-    let Some(c) = (unsafe { client_ref(client) }) else {
-        return -1;
-    };
-    if c.resume().is_ok() {
-        0
-    } else {
-        -1
-    }
+    ffi_guard_i32(|| {
+        let Some(c) = (unsafe { client_ref(client) }) else {
+            return -1;
+        };
+        if c.resume().is_ok() {
+            0
+        } else {
+            -1
+        }
+    })
 }
 
 /// Pushes one 20 ms mono 16-bit PCM microphone frame matching `bmsip_client_audio_sample_rate_hz(client) / 50`.
@@ -577,23 +632,25 @@ pub unsafe extern "C" fn bmsip_client_push_pcm(
     samples: *const i16,
     len: usize,
 ) -> i32 {
-    let Some(c) = (unsafe { client_ref(client) }) else {
-        return -1;
-    };
-    if samples.is_null() {
-        return -1;
-    }
-    let expected = (c.audio_sample_rate_hz() as usize) / 50;
-    if expected == 0 || len != expected {
-        return -1;
-    }
-    // SAFETY: `len` matches exact expected 20 ms frame length and caller guarantees valid buffer of `len` elements.
-    let pcm = unsafe { slice::from_raw_parts(samples, len) };
-    if c.push_captured_pcm(pcm.to_vec()).is_ok() {
-        0
-    } else {
-        -1
-    }
+    ffi_guard_i32(|| {
+        let Some(c) = (unsafe { client_ref(client) }) else {
+            return -1;
+        };
+        if samples.is_null() {
+            return -1;
+        }
+        let expected = (c.audio_sample_rate_hz() as usize) / 50;
+        if expected == 0 || len != expected {
+            return -1;
+        }
+        // SAFETY: `len` matches exact expected 20 ms frame length and caller guarantees valid buffer of `len` elements.
+        let pcm = unsafe { slice::from_raw_parts(samples, len) };
+        if c.push_captured_pcm(pcm.to_vec()).is_ok() {
+            0
+        } else {
+            -1
+        }
+    })
 }
 
 /// Pops one 20 ms decoded mono PCM playout frame into `out_samples`.
@@ -608,26 +665,28 @@ pub unsafe extern "C" fn bmsip_client_pop_pcm(
     out_samples: *mut i16,
     capacity: usize,
 ) -> i32 {
-    let Some(c) = (unsafe { client_ref(client) }) else {
-        return -1;
-    };
-    if out_samples.is_null() {
-        return -1;
-    }
-    let expected = (c.audio_sample_rate_hz() as usize) / 50;
-    if expected == 0 || capacity < expected {
-        return -1;
-    }
-    let Some(frame) = c.pop_playout_pcm() else {
-        return 0;
-    };
-    if capacity < frame.len() {
-        return -1;
-    }
-    // SAFETY: Caller guarantees `out_samples` points to writable buffer of size >= `capacity`.
-    let dst = unsafe { slice::from_raw_parts_mut(out_samples, frame.len()) };
-    dst.copy_from_slice(&frame);
-    frame.len() as i32
+    ffi_guard_i32(|| {
+        let Some(c) = (unsafe { client_ref(client) }) else {
+            return -1;
+        };
+        if out_samples.is_null() {
+            return -1;
+        }
+        let expected = (c.audio_sample_rate_hz() as usize) / 50;
+        if expected == 0 || capacity < expected {
+            return -1;
+        }
+        let Some(frame) = c.pop_playout_pcm() else {
+            return 0;
+        };
+        if capacity < frame.len() {
+            return -1;
+        }
+        // SAFETY: Caller guarantees `out_samples` points to writable buffer of size >= `capacity`.
+        let dst = unsafe { slice::from_raw_parts_mut(out_samples, frame.len()) };
+        dst.copy_from_slice(&frame);
+        frame.len() as i32
+    })
 }
 
 /// Returns the bound local SIP address (`ip:port`) as a heap-allocated C string (`NULL` on error).
@@ -640,13 +699,15 @@ pub unsafe extern "C" fn bmsip_client_pop_pcm(
 pub unsafe extern "C" fn bmsip_client_local_sip_addr(
     client: *const BmsipClientHandle,
 ) -> *mut c_char {
-    let Some(c) = (unsafe { client_ref(client) }) else {
-        return ptr::null_mut();
-    };
-    match CString::new(c.local_sip_address()) {
-        Ok(cstr) => cstr.into_raw(),
-        Err(_) => ptr::null_mut(),
-    }
+    ffi_guard_ptr(|| {
+        let Some(c) = (unsafe { client_ref(client) }) else {
+            return ptr::null_mut();
+        };
+        match CString::new(c.local_sip_address()) {
+            Ok(cstr) => cstr.into_raw(),
+            Err(_) => ptr::null_mut(),
+        }
+    })
 }
 
 /// Requests a Flight Recorder telemetry snapshot (all calls when `call_id` is NULL/empty) via the event queue.
@@ -658,26 +719,28 @@ pub unsafe extern "C" fn bmsip_client_request_telemetry(
     client: *const BmsipClientHandle,
     call_id: *const c_char,
 ) -> i32 {
-    let Some(c) = (unsafe { client_ref(client) }) else {
-        return -1;
-    };
-    let cid = if call_id.is_null() {
-        None
-    } else {
-        let Some(s) = (unsafe { cstr_to_string(call_id) }) else {
+    ffi_guard_i32(|| {
+        let Some(c) = (unsafe { client_ref(client) }) else {
             return -1;
         };
-        if s.is_empty() {
+        let cid = if call_id.is_null() {
             None
         } else {
-            Some(s)
+            let Some(s) = (unsafe { cstr_to_string(call_id) }) else {
+                return -1;
+            };
+            if s.is_empty() {
+                None
+            } else {
+                Some(s)
+            }
+        };
+        if c.request_telemetry(cid).is_ok() {
+            0
+        } else {
+            -1
         }
-    };
-    if c.request_telemetry(cid).is_ok() {
-        0
-    } else {
-        -1
-    }
+    })
 }
 
 /// Polls the next event as a heap-allocated JSON C string (`NULL` if no event).
@@ -691,16 +754,18 @@ pub unsafe extern "C" fn bmsip_client_poll_event_json(
     client: *const BmsipClientHandle,
     timeout_ms: u32,
 ) -> *mut c_char {
-    let Some(c) = (unsafe { client_ref(client) }) else {
-        return ptr::null_mut();
-    };
-    let Some(ev) = c.poll_event(timeout_ms) else {
-        return ptr::null_mut();
-    };
-    match CString::new(ev.to_json()) {
-        Ok(cstr) => cstr.into_raw(),
-        Err(_) => ptr::null_mut(),
-    }
+    ffi_guard_ptr(|| {
+        let Some(c) = (unsafe { client_ref(client) }) else {
+            return ptr::null_mut();
+        };
+        let Some(ev) = c.poll_event(timeout_ms) else {
+            return ptr::null_mut();
+        };
+        match CString::new(ev.to_json()) {
+            Ok(cstr) => cstr.into_raw(),
+            Err(_) => ptr::null_mut(),
+        }
+    })
 }
 
 /// Frees a C string previously returned by `bmsip_client_poll_event_json`.
@@ -709,10 +774,12 @@ pub unsafe extern "C" fn bmsip_client_poll_event_json(
 /// `s` must be null or a pointer returned by `bmsip_client_poll_event_json`.
 #[no_mangle]
 pub unsafe extern "C" fn bmsip_string_free(s: *mut c_char) {
-    if !s.is_null() {
-        // SAFETY: Pointer was allocated via `CString::into_raw`.
-        drop(unsafe { CString::from_raw(s) });
-    }
+    ffi_guard_unit(|| {
+        if !s.is_null() {
+            // SAFETY: Pointer was allocated via `CString::into_raw`.
+            drop(unsafe { CString::from_raw(s) });
+        }
+    });
 }
 
 /// Shuts down and frees a [`BmsipClientHandle`].
@@ -721,9 +788,53 @@ pub unsafe extern "C" fn bmsip_string_free(s: *mut c_char) {
 /// `client` must be null or a live handle returned by `bmsip_client_new`, freed at most once.
 #[no_mangle]
 pub unsafe extern "C" fn bmsip_client_free(client: *mut BmsipClientHandle) {
-    if !client.is_null() {
-        // SAFETY: Handle was allocated via `Box::into_raw`.
-        let boxed = unsafe { Box::from_raw(client) };
-        boxed.inner.shutdown();
+    ffi_guard_unit(|| {
+        if !client.is_null() {
+            // SAFETY: Handle was allocated via `Box::into_raw`.
+            let boxed = unsafe { Box::from_raw(client) };
+            boxed.inner.shutdown();
+        }
+    });
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn ffi_guards_catch_panics_and_shutdown_returns_error() {
+        assert_eq!(ffi_guard_i32(|| panic!("i32 panic")), -1);
+        assert_eq!(ffi_guard_u32(|| panic!("u32 panic")), 0);
+        assert!(ffi_guard_ptr::<u8>(|| panic!("ptr panic")).is_null());
+        ffi_guard_unit(|| panic!("unit panic"));
+
+        let user = CString::new("1001").unwrap();
+        let pass = CString::new("pw").unwrap();
+        let domain = CString::new("127.0.0.1").unwrap();
+        let reg = CString::new("127.0.0.1:59996").unwrap();
+        let bind = CString::new("127.0.0.1").unwrap();
+
+        // SAFETY: valid NUL-terminated UTF-8 strings.
+        let handle = unsafe {
+            bmsip_client_new(
+                user.as_ptr(),
+                pass.as_ptr(),
+                domain.as_ptr(),
+                reg.as_ptr(),
+                bind.as_ptr(),
+                0,
+            )
+        };
+        assert!(!handle.is_null());
+
+        // SAFETY: `handle` is live; shut down inner client while handle stays allocated to test C-API errors.
+        unsafe {
+            (&*handle).inner.shutdown();
+            assert_eq!(bmsip_client_register(handle), -1);
+            assert_eq!(bmsip_client_request_telemetry(handle, ptr::null()), -1);
+            let mut pcm = [0i16; 160];
+            assert_eq!(bmsip_client_pop_pcm(handle, pcm.as_mut_ptr(), 160), 0);
+            bmsip_client_free(handle);
+        }
     }
 }

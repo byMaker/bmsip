@@ -2990,3 +2990,81 @@ fn p1_network_changed_same_sip_port_rebind_and_pending_rtp_succeeds() {
     }
     engine.shutdown().unwrap();
 }
+
+#[test]
+fn p2_worker_panic_is_caught_emits_stopped_and_closes_command_channel() {
+    struct PanickingAudioPort;
+    impl bmsip_engine::AudioPort for PanickingAudioPort {
+        fn capture_20ms(&mut self) -> [i16; 160] {
+            panic!("simulated audio port panic");
+        }
+        fn playout_20ms(&mut self, _samples: &[i16]) {}
+    }
+
+    let uas_cfg = UaConfig::new(
+        "callee",
+        "pw",
+        "127.0.0.1",
+        SipUri::parse("sip:127.0.0.1:5060").unwrap(),
+        "127.0.0.1",
+        0,
+    );
+    let (uas_port, _) = WavAudioPort::new(WavPcm16::new(8_000, vec![0i16; 1_600]), true);
+    let uas = SipEngine::spawn(
+        EngineConfig::new(
+            uas_cfg,
+            "127.0.0.1:5060".parse().unwrap(),
+            IpAddr::V4(Ipv4Addr::LOCALHOST),
+            0,
+        ),
+        Box::new(uas_port),
+    )
+    .unwrap();
+    let uas_addr = uas.local_sip_addr();
+
+    let uac_cfg = UaConfig::new(
+        "caller",
+        "pw",
+        "127.0.0.1",
+        SipUri::parse(&format!("sip:{uas_addr}")).unwrap(),
+        "127.0.0.1",
+        0,
+    );
+    let uac = SipEngine::spawn(
+        EngineConfig::new(uac_cfg, uas_addr, IpAddr::V4(Ipv4Addr::LOCALHOST), 0),
+        Box::new(PanickingAudioPort),
+    )
+    .unwrap();
+
+    uac.send_command(EngineCommand::Dial {
+        target_uri: SipUri::parse(&format!("sip:callee@{uas_addr}")).unwrap(),
+    })
+    .unwrap();
+
+    let incoming_cid = match wait_for_engine_event(&uas, Duration::from_secs(3), |e| {
+        matches!(e, EngineEvent::IncomingCall { .. })
+    })
+    .expect("expected IncomingCall")
+    {
+        EngineEvent::IncomingCall { call_id, .. } => call_id,
+        _ => unreachable!(),
+    };
+    uas.send_command(EngineCommand::Answer {
+        call_id: incoming_cid,
+    })
+    .unwrap();
+
+    let stopped = wait_for_engine_event(&uac, Duration::from_secs(4), |e| {
+        matches!(e, EngineEvent::Stopped)
+    });
+    assert!(
+        matches!(stopped, Some(EngineEvent::Stopped)),
+        "expected worker panic to emit EngineEvent::Stopped, got {stopped:?}"
+    );
+    assert!(matches!(
+        uac.send_command(EngineCommand::Unregister),
+        Err(EngineError::ChannelClosed)
+    ));
+    let _ = uac.shutdown();
+    uas.shutdown().unwrap();
+}
