@@ -5,6 +5,28 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.15.0] - 2026-11-21
+
+### Added
+- **RFC 3966 `tel:` URI Support & Routing (`bmsip-core`, `bmsip-engine`):**
+  - Added `SipScheme::Tel`, RFC 3966 `tel:<subscriber>[;params]` parsing/formatting, `NameAddr` / `CallerIdentity` `tel:` support, and automatic fallback routing to `registrar_addr` in `WorkerCtx::resolve_sip_destination`.
+- **RTCP `SDES` (`CNAME`), `DLSR`, & C ABI Diagnostics (`bmsip-media`, `bmsip-engine`, `bmsip-ffi`):**
+  - Added `RtcpPacket::Sdes` (`PT=202`, `SdesChunk`, `SdesItem`, `SDES_CNAME`), compound `RR + SDES(CNAME)` emission in `MediaSession::build_rtcp_receiver_report*`, and monotonic `DLSR` calculation via `receive_rtcp_at` / `build_rtcp_receiver_report_at`.
+  - Exported `bmsip_client_local_sip_addr` and `bmsip_client_request_telemetry` in [`bmsip.h`](crates/bmsip-ffi/include/bmsip.h) and `bmsip-ffi::c_api`.
+
+### Fixed
+- **SIP Parser, Framing & Digest Auth (`bmsip-core`, `bmsip-engine`):**
+  - Updated `split_unquoted` to respect `<...>` angle brackets outside quotes; tolerated LWS around `/` and `:` in `Via` and unquoted quoted parameter values; added `ReplacesHeader::parse_header_value`; scanned all `P-Asserted-Identity`/`Remote-Party-ID` items individually in `CallerIdentity::from_headers`.
+  - Guarded `StreamFrame::KeepAlivePong` behind outstanding `note_keepalive_ping_sent()` tracking, stripped leading `\r\n` padding per RFC 3261 §7.5, handled unfolded continuation lines in `parse_stream_content_length`, and cleared only the bad frame on stream frame errors without discarding earlier queued frames.
+  - Enforced `qop=auth` for `-sess` Digest algorithms, ranked `SHA-256` / `SHA-256-sess` ahead of `MD5` / `MD5-sess` across all challenge headers, and retained stacked `Proxy-Authorization` + `Authorization` across `407 -> 401` retries and `2xx` `ACK` requests.
+- **Transactions, Dialog Timers & Session-Timers Interop (`bmsip-core`):**
+  - Bounded `ServerNonInviteTransaction` `Trying`/`Proceeding` lifetime to `64 * T1` (`lifetime_timer`), and validated mandatory `From`, `To`, `Call-ID`, `CSeq`, and `CSeq` method match in `TransactionManager::receive_message` before allocating server transactions (sending stateless `400 Bad Request` on invalid non-`ACK` requests).
+  - Enforced `To-tag` on all non-`100` UAS responses; sent `487 Request Terminated` on `inbound_invite_tx` on early-dialog `BYE`; added `cancel_deadline` (`64 * T1`) on `Cancelling` calls; added `PendingReInviteRollback` (`local_sdp`, `sdp_version`, `local_hold`, `local_rtp_port`) restored on `re-INVITE` rejection/timeout.
+  - Isolated per-call `min_se_secs` on `422 Session Interval Too Small`, selected `refresher=uas` without `Require: timer` when UAC lacks `Supported: timer` (adding `Require: timer` for `refresher=uac` per RFC 4028 §9), cleared stale session timers when `Session-Expires` is absent on `2xx`, added `405`/`501` session-refresh `UPDATE` fallback to `re-INVITE`, and handled `REGISTER` `423 Interval Too Brief` (capped at `86400` s) plus `expires=0` unregistration.
+- **Media Stats, DTMF, CN, Handover & FFI Bounds (`bmsip-media`, `bmsip-engine`, `bmsip-ffi`):**
+  - Fixed modular 32-bit RTP timestamp wraparound in `RtpStreamStats::record_packet`, isolated DTMF/CN packets from jitter calculations via `record_non_audio_packet`, enforced strictly monotonic event timestamps in `DtmfSender` with `(ts, digit)` deduplication in `DtmfDetector`, and advanced RTP timestamp + `M=1` resume marker across CN/DTMF pauses.
+  - Fixed `SipTransportDriver::rebind` to release previous sockets before rebinding (allowing same-port handovers such as `5060`), rebound `pending_rtp_sockets` and early `Ringing` calls during `NetworkChanged`, attempted up to 16 binds for even/odd RTP/RTCP ports, capped `SharedState` event queue depth (`4096`) and `pump_rtp_rx` packets per tick (`128`), and validated C-API PCM frame lengths against the configured sample rate prior to slice construction.
+
 ## [0.14.1] - 2026-11-21
 
 ### Fixed

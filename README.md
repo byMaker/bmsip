@@ -34,8 +34,8 @@ Legacy C/C++ SIP stacks often suffer from hidden global state, callback re-entra
 ```text
 bmsip/
 ├── crates/
-│   ├── bmsip-core/     # Sans-I/O SIP/2.0, SDP (RFC 4566/3264), MD5/SHA-256 Digest Auth, RFC 3261 tx & dialog FSMs
-│   ├── bmsip-media/    # Safe-Rust RTP/RTCP, G.711/G.722/Opus, CodecRegistry plugins, DTMF (RFC 4733), jitter buffer, DSP
+│   ├── bmsip-core/     # Sans-I/O SIP/2.0 (sip:/sips:/tel:), SDP (RFC 4566/3264), MD5/SHA-256 Digest Auth, RFC 3261/6026/4028 FSMs
+│   ├── bmsip-media/    # Safe-Rust RTP/RTCP (compound RR+SDES, DLSR), G.711/G.722/Opus, CodecRegistry plugins, DTMF/CN, jitter buffer, DSP
 │   ├── bmsip-engine/   # Lock-safe SipEngine runtime, UDP/TCP/TLS (rustls) transport, timers, libopus FFI, AudioPort, FlightRecorder
 │   ├── bmsip-ffi/      # Cross-platform BmsipClient (UniFFI bmsip.udl) & C99 ABI (include/bmsip.h)
 │   └── bmsip-cli/      # CLI softphone (`call`, `listen`), DSP WAV `analyze`, PBX `selftest`, and 3-server `interop` suite

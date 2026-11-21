@@ -7,11 +7,12 @@ use std::str::FromStr;
 
 use crate::error::SipError;
 
-/// URI scheme for SIP addresses.
+/// URI scheme for SIP/telephony addresses.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum SipScheme {
     Sip,
     Sips,
+    Tel,
 }
 
 impl SipScheme {
@@ -20,6 +21,7 @@ impl SipScheme {
         match self {
             Self::Sip => "sip",
             Self::Sips => "sips",
+            Self::Tel => "tel",
         }
     }
 }
@@ -92,16 +94,56 @@ impl SipUri {
             .map(|p| p.value.as_deref())
     }
 
-    /// Parses a `sip:` or `sips:` URI string.
+    /// Parses a `sip:`, `sips:`, or RFC 3966 `tel:` URI string.
     pub fn parse(input: &str) -> Result<Self, SipError> {
         let trimmed = input.trim();
+        if let Some(rest) = strip_prefix_ignore_ascii_case(trimmed, "tel:") {
+            let mut parts = rest.split(';');
+            let subscriber = parts
+                .next()
+                .map(str::trim)
+                .filter(|s| !s.is_empty())
+                .ok_or_else(|| SipError::InvalidUri(format!("empty tel subscriber in '{trimmed}'")))?;
+            if subscriber.chars().any(char::is_whitespace) || subscriber.contains('?') {
+                return Err(SipError::InvalidUri(format!(
+                    "invalid tel subscriber '{subscriber}' in '{trimmed}'"
+                )));
+            }
+            let mut params = Vec::new();
+            for raw_param in parts {
+                let p = raw_param.trim();
+                if p.is_empty() {
+                    continue;
+                }
+                match p.split_once('=') {
+                    Some((k, v)) => params.push(UriParam {
+                        name: k.trim().to_string(),
+                        value: Some(v.trim().to_string()),
+                    }),
+                    None => params.push(UriParam {
+                        name: p.to_string(),
+                        value: None,
+                    }),
+                }
+            }
+            return Ok(Self {
+                scheme: SipScheme::Tel,
+                user: Some(subscriber.to_string()),
+                password: None,
+                host: String::new(),
+                port: None,
+                params,
+                headers: Vec::new(),
+            });
+        }
+
         let (scheme, rest) = if let Some(rest) = strip_prefix_ignore_ascii_case(trimmed, "sips:") {
             (SipScheme::Sips, rest)
         } else if let Some(rest) = strip_prefix_ignore_ascii_case(trimmed, "sip:") {
             (SipScheme::Sip, rest)
         } else {
             return Err(SipError::InvalidUri(format!(
-                "missing sip/sips scheme in '{trimmed}'"
+                "missing sip/sips/tel scheme in '{trimmed}'"
             )));
         };
 
@@ -189,6 +231,18 @@ impl SipUri {
 impl fmt::Display for SipUri {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         write!(f, "{}:", self.scheme)?;
+        if self.scheme == SipScheme::Tel {
+            if let Some(sub) = &self.user {
+                f.write_str(sub)?;
+            }
+            for param in &self.params {
+                match &param.value {
+                    Some(val) => write!(f, ";{}={val}", param.name)?,
+                    None => write!(f, ";{}", param.name)?,
+                }
+            }
+            return Ok(());
+        }
         if let Some(user) = &self.user {
             f.write_str(user)?;
             if let Some(pass) = &self.password {
@@ -334,5 +388,22 @@ mod tests {
             uri3.headers,
             vec![("Replaces".to_string(), "cid@10.0.0.1".to_string())]
         );
+    }
+
+    #[test]
+    fn parses_tel_uri_with_parameters_and_roundtrips() {
+        let uri = SipUri::parse("TEL:+1-555-0100;phone-context=+1;isub=123").unwrap();
+        assert_eq!(uri.scheme, SipScheme::Tel);
+        assert_eq!(uri.user.as_deref(), Some("+1-555-0100"));
+        assert!(uri.host.is_empty());
+        assert_eq!(uri.port, None);
+        assert_eq!(uri.param("phone-context"), Some(Some("+1")));
+        assert_eq!(uri.param("isub"), Some(Some("123")));
+        assert_eq!(
+            uri.to_string(),
+            "tel:+1-555-0100;phone-context=+1;isub=123"
+        );
+        assert!(SipUri::parse("tel:").is_err());
+        assert!(SipUri::parse("tel:;phone-context=+1").is_err());
     }
 }

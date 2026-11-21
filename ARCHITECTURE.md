@@ -48,12 +48,13 @@ bmsip-ffi  ──┘                 └─────────────�
 | RFC 4566 / 3264 | SDP audio parsing/generation and Offer/Answer negotiation | Implemented (`v0.1.0`) |
 | RFC 2617 / 7616 | Digest authentication (`MD5`, `MD5-sess`, `SHA-256`, `SHA-256-sess`, `qop=auth`) | Implemented (`v0.1.0`) |
 | RFC 3261 Sec 12–16 | Dialogs, `REGISTER` refresh, `INVITE`/`CANCEL`/`BYE`/`re-INVITE` | Implemented (`v0.2.0`) |
-| RFC 3550 / 4733 | RTP/RTCP media transport and DTMF telephone-event | Implemented (`v0.3.0`) |
+| RFC 3550 / 4733 | RTP/RTCP media transport (compound `RR + SDES CNAME`, `DLSR`, modular jitter wrap), even/odd RTP/RTCP port pairing, DTMF (`telephone-event` + monotonic same-tick TS) | Implemented (`v0.3.0`, hardened `v0.15.0`) |
 | RFC 6716 / 7587 | Native `libopus` 48 kHz VoIP codec + TOC/`fmtp` + mic DSP conditioning | Implemented (`v0.7.0`) |
-| ITU-T G.722 / RFC 3551 §4.5.2 | Pure-Rust 16 kHz wideband G.722 codec (PT 9) + universal pluggable `AudioCodecPlugin` / `CodecRegistry` | Implemented (`v0.9.0`) |
-| RFC 6337 / 3311 / 3262 | Call Hold/Resume (`a=sendonly`/`inactive`/`sendrecv`), early/in-dialog `UPDATE`, reliable `1xx` / `PRACK` (`100rel`) | Implemented (`v0.10.0`) |
+| ITU-T G.722 / RFC 3551 §4.5.2 | Pure-Rust 16 kHz wideband G.722 codec (PT 9) + universal pluggable `AudioCodecPlugin` / `CodecRegistry` | Implemented (`v0.9.0`, QMF fixed `v0.14.1`) |
+| RFC 6337 / 3311 / 3262 | Call Hold/Resume (`a=sendonly`/`inactive`/`sendrecv`) with `re-INVITE` rollback, early/in-dialog `UPDATE`, reliable `1xx` / `PRACK` (`100rel`) | Implemented (`v0.10.0`, hardened `v0.15.0`) |
 | RFC 3515 / 3891 | Blind (`REFER` + `NOTIFY message/sipfrag`) and Attended (`Replaces`) Call Transfer | Implemented (`v0.10.0`) |
-| RFC 4028 / 3326 / 3323 / 3325 | `Session-Timers` (`Session-Expires`/`Min-SE`/`422`), `Reason` header, `P-Asserted-Identity` & `Privacy` | Implemented (`v0.10.0`) |
+| RFC 3966 | `tel:` URI parsing & `CallerIdentity` / registrar routing fallback | Implemented (`v0.15.0`) |
+| RFC 4028 / 3326 / 3323 / 3325 | `Session-Timers` (`Session-Expires`/`Min-SE` per-call/`Require: timer`/`405` fallback), `Reason` header, `P-Asserted-Identity` & `Privacy` | Implemented (`v0.10.0`, hardened `v0.15.0`) |
 | RFC 3960 / 2976 / 3389 | Early media (`183`/`180` SDP), SIP `INFO` DTMF (`application/dtmf-relay`), Comfort Noise (`CN` PT 13) | Implemented (`v0.11.0`) |
 | RFC 3261 §18 / 5626 / 5922 / 5923 | SIP over TCP & TLS 1.2–1.3 (`rustls`, mTLS), `Content-Length` stream framing, CRLF keep-alive, connection reuse | Implemented (`v0.12.0`) |
 | RFC 3711 / 4568 | Production-hardened SRTP & SRTCP (`AES_CM_128_HMAC_SHA1_80`/`_32`), per-SSRC ROC/replay, RFC 3711 §9.2 key lifetime limits, key zeroization, OS CSPRNG SDES (`a=crypto:`) enforced over TLS | Implemented (`v0.13.0`, hardened `v0.14.0`) |

@@ -179,77 +179,71 @@ impl Via {
     /// Parses a single `Via` entry.
     pub fn parse(input: &str) -> Result<Self, SipError> {
         let trimmed = input.trim();
-        let mut semi_parts = trimmed.split(';');
-        let main_part = semi_parts
+        let semi_parts = split_unquoted(trimmed, ';');
+        let mut semi_iter = semi_parts.into_iter();
+        let main_part = semi_iter
             .next()
             .map(str::trim)
             .filter(|s| !s.is_empty())
             .ok_or_else(|| SipError::ParseError(format!("empty Via header '{input}'")))?;
 
-        let mut ws_parts = main_part.split_whitespace();
-        let sent_protocol = ws_parts.next().ok_or_else(|| {
-            SipError::ParseError(format!("missing sent-protocol in Via '{input}'"))
-        })?;
-        let sent_by = ws_parts
+        let mut slash_parts = main_part.splitn(3, '/');
+        let protocol_name = slash_parts
             .next()
-            .ok_or_else(|| SipError::ParseError(format!("missing sent-by in Via '{input}'")))?;
-        if ws_parts.next().is_some() {
-            return Err(SipError::ParseError(format!(
-                "unexpected tokens in Via '{input}'"
-            )));
-        }
+            .map(str::trim)
+            .filter(|s| !s.is_empty() && !s.chars().any(char::is_whitespace))
+            .ok_or_else(|| SipError::ParseError(format!("invalid Via protocol '{main_part}'")))?
+            .to_string();
+        let protocol_version = slash_parts
+            .next()
+            .map(str::trim)
+            .filter(|s| !s.is_empty() && !s.chars().any(char::is_whitespace))
+            .ok_or_else(|| SipError::ParseError(format!("invalid Via version '{main_part}'")))?
+            .to_string();
+        let transport_and_sent = slash_parts
+            .next()
+            .map(str::trim_start)
+            .filter(|s| !s.is_empty())
+            .ok_or_else(|| SipError::ParseError(format!("invalid Via transport '{main_part}'")))?;
 
-        let mut proto_segs = sent_protocol.split('/');
-        let protocol_name = proto_segs
-            .next()
-            .filter(|s| !s.is_empty())
-            .ok_or_else(|| SipError::ParseError(format!("invalid Via protocol '{sent_protocol}'")))?
-            .to_string();
-        let protocol_version = proto_segs
-            .next()
-            .filter(|s| !s.is_empty())
-            .ok_or_else(|| SipError::ParseError(format!("invalid Via version '{sent_protocol}'")))?
-            .to_string();
-        let transport = proto_segs
-            .next()
-            .filter(|s| !s.is_empty())
-            .ok_or_else(|| {
-                SipError::ParseError(format!("invalid Via transport '{sent_protocol}'"))
-            })?
-            .to_string();
-        if proto_segs.next().is_some() {
+        let split_ws = transport_and_sent
+            .char_indices()
+            .find(|(_, ch)| ch.is_whitespace())
+            .map(|(idx, _)| idx)
+            .ok_or_else(|| SipError::ParseError(format!("missing sent-by in Via '{input}'")))?;
+        let transport = transport_and_sent[..split_ws].trim();
+        if transport.is_empty() || transport.contains('/') {
             return Err(SipError::ParseError(format!(
-                "invalid Via protocol '{sent_protocol}'"
+                "invalid Via transport '{transport}' in '{input}'"
             )));
         }
+        let sent_by = collapse_colon_lws(transport_and_sent[split_ws..].trim())?;
 
         let mut via = Self {
             protocol_name,
             protocol_version,
-            transport,
-            sent_by: sent_by.to_string(),
+            transport: transport.to_string(),
+            sent_by,
             branch: None,
             rport: None,
             received: None,
             params: Vec::new(),
         };
 
-        for raw_param in semi_parts {
+        for raw_param in semi_iter {
             let p = raw_param.trim();
             if p.is_empty() {
                 continue;
             }
             let (k, v) = match p.split_once('=') {
-                Some((key, val)) => (key.trim(), Some(val.trim())),
+                Some((key, val)) => (key.trim(), Some(unquote_sip_string(val.trim()))),
                 None => (p, None),
             };
             if k.eq_ignore_ascii_case("branch") {
-                via.branch = Some(
-                    v.ok_or_else(|| {
-                        SipError::ParseError(format!("empty Via branch in '{input}'"))
-                    })?
-                    .to_string(),
-                );
+                let branch_val = v.filter(|s| !s.is_empty()).ok_or_else(|| {
+                    SipError::ParseError(format!("empty Via branch in '{input}'"))
+                })?;
+                via.branch = Some(branch_val);
             } else if k.eq_ignore_ascii_case("rport") {
                 via.rport = match v {
                     None => Some(None),
@@ -261,9 +255,9 @@ impl Via {
                     }
                 };
             } else if k.eq_ignore_ascii_case("received") {
-                via.received = v.map(str::to_string);
+                via.received = v;
             } else {
-                via.params.push((k.to_string(), v.map(str::to_string)));
+                via.params.push((k.to_string(), v));
             }
         }
 
@@ -384,7 +378,7 @@ impl NameAddr {
             params: Vec::new(),
         };
 
-        for raw_param in raw_params.split(';') {
+        for raw_param in split_unquoted(raw_params, ';') {
             let p = raw_param.trim();
             if p.is_empty() {
                 continue;
@@ -416,9 +410,10 @@ impl NameAddr {
 
     /// Parses comma-separated address specifications from a single header value.
     pub fn parse_list(input: &str) -> Result<Vec<Self>, SipError> {
-        split_comma_respecting_quotes_and_angles(input)
+        split_unquoted(input, ',')
             .into_iter()
-            .filter(|item| !item.trim().is_empty())
+            .map(str::trim)
+            .filter(|item| !item.is_empty())
             .map(Self::parse)
             .collect()
     }
@@ -518,22 +513,34 @@ impl ReplacesHeader {
         self
     }
 
-    /// Parses a raw or URI-percent-encoded `Replaces` value (`<call-id>;to-tag=...;from-tag=...[;early-only]`).
+    /// Parses a URI-percent-encoded `Replaces` value (`?Replaces=...`).
     pub fn parse(input: &str) -> Result<Self, SipError> {
         let decoded = percent_decode(input.trim());
-        let mut parts = decoded.split(';');
-        let call_id = parts
+        Self::parse_raw(&decoded, input)
+    }
+
+    /// Parses a standalone SIP `Replaces:` header value without percent-decoding `Call-ID` or tags.
+    pub fn parse_header_value(input: &str) -> Result<Self, SipError> {
+        Self::parse_raw(input.trim(), input)
+    }
+
+    fn parse_raw(raw: &str, orig_input: &str) -> Result<Self, SipError> {
+        let parts = split_unquoted(raw, ';');
+        let mut iter = parts.into_iter();
+        let call_id = iter
             .next()
             .map(str::trim)
             .filter(|s| !s.is_empty())
-            .ok_or_else(|| SipError::ParseError(format!("missing call-id in Replaces '{input}'")))?
+            .ok_or_else(|| {
+                SipError::ParseError(format!("missing call-id in Replaces '{orig_input}'"))
+            })?
             .to_string();
 
         let mut to_tag: Option<String> = None;
         let mut from_tag: Option<String> = None;
         let mut early_only = false;
 
-        for raw_param in parts {
+        for raw_param in iter {
             let p = raw_param.trim();
             if p.is_empty() {
                 continue;
@@ -541,7 +548,7 @@ impl ReplacesHeader {
             match p.split_once('=') {
                 Some((k, v)) => {
                     let key = k.trim();
-                    let val = v.trim().trim_matches('"').to_string();
+                    let val = unquote_sip_string(v.trim());
                     if key.eq_ignore_ascii_case("to-tag") {
                         to_tag = Some(val);
                     } else if key.eq_ignore_ascii_case("from-tag") {
@@ -556,11 +563,11 @@ impl ReplacesHeader {
             }
         }
 
-        let to_tag = to_tag
-            .filter(|s| !s.is_empty())
-            .ok_or_else(|| SipError::ParseError(format!("missing to-tag in Replaces '{input}'")))?;
+        let to_tag = to_tag.filter(|s| !s.is_empty()).ok_or_else(|| {
+            SipError::ParseError(format!("missing to-tag in Replaces '{orig_input}'"))
+        })?;
         let from_tag = from_tag.filter(|s| !s.is_empty()).ok_or_else(|| {
-            SipError::ParseError(format!("missing from-tag in Replaces '{input}'"))
+            SipError::ParseError(format!("missing from-tag in Replaces '{orig_input}'"))
         })?;
 
         Ok(Self {
@@ -824,11 +831,17 @@ pub struct CallerIdentity {
 impl CallerIdentity {
     /// Extracts caller identity and privacy tokens from SIP `Headers`, if any are present.
     pub fn from_headers(headers: &Headers) -> Option<Self> {
-        let asserted_identity = headers
-            .get("P-Asserted-Identity")
-            .or_else(|| headers.get("P-Preferred-Identity"))
-            .or_else(|| headers.get("Remote-Party-ID"))
-            .and_then(|raw| NameAddr::parse_list(raw).ok()?.into_iter().next());
+        let asserted_identity = [
+            "P-Asserted-Identity",
+            "P-Preferred-Identity",
+            "Remote-Party-ID",
+        ]
+        .into_iter()
+        .flat_map(|hdr| headers.get_all(hdr))
+        .flat_map(|raw| split_unquoted(raw, ','))
+        .map(str::trim)
+        .filter(|item| !item.is_empty())
+        .find_map(|item| NameAddr::parse(item).ok());
 
         let mut privacy = Vec::new();
         for raw in headers.get_all("Privacy") {
@@ -883,6 +896,7 @@ fn split_unquoted(input: &str, delim: char) -> Vec<&str> {
     let mut start = 0;
     let mut in_quotes = false;
     let mut escaped = false;
+    let mut angle_depth: usize = 0;
     for (idx, ch) in input.char_indices() {
         if escaped {
             escaped = false;
@@ -896,13 +910,41 @@ fn split_unquoted(input: &str, delim: char) -> Vec<&str> {
             in_quotes = !in_quotes;
             continue;
         }
-        if !in_quotes && ch == delim {
-            out.push(&input[start..idx]);
-            start = idx + delim.len_utf8();
+        if !in_quotes {
+            if ch == '<' {
+                angle_depth = angle_depth.saturating_add(1);
+                continue;
+            }
+            if ch == '>' {
+                angle_depth = angle_depth.saturating_sub(1);
+                continue;
+            }
+            if angle_depth == 0 && ch == delim {
+                out.push(&input[start..idx]);
+                start = idx + delim.len_utf8();
+            }
         }
     }
     out.push(&input[start..]);
     out
+}
+
+fn collapse_colon_lws(input: &str) -> Result<String, SipError> {
+    let tokens: Vec<&str> = input.split_whitespace().collect();
+    if tokens.is_empty() {
+        return Err(SipError::ParseError("empty Via sent-by".to_string()));
+    }
+    let mut out = tokens[0].to_string();
+    for tok in &tokens[1..] {
+        if out.ends_with(':') || tok.starts_with(':') {
+            out.push_str(tok);
+        } else {
+            return Err(SipError::ParseError(format!(
+                "unexpected tokens in Via sent-by '{input}'"
+            )));
+        }
+    }
+    Ok(out)
 }
 
 fn unquote_sip_string(val: &str) -> String {
@@ -979,44 +1021,16 @@ fn parse_display_name(raw: &str) -> Result<Option<String>, SipError> {
 }
 
 pub(crate) fn split_comma_respecting_quotes_and_angles(input: &str) -> Vec<&str> {
-    let mut items = Vec::new();
-    let mut start = 0;
-    let mut in_quotes = false;
-    let mut escaped = false;
-    let mut angle_depth: usize = 0;
-
-    for (idx, ch) in input.char_indices() {
-        if escaped {
-            escaped = false;
-            continue;
-        }
-        if ch == '\\' && in_quotes {
-            escaped = true;
-            continue;
-        }
-        if ch == '"' {
-            in_quotes = !in_quotes;
-            continue;
-        }
-        if !in_quotes {
-            match ch {
-                '<' => angle_depth = angle_depth.saturating_add(1),
-                '>' => angle_depth = angle_depth.saturating_sub(1),
-                ',' if angle_depth == 0 => {
-                    items.push(input[start..idx].trim());
-                    start = idx + 1;
-                }
-                _ => {}
-            }
-        }
-    }
-    items.push(input[start..].trim());
-    items
+    split_unquoted(input, ',')
+        .into_iter()
+        .map(str::trim)
+        .collect()
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::sip::SipScheme;
 
     #[test]
     fn normalizes_compact_headers() {
@@ -1120,5 +1134,41 @@ mod tests {
             SipUri::parse("sip:1001@pbx.local").unwrap()
         );
         assert_eq!(ci.privacy, vec!["id".to_string(), "header".to_string()]);
+    }
+
+    #[test]
+    fn parses_via_lws_quoted_params_tel_identity_and_raw_replaces_header() {
+        let via =
+            Via::parse("SIP / 2.0 / UDP 10.0.0.1 : 5060;branch=\"z9hG4bK1\";received=\"10.0.0.1\"")
+                .unwrap();
+        assert_eq!(via.transport, "UDP");
+        assert_eq!(via.sent_by, "10.0.0.1:5060");
+        assert_eq!(via.branch.as_deref(), Some("z9hG4bK1"));
+        assert_eq!(via.received.as_deref(), Some("10.0.0.1"));
+
+        let na = NameAddr::parse("<tel:+1-555-0199>;foo=\"a;b\";tag=t9").unwrap();
+        assert_eq!(na.uri.scheme, SipScheme::Tel);
+        assert_eq!(na.uri.user.as_deref(), Some("+1-555-0199"));
+        assert_eq!(na.tag.as_deref(), Some("t9"));
+        assert_eq!(
+            na.params,
+            vec![("foo".to_string(), Some("\"a;b\"".to_string()))]
+        );
+
+        // Raw Replaces header values must NOT percent-decode literal `%` sequences in Call-ID.
+        let rep = ReplacesHeader::parse_header_value(
+            "call%40host;to-tag=t1;from-tag=f1;early-only;custom=1",
+        )
+        .unwrap();
+        assert_eq!(rep.call_id, "call%40host");
+        assert_eq!(rep.to_tag, "t1");
+        assert_eq!(rep.from_tag, "f1");
+        assert!(rep.early_only);
+
+        let mut hdrs = Headers::new();
+        hdrs.add("P-Asserted-Identity", "\"Tel\" <tel:+15550100>");
+        hdrs.add("P-Asserted-Identity", "<sip:1001@pbx.local>");
+        let ci = CallerIdentity::from_headers(&hdrs).unwrap();
+        assert_eq!(ci.asserted_identity.unwrap().uri.scheme, SipScheme::Tel);
     }
 }

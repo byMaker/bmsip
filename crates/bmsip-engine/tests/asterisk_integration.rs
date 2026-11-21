@@ -2933,3 +2933,60 @@ fn p0_multi_call_hold_focus_and_spoofed_rtp_rejection() {
     eng_carol.shutdown().unwrap();
     eng_hub.shutdown().unwrap();
 }
+
+#[test]
+fn p1_network_changed_same_sip_port_rebind_and_pending_rtp_succeeds() {
+    let ua_cfg = UaConfig::new(
+        "nettest",
+        "pw",
+        "127.0.0.1",
+        SipUri::parse("sip:127.0.0.1:59997").unwrap(),
+        "127.0.0.1",
+        0,
+    );
+    let (port, _) = WavAudioPort::new(WavPcm16::new(8_000, vec![0i16; 1_600]), true);
+    let engine = SipEngine::spawn(
+        EngineConfig::new(
+            ua_cfg,
+            "127.0.0.1:59997".parse().unwrap(),
+            IpAddr::V4(Ipv4Addr::LOCALHOST),
+            0,
+        ),
+        Box::new(port),
+    )
+    .unwrap();
+    let initial_addr = engine.local_sip_addr();
+    assert_ne!(initial_addr.port(), 0);
+
+    // Dial creates a pending_rtp_sockets entry before handover.
+    engine
+        .send_command(EngineCommand::Dial {
+            target_uri: SipUri::parse("sip:bob@127.0.0.1:59997").unwrap(),
+        })
+        .unwrap();
+    let _ = wait_for_engine_event(&engine, Duration::from_secs(2), |e| {
+        matches!(e, EngineEvent::OutboundCallStarted { .. })
+    });
+
+    // Same SIP port handover must release old sockets first (no EADDRINUSE) and rebind pending RTP sockets.
+    engine
+        .send_command(EngineCommand::NetworkChanged {
+            new_bind_ip: IpAddr::V4(Ipv4Addr::LOCALHOST),
+            new_sip_port: initial_addr.port(),
+        })
+        .unwrap();
+
+    let updated = wait_for_engine_event(&engine, Duration::from_secs(3), |e| {
+        matches!(
+            e,
+            EngineEvent::NetworkUpdated { .. } | EngineEvent::Warning(_)
+        )
+    });
+    match updated {
+        Some(EngineEvent::NetworkUpdated { local_sip_addr }) => {
+            assert_eq!(local_sip_addr.port(), initial_addr.port());
+        }
+        other => panic!("expected NetworkUpdated on same-port handover, got {other:?}"),
+    }
+    engine.shutdown().unwrap();
+}

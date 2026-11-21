@@ -145,12 +145,28 @@ impl DigestCredentials {
         method: &Method,
         digest_uri: &str,
     ) -> Result<String, SipError> {
+        let use_qop_auth = if challenge.qop.is_empty() {
+            false
+        } else if challenge.qop.iter().any(|q| q == "auth") {
+            true
+        } else {
+            return Err(SipError::AuthError(format!(
+                "unsupported qop options: {:?}",
+                challenge.qop
+            )));
+        };
+
         let mut ha1 = challenge.algorithm.hash_hex(&format!(
             "{}:{}:{}",
             self.username, challenge.realm, self.password
         ));
 
         if challenge.algorithm.is_sess() {
+            if !use_qop_auth {
+                return Err(SipError::AuthError(
+                    "-sess algorithms require qop=auth".to_string(),
+                ));
+            }
             let cnonce = self.cnonce.as_deref().ok_or_else(|| {
                 SipError::AuthError("cnonce is required for -sess algorithms".to_string())
             })?;
@@ -162,17 +178,6 @@ impl DigestCredentials {
         let ha2 = challenge
             .algorithm
             .hash_hex(&format!("{}:{}", method.as_str(), digest_uri));
-
-        let use_qop_auth = if challenge.qop.is_empty() {
-            false
-        } else if challenge.qop.iter().any(|q| q == "auth") {
-            true
-        } else {
-            return Err(SipError::AuthError(format!(
-                "unsupported qop options: {:?}",
-                challenge.qop
-            )));
-        };
 
         let (response, nc_hex, cnonce_used) = if use_qop_auth {
             let cnonce = self.cnonce.as_deref().ok_or_else(|| {
@@ -365,5 +370,32 @@ mod tests {
         let expected = hash::md5_hex(format!("{ha1}:nonce1:{ha2}").as_bytes());
         assert!(auth.contains(&format!("response=\"{expected}\"")));
         assert!(!auth.contains("qop="));
+    }
+
+    #[test]
+    fn sess_algorithms_require_qop_auth() {
+        let md5_sess_no_qop =
+            DigestChallenge::parse("Digest realm=\"pbx.local\", nonce=\"n1\", algorithm=MD5-sess")
+                .unwrap();
+        let creds = DigestCredentials::new("alice", "pass", Some("cn1".to_string()));
+        assert!(creds
+            .authorize(&md5_sess_no_qop, &Method::Register, "sip:pbx.local")
+            .is_err());
+
+        let sha_sess_no_qop = DigestChallenge::parse(
+            "Digest realm=\"pbx.local\", nonce=\"n1\", algorithm=SHA-256-sess",
+        )
+        .unwrap();
+        assert!(creds
+            .authorize(&sha_sess_no_qop, &Method::Invite, "sip:bob@pbx.local")
+            .is_err());
+
+        let sha_sess_qop = DigestChallenge::parse(
+            "Digest realm=\"pbx.local\", nonce=\"n1\", algorithm=SHA-256-sess, qop=\"auth\"",
+        )
+        .unwrap();
+        assert!(creds
+            .authorize(&sha_sess_qop, &Method::Invite, "sip:bob@pbx.local")
+            .is_ok());
     }
 }

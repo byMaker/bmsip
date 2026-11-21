@@ -178,9 +178,10 @@ Defined in [`crates/bmsip-ffi/src/bmsip.udl`](../crates/bmsip-ffi/src/bmsip.udl)
 - **Constructors:** `bmsip_client_new(...)` creates an 8 kHz UDP client (G.722/PCMU/PCMA); `bmsip_client_new_ex(..., enable_opus, sample_rate_hz)` enables Opus (`enable_opus != 0`) and selects `8000`, `16000`, or `48000` Hz PCM framing (queryable via `bmsip_client_audio_sample_rate_hz`); `bmsip_client_new_transport(..., transport, tls_ca_pem, tls_insecure)` selects `"udp"`, `"tcp"`, or `"tls"`; `bmsip_client_new_secure(..., transport, srtp_mode, tls_ca_pem, tls_insecure)` additionally configures SRTP (`"off"`, `"optional"`, or `"sdes"` — `"sdes"` requires `"tls"`).
 - **Return Convention:** Action functions (`bmsip_client_register`, `bmsip_client_dial`, `bmsip_client_ring_early_media`, `bmsip_client_answer`, `bmsip_client_hangup`, `bmsip_client_hold`, `bmsip_client_resume_call`, `bmsip_client_transfer`, `bmsip_client_attended_transfer`, `bmsip_client_send_dtmf`, `bmsip_client_send_info_dtmf`, etc.) return `0` on success or `-1` on error.
 - **PCM Functions:**
-  - `bmsip_client_push_pcm(client, samples, len)` returns `0` on success (`-1` if `len` does not match the 20 ms frame length for the configured sample rate: `160`, `320`, or `960`).
-  - `bmsip_client_pop_pcm(client, out_samples, capacity)` returns the number of copied samples (`160`/`320`/`960`), `0` if empty, or `-1` on error.
-- **Memory Management:** Strings returned by `bmsip_client_poll_event_json` must be freed via `bmsip_string_free(s)`. Clients must be released with `bmsip_client_free(client)`.
+  - `bmsip_client_push_pcm(client, samples, len)` validates `len == bmsip_client_audio_sample_rate_hz(client) / 50` (`160`, `320`, or `960`) before dereferencing `samples` and returns `0` on success (`-1` on null/length mismatch).
+  - `bmsip_client_pop_pcm(client, out_samples, capacity)` validates `capacity` against the configured frame length before popping the playout queue and returns the number of copied samples (`160`/`320`/`960`), `0` if empty, or `-1` on error.
+- **Diagnostics & Socket Helpers:** `bmsip_client_local_sip_addr(client)` returns the bound `ip:port` C string (free via `bmsip_string_free`); `bmsip_client_request_telemetry(client, call_id)` triggers an async `TelemetryExported` JSON event (`call_id` may be `NULL` for the global ring).
+- **Memory Management:** Strings returned by `bmsip_client_poll_event_json` and `bmsip_client_local_sip_addr` must be freed via `bmsip_string_free(s)`. Clients must be released with `bmsip_client_free(client)`.
 - See [`bindings/c/minimal_phone.c`](../bindings/c/minimal_phone.c) for a complete runnable C99 example (`gcc -std=c99 -Wall -Wextra -Werror`).
 
 ---
@@ -192,8 +193,8 @@ Defined in [`crates/bmsip-ffi/src/bmsip.udl`](../crates/bmsip-ffi/src/bmsip.udl)
 When the device moves between networks (e.g., Wi-Fi to LTE):
 
 1. Application issues `EngineCommand::NetworkChanged { new_bind_ip, new_sip_port }` (or `BmsipClient::notify_network_changed`).
-2. `SipEngine` rebinds the SIP transport socket (dropping any stale TCP/TLS connections immediately) and probes the updated reachable local IP.
-3. `UserAgent::notify_network_changed` updates advertised `Contact` / SDP IP, triggers an immediate `REGISTER` refresh if registered, and sends an in-dialog `re-INVITE` on active `Established` calls with the updated SDP.
+2. `SipEngine` releases the previous SIP sockets first (allowing same-port rebinding such as `5060` without `EADDRINUSE`), drops stale TCP/TLS connections, rebinds both active and early-dialog pending RTP/RTCP sockets onto the new interface, and probes the updated reachable local IP.
+3. `UserAgent::notify_network_changed` updates advertised `Contact` / SDP IP, triggers an immediate `REGISTER` refresh if registered, updates pending call RTP ports (sending `UPDATE` on early `Ringing` dialogs when supported), and sends an in-dialog `re-INVITE` on active `Established` calls with the updated SDP.
 
 ### 4.2 Background Suspend & Push Wakeup (`Suspend` / `Resume`)
 

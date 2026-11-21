@@ -148,3 +148,10 @@ engine_cfg.register_custom_codec(factory);
   - `SrtpMode::SdesRequired` (RFC 4568): Negotiates `RTP/SAVP` with `a=crypto:<tag> <suite> inline:<base64>` derived via HMAC-SHA256 from a 256-bit OS CSPRNG secret (`UaConfig::crypto_seed`), requires `SipTransport::Tls` by default (RFC 4568 §8), rejects unsupported MKI lines, preserves keys across Hold `re-INVITE`, and selectively rotates keys on `re-INVITE` / `183 -> 200 OK` forking (`MediaSession::update_srtp_keys`).
   - `SrtpMode::SdesOptional`: Offers opportunistic `a=crypto:` over `SipTransport::Tls` (automatically suppressed over unencrypted UDP/TCP unless `allow_insecure_cleartext_sdes` is explicitly enabled) and interoperates with either `RTP/AVP` or `RTP/SAVP`.
   - Incoming `UDP/TLS/RTP/SAVP(F)` (DTLS-SRTP) offers are rejected with `488 Not Acceptable Here`; internal DTLS scaffolding is isolated behind the off-by-default `experimental-dtls` Cargo feature.
+
+---
+
+## 6. RTCP Compound Reports, DTMF Pacing & Comfort Noise (`RFC 3550`, `RFC 4733`, `RFC 3389`)
+
+- **Compound `RR + SDES(CNAME)` & `DLSR`:** [`MediaSession`](../crates/bmsip-media/src/session.rs) emits compound RTCP `ReceiverReport` + `Sdes` (`SDES_CNAME`, configurable via `MediaSession::with_cname`) packets. `RtpStreamStats` computes modular 32-bit interarrival jitter (immune to 32-bit RTP timestamp wraparound) and `DLSR` via `receive_rtcp_at` / `build_rtcp_receiver_report_at`.
+- **DTMF & DTX Isolation:** Inbound RFC 4733 DTMF and RFC 3389 CN (`PT 13`) packets update sequence/loss counters via `RtpStreamStats::record_non_audio_packet` without polluting jitter estimates or jitter buffer depth. Outbound `DtmfSender` enforces monotonically advancing timestamps when multiple digits are queued in the same tick, and both CN SID transmission and outbound DTMF set the RTP marker bit (`M=1`) on the next speech frame.

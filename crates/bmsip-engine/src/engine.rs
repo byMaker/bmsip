@@ -265,9 +265,23 @@ struct WorkerCtx {
     shared: Arc<SharedState>,
 }
 
+const MAX_EVENT_QUEUE: usize = 4096;
+const MAX_RTP_PACKETS_PER_TICK: usize = 128;
+
 impl WorkerCtx {
     fn push_event(&self, ev: EngineEvent) {
         if let Ok(mut guard) = self.shared.events.lock() {
+            while guard.0.len() >= MAX_EVENT_QUEUE {
+                if let Some(pos) = guard
+                    .0
+                    .iter()
+                    .position(|queued| !matches!(queued, EngineEvent::Stopped))
+                {
+                    guard.0.remove(pos);
+                } else {
+                    break;
+                }
+            }
             guard.0.push_back(ev);
             self.shared.event_cv.notify_all();
         }
@@ -349,6 +363,13 @@ impl WorkerCtx {
                     }
                 }
 
+                if req.uri.scheme == bmsip_core::sip::SipScheme::Tel || req.uri.host.is_empty() {
+                    if req.method == Method::Invite {
+                        self.record_outbound_tx_target(via_branch, self.registrar_addr);
+                    }
+                    return self.registrar_addr;
+                }
+
                 // In-dialog requests without a Route set (To tag present: 2xx ACK, BYE, re-INVITE)
                 // route directly to the remote Contact (Request-URI) when it carries a concrete IP.
                 if is_in_dialog {
@@ -369,6 +390,9 @@ impl WorkerCtx {
     }
 
     fn resolve_sip_uri_cached(&mut self, uri: &SipUri, fallback_port: u16) -> Option<SocketAddr> {
+        if uri.scheme == bmsip_core::sip::SipScheme::Tel || uri.host.is_empty() {
+            return None;
+        }
         if let Some(addr) = resolve_sip_uri_literal_ip(uri, fallback_port) {
             return Some(addr);
         }
@@ -1257,7 +1281,7 @@ impl WorkerCtx {
                     if let Ok(mut g) = self.shared.local_sip_addr.lock() {
                         *g = self.local_sip_addr;
                     }
-                    // Rebind active RTP/RTCP sockets onto the new interface so media survives IP handover.
+                    // Rebind active and pending RTP/RTCP sockets onto the new interface so media survives IP handover.
                     let mut rebound_rtp_ports = HashMap::new();
                     let active_ids: Vec<String> = self.active_media.keys().cloned().collect();
                     for cid in active_ids {
@@ -1271,6 +1295,17 @@ impl WorkerCtx {
                                 media.latched_rtcp_source = None;
                                 rebound_rtp_ports.insert(cid, new_port);
                             }
+                        }
+                    }
+                    let pending_ids: Vec<String> =
+                        self.pending_rtp_sockets.keys().cloned().collect();
+                    for cid in pending_ids {
+                        if let Ok((new_rtp, new_rtcp, new_port)) =
+                            bind_rtp_socket(new_bind_ip, reachable_ip)
+                        {
+                            self.pending_rtp_sockets
+                                .insert(cid.clone(), (new_rtp, new_rtcp));
+                            rebound_rtp_ports.insert(cid, new_port);
                         }
                     }
                     if let Err(err) = self.ua.notify_network_changed_with_rtp_ports(
@@ -1393,8 +1428,9 @@ impl WorkerCtx {
                 continue;
             }
 
+            let elapsed_ms = now.saturating_duration_since(media.started_at).as_millis() as u64;
             let mut rtp_buf = [0u8; 4096];
-            loop {
+            for _ in 0..MAX_RTP_PACKETS_PER_TICK {
                 match media.rtp_socket.recv_from(&mut rtp_buf) {
                     Ok((len, src_addr)) => {
                         if !media.session.is_srtp_active()
@@ -1411,7 +1447,7 @@ impl WorkerCtx {
                         }
                         let pkt_slice = &rtp_buf[..len];
                         let samples_per_ms = media.session.clock_rate_hz() / 1000;
-                        let arrival_samples = (media.started_at.elapsed().as_millis() as u32)
+                        let arrival_samples = (elapsed_ms.min(u64::from(u32::MAX)) as u32)
                             .saturating_mul(samples_per_ms);
                         if let Ok(opt_digit) = media.session.receive_rtp(pkt_slice, arrival_samples)
                         {
@@ -1440,7 +1476,7 @@ impl WorkerCtx {
 
             if let Some(rtcp_sock) = media.rtcp_socket.as_ref() {
                 let mut rtcp_buf = [0u8; 1024];
-                loop {
+                for _ in 0..MAX_RTP_PACKETS_PER_TICK {
                     match rtcp_sock.recv_from(&mut rtcp_buf) {
                         Ok((len, src_addr)) => {
                             if !media.session.is_srtp_active()
@@ -1455,7 +1491,10 @@ impl WorkerCtx {
                                     }
                                 }
                             }
-                            if media.session.receive_rtcp(&rtcp_buf[..len]).is_ok()
+                            if media
+                                .session
+                                .receive_rtcp_at(&rtcp_buf[..len], elapsed_ms)
+                                .is_ok()
                                 && !media.session.is_srtp_active()
                                 && !media.remote_rtcp.ip().is_unspecified()
                                 && media.latched_rtcp_source.is_none()
@@ -1599,7 +1638,10 @@ impl WorkerCtx {
             if let Some(rtcp_sock) = media.rtcp_socket.as_ref() {
                 let rx_count = media.session.stats().received_count();
                 if rx_count >= 20 && (!media.initial_rtcp_sent || now >= media.next_rtcp_at) {
-                    let rr = media.session.build_rtcp_receiver_report();
+                    let now_ms = now.saturating_duration_since(media.started_at).as_millis() as u64;
+                    let rr = media
+                        .session
+                        .build_rtcp_receiver_report_at(Some(now_ms));
                     if rtcp_sock.send_to(&rr, media.remote_rtcp).is_ok() {
                         media.initial_rtcp_sent = true;
                         media.next_rtcp_at = now + Duration::from_millis(RTCP_REPORT_INTERVAL_MS);
@@ -1755,9 +1797,25 @@ fn bind_rtp_socket(
     } else {
         advertised_ip
     };
-    let rtp_sock = UdpSocket::bind((target_ip, 0))?;
-    rtp_sock.set_nonblocking(true)?;
-    let port = rtp_sock.local_addr()?.port();
+    let mut fallback: Option<(UdpSocket, u16)> = None;
+    for _ in 0..16 {
+        let rtp_sock = UdpSocket::bind((target_ip, 0))?;
+        rtp_sock.set_nonblocking(true)?;
+        let port = rtp_sock.local_addr()?.port();
+        if port % 2 == 0 {
+            if let Some(rtcp_sock) = port
+                .checked_add(1)
+                .and_then(|rtcp_port| UdpSocket::bind((target_ip, rtcp_port)).ok())
+                .and_then(|sock| sock.set_nonblocking(true).ok().map(|()| sock))
+            {
+                return Ok((rtp_sock, Some(rtcp_sock), port));
+            }
+        }
+        fallback = Some((rtp_sock, port));
+    }
+    let (rtp_sock, port) = fallback.ok_or_else(|| {
+        EngineError::Io("failed to bind ephemeral RTP UDP socket".to_string())
+    })?;
     let rtcp_sock = port
         .checked_add(1)
         .and_then(|rtcp_port| UdpSocket::bind((target_ip, rtcp_port)).ok())

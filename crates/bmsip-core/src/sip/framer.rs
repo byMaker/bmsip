@@ -106,6 +106,7 @@ pub enum StreamFrame {
 pub struct SipStreamFramer {
     buf: Vec<u8>,
     max_buffer_bytes: usize,
+    ping_outstanding: bool,
 }
 
 impl Default for SipStreamFramer {
@@ -125,7 +126,13 @@ impl SipStreamFramer {
         Self {
             buf: Vec::new(),
             max_buffer_bytes: max_buffer_bytes.max(1024),
+            ping_outstanding: false,
         }
+    }
+
+    /// Marks that an outbound RFC 5626 CRLF keep-alive ping was sent so an incoming `\r\n` is recognized as its pong.
+    pub fn note_keepalive_ping_sent(&mut self) {
+        self.ping_outstanding = true;
     }
 
     /// Appends raw bytes read from a TCP or TLS stream.
@@ -143,68 +150,92 @@ impl SipStreamFramer {
 
     /// Attempts to extract the next complete [`StreamFrame`] from the internal buffer.
     pub fn next_frame(&mut self) -> Result<Option<StreamFrame>, SipError> {
-        if self.buf.is_empty() {
-            return Ok(None);
-        }
+        loop {
+            if self.buf.is_empty() {
+                return Ok(None);
+            }
 
-        // RFC 5626 §4.4.1: double-CRLF keep-alive ping between SIP messages.
-        if self.buf.starts_with(RFC5626_KEEPALIVE_PING) {
-            self.buf.drain(..4);
-            return Ok(Some(StreamFrame::KeepAlivePing));
-        }
+            // RFC 5626 §4.4.1: double-CRLF keep-alive ping between SIP messages.
+            if self.buf.starts_with(RFC5626_KEEPALIVE_PING) {
+                self.buf.drain(..4);
+                return Ok(Some(StreamFrame::KeepAlivePing));
+            }
 
-        // If stream begins with `\r\n\r`, wait for the 4th byte to distinguish `\r\n\r\n` ping.
-        if self.buf == b"\r\n\r" {
-            return Ok(None);
-        }
+            // If stream begins with `\r\n\r`, wait for the 4th byte to distinguish `\r\n\r\n` ping.
+            if self.buf == b"\r\n\r" {
+                return Ok(None);
+            }
 
-        // Standalone `\r\n` pong (either exact 2-byte read or followed by non-`\r` next SIP message).
-        if self.buf.starts_with(RFC5626_KEEPALIVE_PONG) {
-            self.buf.drain(..2);
-            return Ok(Some(StreamFrame::KeepAlivePong));
-        }
+            // Exact 2-byte `\r\n`: only treat as KeepAlivePong when a ping is outstanding;
+            // otherwise wait so a TCP-split `\r\n` + `\r\n` inbound ping is not misread.
+            if self.buf == RFC5626_KEEPALIVE_PONG {
+                if self.ping_outstanding {
+                    self.ping_outstanding = false;
+                    self.buf.drain(..2);
+                    return Ok(Some(StreamFrame::KeepAlivePong));
+                }
+                return Ok(None);
+            }
 
-        // Wait if buffer only contains a single leading `\r` before `\n`.
-        if self.buf == b"\r" {
-            return Ok(None);
-        }
+            // Leading `\r\n` followed by a non-`\r` byte: emit pong if ping outstanding,
+            // or strip leading CRLF padding between SIP messages per RFC 3261 §7.5.
+            if self.buf.starts_with(RFC5626_KEEPALIVE_PONG) {
+                self.buf.drain(..2);
+                if self.ping_outstanding {
+                    self.ping_outstanding = false;
+                    return Ok(Some(StreamFrame::KeepAlivePong));
+                }
+                continue;
+            }
 
-        let Some(header_end) = find_subslice(&self.buf, b"\r\n\r\n") else {
-            return Ok(None);
-        };
+            // Wait if buffer only contains a single leading `\r` before `\n`.
+            if self.buf == b"\r" {
+                return Ok(None);
+            }
 
-        let header_slice = &self.buf[..header_end];
-        let content_length = parse_stream_content_length(header_slice)?;
-        if content_length > self.max_buffer_bytes {
-            self.buf.clear();
-            return Err(SipError::ParseError(format!(
-                "SIP stream Content-Length {content_length} exceeds limit {}",
-                self.max_buffer_bytes
-            )));
-        }
+            let Some(header_end) = find_subslice(&self.buf, b"\r\n\r\n") else {
+                return Ok(None);
+            };
 
-        let total_len = header_end
-            .checked_add(4)
-            .and_then(|n| n.checked_add(content_length))
-            .ok_or_else(|| {
+            let header_slice = &self.buf[..header_end];
+            let content_length = match parse_stream_content_length(header_slice) {
+                Ok(cl) => cl,
+                Err(err) => {
+                    self.buf.clear();
+                    return Err(err);
+                }
+            };
+            if content_length > self.max_buffer_bytes {
                 self.buf.clear();
-                SipError::ParseError("SIP stream frame length overflow".to_string())
-            })?;
+                return Err(SipError::ParseError(format!(
+                    "SIP stream Content-Length {content_length} exceeds limit {}",
+                    self.max_buffer_bytes
+                )));
+            }
 
-        if total_len > self.max_buffer_bytes {
-            self.buf.clear();
-            return Err(SipError::ParseError(format!(
-                "SIP stream message length {total_len} exceeds limit {}",
-                self.max_buffer_bytes
-            )));
+            let total_len = header_end
+                .checked_add(4)
+                .and_then(|n| n.checked_add(content_length))
+                .ok_or_else(|| {
+                    self.buf.clear();
+                    SipError::ParseError("SIP stream frame length overflow".to_string())
+                })?;
+
+            if total_len > self.max_buffer_bytes {
+                self.buf.clear();
+                return Err(SipError::ParseError(format!(
+                    "SIP stream message length {total_len} exceeds limit {}",
+                    self.max_buffer_bytes
+                )));
+            }
+
+            if self.buf.len() < total_len {
+                return Ok(None);
+            }
+
+            let msg: Vec<u8> = self.buf.drain(..total_len).collect();
+            return Ok(Some(StreamFrame::Message(msg)));
         }
-
-        if self.buf.len() < total_len {
-            return Ok(None);
-        }
-
-        let msg: Vec<u8> = self.buf.drain(..total_len).collect();
-        Ok(Some(StreamFrame::Message(msg)))
     }
 
     /// Extracts all currently complete [`StreamFrame`]s from the buffer.
@@ -286,11 +317,21 @@ fn parse_stream_content_length(header_bytes: &[u8]) -> Result<usize, SipError> {
     let header_text = std::str::from_utf8(header_bytes)
         .map_err(|_| SipError::ParseError("non-UTF-8 SIP stream headers".to_string()))?;
 
-    let mut found: Option<usize> = None;
+    // Unfold RFC 3261 §7.3.1 linear-whitespace continuation lines prior to field lookup.
+    let mut logical_lines: Vec<String> = Vec::new();
     for line in header_text.split("\r\n").skip(1) {
         if line.starts_with(' ') || line.starts_with('\t') {
-            continue;
+            if let Some(prev) = logical_lines.last_mut() {
+                prev.push(' ');
+                prev.push_str(line.trim());
+            }
+        } else {
+            logical_lines.push(line.to_string());
         }
+    }
+
+    let mut found: Option<usize> = None;
+    for line in logical_lines {
         let Some((name, value)) = line.split_once(':') else {
             continue;
         };
@@ -361,6 +402,7 @@ mod tests {
         wire.extend_from_slice(msg2);
 
         let mut framer = SipStreamFramer::new();
+        framer.note_keepalive_ping_sent();
         let mut frames = Vec::new();
         for b in &wire {
             framer.push(&[*b]).unwrap();
@@ -379,6 +421,7 @@ mod tests {
         assert_eq!(framer.buffered_len(), 0);
 
         // Coalesced single read produces all frames at once.
+        framer.note_keepalive_ping_sent();
         framer.push(&wire).unwrap();
         let coalesced = framer.drain_frames().unwrap();
         assert_eq!(coalesced, frames);
@@ -396,6 +439,26 @@ mod tests {
         let huge_cl = b"INVITE sip:bob@10.0.0.2 SIP/2.0\r\n\
             Content-Length: 999999\r\n\r\n";
         framer.push(huge_cl).unwrap();
+        assert!(framer.next_frame().is_err());
+        assert_eq!(framer.buffered_len(), 0);
+    }
+
+    #[test]
+    fn framer_ignores_unsolicited_crlf_supports_folded_cl_and_clears_only_bad_frame() {
+        let valid = b"\r\nOPTIONS sip:bob@10.0.0.2:5060 SIP/2.0\r\n\
+            Via: SIP/2.0/TCP 10.0.0.1:5060;branch=z9hG4bK-f1\r\n\
+            Content-Length:\r\n 0\r\n\r\n";
+        let bad = b"OPTIONS sip:bob@10.0.0.2:5060 SIP/2.0\r\n\
+            Via: SIP/2.0/TCP 10.0.0.1:5060;branch=z9hG4bK-f2\r\n\r\n";
+
+        let mut wire = Vec::new();
+        wire.extend_from_slice(valid);
+        wire.extend_from_slice(bad);
+
+        let mut framer = SipStreamFramer::new();
+        framer.push(&wire).unwrap();
+        let first = framer.next_frame().unwrap().expect("expected valid frame");
+        assert!(matches!(first, StreamFrame::Message(_)));
         assert!(framer.next_frame().is_err());
         assert_eq!(framer.buffered_len(), 0);
     }

@@ -256,6 +256,11 @@ impl RtpPacketizer {
         self.timestamp
     }
 
+    /// Advances the media RTP timestamp counter without emitting a packet (e.g., across DTX/CN intervals).
+    pub fn advance_timestamp(&mut self, samples: u32) {
+        self.timestamp = self.timestamp.wrapping_add(samples);
+    }
+
     /// Returns the next sequence number to be stamped.
     pub fn current_sequence(&self) -> u16 {
         self.sequence_number

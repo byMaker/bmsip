@@ -15,7 +15,7 @@ bmsip-cli call \
   --server <host:port> \
   --user <username> \
   --password <password> \
-  --target <sip_uri> \
+  --target <sip_or_tel_uri> \
   [--transport udp|tcp|tls] \
   [--srtp off|optional|sdes] \
   [--tls-ca <path>] \
@@ -35,6 +35,7 @@ bmsip-cli call \
   [--json-report <path>]
 ```
 
+- `--target <sip_or_tel_uri>`: Accepts `sip:`, `sips:`, or RFC 3966 `tel:` target URIs (`tel:` routes automatically to the configured `--server` registrar).
 - `--transport udp|tcp|tls`: Selects SIP signaling transport (`udp` default, `tcp`, or `tls` via pure-Rust `rustls` 1.2–1.3).
 - `--srtp off|optional|sdes`: Configures SRTP media encryption (`off` default `RTP/AVP`, `optional` opportunistic SDES over TLS, or `sdes` mandatory `RTP/SAVP` RFC 4568 `a=crypto:`, which requires `--transport tls`).
 - `--tls-ca <path>`, `--tls-server-name <hostname>`, `--tls-insecure`: Optional TLS trust bundle, SNI/hostname override, and lab-only certificate verification bypass.

@@ -2277,3 +2277,431 @@ fn p0_forked_second_2xx_triggers_ack_and_bye_for_forked_leg() {
     }));
     assert_eq!(alice.call_state(&call_id), Some(CallState::Established));
 }
+
+#[test]
+fn p1_tel_uri_stacked_407_401_sha256_preference_and_ack_auth() {
+    let t0 = Instant::now();
+    let registrar = SipUri::parse("sip:pbx.local:5060").unwrap();
+    let mut alice = UserAgent::new(UaConfig::new(
+        "alice",
+        "secretpw",
+        "pbx.local",
+        registrar,
+        "10.0.0.1",
+        5060,
+    ));
+
+    let call_id = alice
+        .dial(SipUri::parse("tel:+1-555-0199").unwrap(), 40000, t0)
+        .unwrap();
+    let inv1_bytes = alice.poll_transmit().remove(0);
+    let SipMessage::Request(inv1) = SipMessage::parse(&inv1_bytes).unwrap() else {
+        panic!("expected INVITE");
+    };
+    assert_eq!(inv1.uri.scheme, bmsip_core::sip::SipScheme::Tel);
+
+    // 1. Proxy sends 407 offering MD5 first and SHA-256 second -> UAC must prefer SHA-256.
+    let mut r407 = inv1
+        .create_response(407, "Proxy Authentication Required")
+        .unwrap();
+    r407.headers.add(
+        "Proxy-Authenticate",
+        "Digest realm=\"proxy\", nonce=\"n1\", algorithm=MD5, qop=\"auth\"",
+    );
+    r407.headers.add(
+        "Proxy-Authenticate",
+        "Digest realm=\"proxy\", nonce=\"n2\", algorithm=SHA-256, qop=\"auth\"",
+    );
+    let _ = alice.receive_datagram(&r407.to_bytes(), t0 + Duration::from_millis(10));
+    let inv2_bytes = alice
+        .poll_transmit()
+        .into_iter()
+        .find(|b| matches!(SipMessage::parse(b), Ok(SipMessage::Request(r)) if r.method == Method::Invite))
+        .unwrap();
+    let SipMessage::Request(inv2) = SipMessage::parse(&inv2_bytes).unwrap() else {
+        unreachable!();
+    };
+    let proxy_hdr = inv2.headers.get("Proxy-Authorization").unwrap().to_string();
+    assert!(proxy_hdr.contains("algorithm=SHA-256"));
+
+    // 2. Endpoint also challenges 401 -> retry must retain Proxy-Authorization alongside Authorization.
+    let mut r401 = inv2.create_response(401, "Unauthorized").unwrap();
+    r401.headers.set(
+        "WWW-Authenticate",
+        "Digest realm=\"uas\", nonce=\"n3\", algorithm=MD5, qop=\"auth\"",
+    );
+    let _ = alice.receive_datagram(&r401.to_bytes(), t0 + Duration::from_millis(20));
+    let inv3_bytes = alice
+        .poll_transmit()
+        .into_iter()
+        .find(|b| matches!(SipMessage::parse(b), Ok(SipMessage::Request(r)) if r.method == Method::Invite))
+        .unwrap();
+    let SipMessage::Request(inv3) = SipMessage::parse(&inv3_bytes).unwrap() else {
+        unreachable!();
+    };
+    assert!(inv3.headers.get("Proxy-Authorization").is_some());
+    assert!(inv3.headers.get("Authorization").is_some());
+
+    // 3. 200 OK -> ACK carries both Proxy-Authorization and Authorization.
+    let ans = SdpSession::new("bob", "1", "10.0.0.2", 50000, vec![RtpCodec::pcmu()]);
+    let mut r200 = inv3
+        .create_response(200, "OK")
+        .unwrap()
+        .with_body("application/sdp", ans.to_string().into_bytes());
+    r200.headers.set("To", "<tel:+1-555-0199>;tag=btag1");
+    r200.headers.set("Contact", "<sip:bob@10.0.0.2:5060>");
+    let _ = alice.receive_datagram(&r200.to_bytes(), t0 + Duration::from_millis(30));
+    let ack = alice
+        .poll_transmit()
+        .into_iter()
+        .filter_map(|b| match SipMessage::parse(&b).ok()? {
+            SipMessage::Request(r) if r.method == Method::Ack => Some(r),
+            _ => None,
+        })
+        .next()
+        .expect("expected ACK");
+    assert!(ack.headers.get("Proxy-Authorization").is_some());
+    assert!(ack.headers.get("Authorization").is_some());
+    assert_eq!(alice.call_state(&call_id), Some(CallState::Established));
+}
+
+#[test]
+fn p1_register_423_min_expires_retry_and_zero_contact_expires_unregisters() {
+    let t0 = Instant::now();
+    let registrar = SipUri::parse("sip:pbx.local:5060").unwrap();
+    let mut cfg = UaConfig::new("alice", "pw", "pbx.local", registrar, "10.0.0.1", 5060);
+    cfg.expires_secs = 30;
+    let mut ua = UserAgent::new(cfg);
+
+    ua.register(t0).unwrap();
+    let reg1 = match SipMessage::parse(&ua.poll_transmit().remove(0)).unwrap() {
+        SipMessage::Request(r) => r,
+        _ => panic!("expected REGISTER"),
+    };
+    let mut r423 = reg1.create_response(423, "Interval Too Brief").unwrap();
+    r423.headers.set("Min-Expires", "999999");
+    let _ = ua.receive_datagram(&r423.to_bytes(), t0 + Duration::from_millis(10));
+
+    let reg2 = match SipMessage::parse(&ua.poll_transmit().remove(0)).unwrap() {
+        SipMessage::Request(r) => r,
+        _ => panic!("expected retried REGISTER"),
+    };
+    assert_eq!(reg2.headers.get("Expires"), Some("86400"));
+
+    // 200 OK with Contact ;expires=0 must yield Unregistered instead of clamping to 1s.
+    let mut r200 = reg2.create_response(200, "OK").unwrap();
+    r200.headers
+        .set("Contact", "<sip:alice@10.0.0.1:5060>;expires=0");
+    let _ = ua.receive_datagram(&r200.to_bytes(), t0 + Duration::from_millis(20));
+    assert_eq!(ua.registration_state(), &RegistrationState::Unregistered);
+}
+
+#[test]
+fn p1_early_bye_487_cancel_timeout_reinvite_rollback_and_uas_to_tag() {
+    let t0 = Instant::now();
+    let reg = SipUri::parse("sip:pbx.local:5060").unwrap();
+
+    // 1. OPTIONS without To-tag must receive 200 OK with a generated To-tag.
+    let mut uas = UserAgent::new(UaConfig::new(
+        "bob",
+        "pw",
+        "pbx.local",
+        reg.clone(),
+        "10.0.0.2",
+        5062,
+    ));
+    let mut opt = SipRequest::new(
+        Method::Options,
+        SipUri::parse("sip:bob@10.0.0.2:5062").unwrap(),
+    );
+    opt.headers
+        .add("Via", "SIP/2.0/UDP 10.0.0.1:5060;branch=z9hG4bK-opt");
+    opt.headers.set("From", "<sip:alice@pbx.local>;tag=a1");
+    opt.headers.set("To", "<sip:bob@pbx.local>");
+    opt.headers.set("Call-ID", "opt-1");
+    opt.headers.set("CSeq", "1 OPTIONS");
+    let _ = uas.receive_datagram(&opt.to_bytes(), t0);
+    let opt_resp = match SipMessage::parse(&uas.poll_transmit().remove(0)).unwrap() {
+        SipMessage::Response(r) => r,
+        _ => panic!("expected OPTIONS 200 OK"),
+    };
+    assert!(opt_resp.to().unwrap().tag.is_some());
+
+    // 2. Early-dialog inbound BYE sends 487 on pending INVITE transaction.
+    let mut uac = UserAgent::new(UaConfig::new(
+        "alice",
+        "pw",
+        "pbx.local",
+        reg,
+        "10.0.0.1",
+        5060,
+    ));
+    let cid_in = "early-bye-1";
+    let mut inv = SipRequest::new(
+        Method::Invite,
+        SipUri::parse("sip:bob@10.0.0.2:5062").unwrap(),
+    )
+    .with_body(
+        "application/sdp",
+        SdpSession::new("alice", "1", "10.0.0.1", 40000, vec![RtpCodec::pcmu()])
+            .to_string()
+            .into_bytes(),
+    );
+    inv.headers
+        .add("Via", "SIP/2.0/UDP 10.0.0.1:5060;branch=z9hG4bK-inv");
+    inv.headers.set("From", "<sip:alice@pbx.local>;tag=atag1");
+    inv.headers.set("To", "<sip:bob@pbx.local>");
+    inv.headers.set("Call-ID", cid_in);
+    inv.headers.set("CSeq", "1 INVITE");
+    let _ = uas.receive_datagram(&inv.to_bytes(), t0);
+    let _ = uas.poll_transmit(); // 100
+    uas.ring(cid_in, t0 + Duration::from_millis(5)).unwrap();
+    let r180 = match SipMessage::parse(&uas.poll_transmit().remove(0)).unwrap() {
+        SipMessage::Response(r) => r,
+        _ => panic!("expected 180"),
+    };
+    let bob_tag = r180.to().unwrap().tag.unwrap();
+
+    let mut bye = SipRequest::new(Method::Bye, SipUri::parse("sip:bob@10.0.0.2:5062").unwrap());
+    bye.headers
+        .add("Via", "SIP/2.0/UDP 10.0.0.1:5060;branch=z9hG4bK-bye");
+    bye.headers.set("From", "<sip:alice@pbx.local>;tag=atag1");
+    bye.headers
+        .set("To", format!("<sip:bob@pbx.local>;tag={bob_tag}"));
+    bye.headers.set("Call-ID", cid_in);
+    bye.headers.set("CSeq", "2 BYE");
+    let _ = uas.receive_datagram(&bye.to_bytes(), t0 + Duration::from_millis(10));
+    let resps: Vec<u16> = uas
+        .poll_transmit()
+        .into_iter()
+        .filter_map(|b| match SipMessage::parse(&b).ok()? {
+            SipMessage::Response(r) => Some(r.status_code),
+            _ => None,
+        })
+        .collect();
+    assert!(resps.contains(&200));
+    assert!(resps.contains(&487));
+
+    // 3. CANCEL deadline (64 * T1) terminates Cancelling call even if 487 never arrives.
+    let cancel_cid = uac
+        .dial(SipUri::parse("sip:bob@10.0.0.2:5062").unwrap(), 40002, t0)
+        .unwrap();
+    let inv_req = match SipMessage::parse(&uac.poll_transmit().remove(0)).unwrap() {
+        SipMessage::Request(r) => r,
+        _ => panic!("expected INVITE"),
+    };
+    let r100 = inv_req.create_response(100, "Trying").unwrap();
+    let _ = uac.receive_datagram(&r100.to_bytes(), t0 + Duration::from_millis(5));
+    uac.hangup(&cancel_cid, t0 + Duration::from_millis(10))
+        .unwrap();
+    let _ = uac.poll_transmit();
+    let mut terminated = false;
+    let mut cur = t0 + Duration::from_millis(10);
+    for _ in 0..40 {
+        let Some(dl) = uac.poll_timeout() else {
+            break;
+        };
+        cur = dl;
+        let evs = uac.handle_timeout(cur);
+        let _ = uac.poll_transmit();
+        if evs
+            .iter()
+            .any(|e| matches!(e, UaEvent::CallTerminated { call_id, .. } if call_id == &cancel_cid))
+        {
+            terminated = true;
+            break;
+        }
+    }
+    assert!(terminated);
+
+    // 4. Failed hold re-INVITE rolls back local_hold and emits reverted CallHoldChanged.
+    let cid_hold = uac
+        .dial(SipUri::parse("sip:bob@10.0.0.2:5062").unwrap(), 40004, cur)
+        .unwrap();
+    let hold_inv = match SipMessage::parse(&uac.poll_transmit().remove(0)).unwrap() {
+        SipMessage::Request(r) => r,
+        _ => panic!("expected INVITE"),
+    };
+    let mut r200_h = hold_inv.create_response(200, "OK").unwrap().with_body(
+        "application/sdp",
+        SdpSession::new("bob", "1", "10.0.0.2", 50004, vec![RtpCodec::pcmu()])
+            .to_string()
+            .into_bytes(),
+    );
+    r200_h.headers.set("To", "<sip:bob@10.0.0.2:5062>;tag=bt2");
+    r200_h.headers.set("Contact", "<sip:bob@10.0.0.2:5062>");
+    let _ = uac.receive_datagram(&r200_h.to_bytes(), cur + Duration::from_millis(5));
+    let _ = uac.poll_transmit();
+
+    uac.hold(&cid_hold, cur + Duration::from_millis(10))
+        .unwrap();
+    let reinv = match SipMessage::parse(&uac.poll_transmit().remove(0)).unwrap() {
+        SipMessage::Request(r) => r,
+        _ => panic!("expected hold re-INVITE"),
+    };
+    let r488 = reinv.create_response(488, "Not Acceptable Here").unwrap();
+    let evs = uac.receive_datagram(&r488.to_bytes(), cur + Duration::from_millis(20));
+    assert_eq!(uac.call_state(&cid_hold), Some(CallState::Established));
+    assert!(evs.iter().any(|e| matches!(
+        e,
+        UaEvent::CallHoldChanged {
+            local_hold: false,
+            ..
+        }
+    )));
+}
+
+#[test]
+fn p1_session_timer_require_uas_fallback_and_isolated_422_config() {
+    let t0 = Instant::now();
+    let reg = SipUri::parse("sip:pbx.local:5060").unwrap();
+    let mut cfg = UaConfig::new("alice", "pw", "pbx.local", reg.clone(), "10.0.0.1", 5060);
+    cfg.session_expires_secs = Some(180);
+    cfg.min_se_secs = 90;
+    let mut ua = UserAgent::new(cfg);
+
+    // 422 Min-SE on Call 1 must not mutate ua.config().min_se_secs for Call 2.
+    let _cid1 = ua
+        .dial(SipUri::parse("sip:bob@10.0.0.2:5062").unwrap(), 40000, t0)
+        .unwrap();
+    let inv1 = match SipMessage::parse(&ua.poll_transmit().remove(0)).unwrap() {
+        SipMessage::Request(r) => r,
+        _ => panic!("expected INVITE"),
+    };
+    let mut r422 = inv1
+        .create_response(422, "Session Interval Too Small")
+        .unwrap();
+    r422.headers.set("Min-SE", "1800");
+    let _ = ua.receive_datagram(&r422.to_bytes(), t0 + Duration::from_millis(5));
+    let _ = ua.poll_transmit();
+    assert_eq!(ua.config().min_se_secs, 90);
+    assert_eq!(ua.config().session_expires_secs, Some(180));
+
+    let cid2 = ua
+        .dial(SipUri::parse("sip:carol@10.0.0.3:5062").unwrap(), 40002, t0)
+        .unwrap();
+    let inv2 = match SipMessage::parse(&ua.poll_transmit().remove(0)).unwrap() {
+        SipMessage::Request(r) => r,
+        _ => panic!("expected INVITE 2"),
+    };
+    assert_eq!(inv2.headers.get("Session-Expires"), Some("180"));
+    assert_eq!(inv2.headers.get("Min-SE"), Some("90"));
+
+    // Establish cid2 with refresher=uac, Session-Expires: 6 -> triggers UPDATE refresh -> 405 falls back to re-INVITE.
+    let mut r200 = inv2.create_response(200, "OK").unwrap().with_body(
+        "application/sdp",
+        SdpSession::new("carol", "1", "10.0.0.3", 50002, vec![RtpCodec::pcmu()])
+            .to_string()
+            .into_bytes(),
+    );
+    r200.headers
+        .set("To", "<sip:carol@10.0.0.3:5062>;tag=ctag1");
+    r200.headers.set("Contact", "<sip:carol@10.0.0.3:5062>");
+    r200.headers.set("Session-Expires", "6;refresher=uac");
+    let _ = ua.receive_datagram(&r200.to_bytes(), t0 + Duration::from_millis(10));
+    let _ = ua.poll_transmit();
+
+    let t_ref = t0 + Duration::from_secs(4);
+    let _ = ua.handle_timeout(t_ref);
+    let upd = ua
+        .poll_transmit()
+        .into_iter()
+        .filter_map(|b| match SipMessage::parse(&b).ok()? {
+            SipMessage::Request(r) if r.method == Method::Update => Some(r),
+            _ => None,
+        })
+        .next()
+        .expect("expected UPDATE refresh");
+    assert_eq!(upd.method, Method::Update);
+    let r405 = upd.create_response(405, "Method Not Allowed").unwrap();
+    let _ = ua.receive_datagram(&r405.to_bytes(), t_ref + Duration::from_millis(5));
+    let reinv = match SipMessage::parse(&ua.poll_transmit().remove(0)).unwrap() {
+        SipMessage::Request(r) => r,
+        _ => panic!("expected re-INVITE fallback"),
+    };
+    assert_eq!(reinv.method, Method::Invite);
+
+    // 200 OK to fallback re-INVITE without Session-Expires clears session timer so no later 408 BYE fires.
+    let mut r200_re = reinv.create_response(200, "OK").unwrap().with_body(
+        "application/sdp",
+        SdpSession::new("carol", "2", "10.0.0.3", 50002, vec![RtpCodec::pcmu()])
+            .to_string()
+            .into_bytes(),
+    );
+    r200_re.headers.set("Contact", "<sip:carol@10.0.0.3:5062>");
+    let _ = ua.receive_datagram(&r200_re.to_bytes(), t_ref + Duration::from_millis(10));
+    let _ = ua.poll_transmit();
+    let _ = ua.handle_timeout(t_ref + Duration::from_secs(30));
+    assert_eq!(ua.call_state(&cid2), Some(CallState::Established));
+
+    // UAS side: Request with Supported: timer -> Require: timer + refresher=uac; without Supported -> refresher=uas and no Require.
+    let mut uas_cfg = UaConfig::new("bob", "pw", "pbx.local", reg, "10.0.0.2", 5062);
+    uas_cfg.session_expires_secs = Some(90);
+    let mut uas = UserAgent::new(uas_cfg);
+    let mut inv_sup = SipRequest::new(
+        Method::Invite,
+        SipUri::parse("sip:bob@10.0.0.2:5062").unwrap(),
+    )
+    .with_body(
+        "application/sdp",
+        SdpSession::new("uac", "1", "10.0.0.1", 40010, vec![RtpCodec::pcmu()])
+            .to_string()
+            .into_bytes(),
+    );
+    inv_sup
+        .headers
+        .add("Via", "SIP/2.0/UDP 10.0.0.1:5060;branch=z9hG4bK-s1");
+    inv_sup.headers.set("From", "<sip:a@pbx.local>;tag=a1");
+    inv_sup.headers.set("To", "<sip:bob@pbx.local>");
+    inv_sup.headers.set("Call-ID", "se-uas-1");
+    inv_sup.headers.set("CSeq", "1 INVITE");
+    inv_sup.headers.set("Supported", "timer");
+    let _ = uas.receive_datagram(&inv_sup.to_bytes(), t0);
+    let _ = uas.poll_transmit();
+    uas.answer("se-uas-1", 50010, t0 + Duration::from_millis(5))
+        .unwrap();
+    let ans_sup = match SipMessage::parse(&uas.poll_transmit().remove(0)).unwrap() {
+        SipMessage::Response(r) => r,
+        _ => panic!("expected 200 OK"),
+    };
+    assert!(ans_sup
+        .headers
+        .get("Require")
+        .is_some_and(|v| v.contains("timer")));
+    assert_eq!(
+        ans_sup.headers.get("Session-Expires"),
+        Some("90;refresher=uac")
+    );
+
+    let mut inv_nosup = SipRequest::new(
+        Method::Invite,
+        SipUri::parse("sip:bob@10.0.0.2:5062").unwrap(),
+    )
+    .with_body(
+        "application/sdp",
+        SdpSession::new("uac", "1", "10.0.0.1", 40012, vec![RtpCodec::pcmu()])
+            .to_string()
+            .into_bytes(),
+    );
+    inv_nosup
+        .headers
+        .add("Via", "SIP/2.0/UDP 10.0.0.1:5060;branch=z9hG4bK-s2");
+    inv_nosup.headers.set("From", "<sip:a@pbx.local>;tag=a2");
+    inv_nosup.headers.set("To", "<sip:bob@pbx.local>");
+    inv_nosup.headers.set("Call-ID", "se-uas-2");
+    inv_nosup.headers.set("CSeq", "1 INVITE");
+    inv_nosup.headers.set("Session-Expires", "90");
+    let _ = uas.receive_datagram(&inv_nosup.to_bytes(), t0);
+    let _ = uas.poll_transmit();
+    uas.answer("se-uas-2", 50012, t0 + Duration::from_millis(5))
+        .unwrap();
+    let ans_nosup = match SipMessage::parse(&uas.poll_transmit().remove(0)).unwrap() {
+        SipMessage::Response(r) => r,
+        _ => panic!("expected 200 OK"),
+    };
+    assert_eq!(
+        ans_nosup.headers.get("Session-Expires"),
+        Some("90;refresher=uas")
+    );
+    assert!(ans_nosup.headers.get("Require").is_none());
+}

@@ -292,6 +292,7 @@ impl StreamPeer {
                 && now >= self.next_keepalive_at
                 && self.plain_tx.is_empty()
             {
+                self.framer.note_keepalive_ping_sent();
                 self.plain_tx.push(RFC5626_KEEPALIVE_PING.to_vec());
                 self.next_keepalive_at = now + RFC5626_KEEPALIVE_INTERVAL;
                 progressed = true;
@@ -446,11 +447,14 @@ impl SipTransportDriver {
         new_sip_port: u16,
         remote_probe: SocketAddr,
     ) -> Result<SocketAddr, EngineError> {
-        let (udp_socket, tcp_listener, local_addr) =
-            bind_transport_sockets(self.mode, new_bind_ip, new_sip_port, remote_probe)?;
+        // Release old sockets before rebinding so binding the same port (e.g. 5060) on a new interface does not hit EADDRINUSE.
+        self.udp_socket = None;
+        self.tcp_listener = None;
         self.connections.clear();
         self.pending_connects.clear();
         self.pending_rx.clear();
+        let (udp_socket, tcp_listener, local_addr) =
+            bind_transport_sockets(self.mode, new_bind_ip, new_sip_port, remote_probe)?;
         self.udp_socket = udp_socket;
         self.tcp_listener = tcp_listener;
         self.protected_peer = remote_probe;

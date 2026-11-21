@@ -387,20 +387,26 @@ struct ServerNonInviteTransaction {
     reliable: bool,
     last_response: Option<Vec<u8>>,
     timer_j: Option<Instant>,
+    // Bounds Trying/Proceeding lifetime if the local UAS never emits a final response.
+    lifetime_timer: Option<Instant>,
 }
 
 impl ServerNonInviteTransaction {
-    fn new(reliable: bool) -> Self {
+    fn new(reliable: bool, now: Instant, timers: RfcTimers) -> Self {
         Self {
             state: NistState::Trying,
             reliable,
             last_response: None,
             timer_j: None,
+            lifetime_timer: Some(now + timers.timer_f()),
         }
     }
 
     fn next_timeout(&self) -> Option<Instant> {
-        self.timer_j
+        match (self.timer_j, self.lifetime_timer) {
+            (Some(a), Some(b)) => Some(a.min(b)),
+            (a, b) => a.or(b),
+        }
     }
 
     fn on_retransmit(&self, outbound: &mut VecDeque<Vec<u8>>) {
@@ -433,6 +439,7 @@ impl ServerNonInviteTransaction {
                     self.state = NistState::Proceeding;
                 } else if (200..700).contains(&code) {
                     self.state = NistState::Completed;
+                    self.lifetime_timer = None;
                     let j = timers.timer_j();
                     // RFC 3261 §17.2.2: Timer J = 0 s for reliable transports.
                     if self.reliable || j.is_zero() {
@@ -459,6 +466,15 @@ impl ServerNonInviteTransaction {
         if self.state == NistState::Completed && self.timer_j.is_some_and(|dl| now >= dl) {
             self.state = NistState::Terminated;
             self.timer_j = None;
+            self.lifetime_timer = None;
+            events.push(TransactionEvent::TransactionTerminated(tx_id.clone()));
+            return;
+        }
+        if matches!(self.state, NistState::Trying | NistState::Proceeding)
+            && self.lifetime_timer.is_some_and(|dl| now >= dl)
+        {
+            self.state = NistState::Terminated;
+            self.lifetime_timer = None;
             events.push(TransactionEvent::TransactionTerminated(tx_id.clone()));
         }
     }
@@ -841,6 +857,32 @@ impl TransactionManager {
                     }
                 };
 
+                let validate = (|| -> Result<(), SipError> {
+                    req.from()?;
+                    req.to()?;
+                    let call_id = req.call_id()?;
+                    if call_id.trim().is_empty() {
+                        return Err(SipError::MissingHeader("Call-ID"));
+                    }
+                    let cseq = req.cseq()?;
+                    if req.method != Method::Ack && cseq.method != req.method {
+                        return Err(SipError::ParseError(format!(
+                            "CSeq method {} does not match request method {}",
+                            cseq.method, req.method
+                        )));
+                    }
+                    Ok(())
+                })();
+                if let Err(err) = validate {
+                    events.push(TransactionEvent::ProtocolWarning(err.to_string()));
+                    if req.method != Method::Ack {
+                        if let Ok(resp) = req.create_response(400, "Bad Request") {
+                            self.outbound.push_back(resp.to_bytes());
+                        }
+                    }
+                    return events;
+                }
+
                 if req.method == Method::Ack {
                     let invite_id = TransactionId {
                         branch,
@@ -876,7 +918,11 @@ impl TransactionManager {
                 let tx = if req.method == Method::Invite {
                     ServerTx::Invite(ServerInviteTransaction::new(reliable))
                 } else {
-                    ServerTx::NonInvite(ServerNonInviteTransaction::new(reliable))
+                    ServerTx::NonInvite(ServerNonInviteTransaction::new(
+                        reliable,
+                        now,
+                        self.timers,
+                    ))
                 };
                 self.server_txs.insert(tx_id.clone(), tx);
                 events.push(TransactionEvent::ServerRequest {
@@ -1087,5 +1133,53 @@ mod tests {
             .iter()
             .any(|e| matches!(e, TransactionEvent::ClientFinal { .. })));
         assert_eq!(client.active_client_count(), 0);
+    }
+
+    #[test]
+    fn server_non_invite_expires_after_64_t1_and_rejects_invalid_requests_with_400() {
+        let t0 = Instant::now();
+        let mut server = TransactionManager::default();
+
+        // Missing To/From/CSeq mismatch must not leak into server_txs.
+        let mut bad_req = SipRequest::new(Method::Bye, SipUri::parse("sip:bob@10.0.0.2").unwrap());
+        bad_req
+            .headers
+            .add("Via", "SIP/2.0/UDP 10.0.0.1:5060;branch=z9hG4bK-bad1");
+        bad_req.headers.set("From", "<sip:alice@pbx.local>;tag=a1");
+        bad_req.headers.set("To", "<sip:bob@pbx.local>;tag=b1");
+        bad_req.headers.set("Call-ID", "bad-bye-1");
+        bad_req.headers.set("CSeq", "1 INVITE");
+
+        let evs = server.receive_message(SipMessage::Request(bad_req), t0);
+        assert!(evs
+            .iter()
+            .any(|e| matches!(e, TransactionEvent::ProtocolWarning(_))));
+        assert_eq!(server.active_server_count(), 0);
+        let out = server.poll_transmit();
+        assert_eq!(out.len(), 1);
+        let SipMessage::Response(resp) = SipMessage::parse(&out[0]).unwrap() else {
+            panic!("expected stateless 400 Bad Request");
+        };
+        assert_eq!(resp.status_code, 400);
+
+        // Abandoned Trying NIST must terminate after 64 * T1.
+        let mut opt_req =
+            SipRequest::new(Method::Options, SipUri::parse("sip:bob@10.0.0.2").unwrap());
+        opt_req
+            .headers
+            .add("Via", "SIP/2.0/UDP 10.0.0.1:5060;branch=z9hG4bK-opt1");
+        opt_req.headers.set("From", "<sip:alice@pbx.local>;tag=a1");
+        opt_req.headers.set("To", "<sip:bob@pbx.local>");
+        opt_req.headers.set("Call-ID", "opt-tx-1");
+        opt_req.headers.set("CSeq", "1 OPTIONS");
+
+        let _ = server.receive_message(SipMessage::Request(opt_req), t0);
+        assert_eq!(server.active_server_count(), 1);
+        let dl = server.poll_timeout().expect("expected NIST lifetime deadline");
+        let term_evs = server.handle_timeout(dl);
+        assert!(term_evs
+            .iter()
+            .any(|e| matches!(e, TransactionEvent::TransactionTerminated(_))));
+        assert_eq!(server.active_server_count(), 0);
     }
 }

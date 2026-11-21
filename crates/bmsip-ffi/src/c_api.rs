@@ -567,7 +567,7 @@ pub unsafe extern "C" fn bmsip_client_resume(client: *const BmsipClientHandle) -
     }
 }
 
-/// Pushes one 20 ms (160-sample) mono 16-bit PCM microphone frame.
+/// Pushes one 20 ms mono 16-bit PCM microphone frame matching `bmsip_client_audio_sample_rate_hz(client) / 50`.
 ///
 /// # Safety
 /// `client` must be valid and `samples` must point to at least `len` `int16_t` elements.
@@ -583,7 +583,11 @@ pub unsafe extern "C" fn bmsip_client_push_pcm(
     if samples.is_null() {
         return -1;
     }
-    // SAFETY: Caller guarantees `samples` points to `len` valid `i16` values.
+    let expected = (c.audio_sample_rate_hz() as usize) / 50;
+    if expected == 0 || len != expected {
+        return -1;
+    }
+    // SAFETY: `len` matches exact expected 20 ms frame length and caller guarantees valid buffer of `len` elements.
     let pcm = unsafe { slice::from_raw_parts(samples, len) };
     if c.push_captured_pcm(pcm.to_vec()).is_ok() {
         0
@@ -594,7 +598,7 @@ pub unsafe extern "C" fn bmsip_client_push_pcm(
 
 /// Pops one 20 ms decoded mono PCM playout frame into `out_samples`.
 ///
-/// Returns number of samples copied (`160`), `0` if empty, or `-1` on invalid arguments.
+/// Returns number of samples copied, `0` if empty, or `-1` on invalid arguments / insufficient `capacity`.
 ///
 /// # Safety
 /// `client` must be valid and `out_samples` must hold at least `capacity` `int16_t` elements.
@@ -610,6 +614,10 @@ pub unsafe extern "C" fn bmsip_client_pop_pcm(
     if out_samples.is_null() {
         return -1;
     }
+    let expected = (c.audio_sample_rate_hz() as usize) / 50;
+    if expected == 0 || capacity < expected {
+        return -1;
+    }
     let Some(frame) = c.pop_playout_pcm() else {
         return 0;
     };
@@ -620,6 +628,56 @@ pub unsafe extern "C" fn bmsip_client_pop_pcm(
     let dst = unsafe { slice::from_raw_parts_mut(out_samples, frame.len()) };
     dst.copy_from_slice(&frame);
     frame.len() as i32
+}
+
+/// Returns the bound local SIP address (`ip:port`) as a heap-allocated C string (`NULL` on error).
+///
+/// Free non-null results with `bmsip_string_free`.
+///
+/// # Safety
+/// `client` must be a valid handle created by `bmsip_client_new*`.
+#[no_mangle]
+pub unsafe extern "C" fn bmsip_client_local_sip_addr(
+    client: *const BmsipClientHandle,
+) -> *mut c_char {
+    let Some(c) = (unsafe { client_ref(client) }) else {
+        return ptr::null_mut();
+    };
+    match CString::new(c.local_sip_address()) {
+        Ok(cstr) => cstr.into_raw(),
+        Err(_) => ptr::null_mut(),
+    }
+}
+
+/// Requests a Flight Recorder telemetry snapshot (all calls when `call_id` is NULL/empty) via the event queue.
+///
+/// # Safety
+/// `client` must be valid; `call_id` may be null or a valid NUL-terminated UTF-8 C string.
+#[no_mangle]
+pub unsafe extern "C" fn bmsip_client_request_telemetry(
+    client: *const BmsipClientHandle,
+    call_id: *const c_char,
+) -> i32 {
+    let Some(c) = (unsafe { client_ref(client) }) else {
+        return -1;
+    };
+    let cid = if call_id.is_null() {
+        None
+    } else {
+        let Some(s) = (unsafe { cstr_to_string(call_id) }) else {
+            return -1;
+        };
+        if s.is_empty() {
+            None
+        } else {
+            Some(s)
+        }
+    };
+    if c.request_telemetry(cid).is_ok() {
+        0
+    } else {
+        -1
+    }
 }
 
 /// Polls the next event as a heap-allocated JSON C string (`NULL` if no event).

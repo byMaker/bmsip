@@ -1,12 +1,30 @@
-//! MODULE_CONTRACT: RFC 3550 RTCP compound packet codec (`SR`, `RR`, `BYE`) and receiver stream statistics (`RtpStreamStats`).
-//! INVARIANTS: Validates `V=2` and word-aligned RTCP packet bounds; computes RFC 3550 Appendix A.1/A.8 extended sequence, packet loss, and interarrival jitter.
-//! RFC_REFS: RFC 3550 Sections 6.1–6.4, Appendix A.1, Appendix A.8.
+//! MODULE_CONTRACT: RFC 3550 RTCP compound packet codec (`SR`, `RR`, `SDES`, `BYE`) and receiver stream statistics (`RtpStreamStats`).
+//! INVARIANTS: Validates `V=2` and word-aligned RTCP packet bounds; computes RFC 3550 Appendix A.1/A.8 extended sequence, packet loss, modular interarrival jitter, and `DLSR`.
+//! RFC_REFS: RFC 3550 Sections 6.1–6.5, Appendix A.1, Appendix A.8.
 
 use crate::error::MediaError;
 
 const PT_SR: u8 = 200;
 const PT_RR: u8 = 201;
+const PT_SDES: u8 = 202;
 const PT_BYE: u8 = 203;
+
+/// RFC 3550 §6.5.1 SDES `CNAME` item type (`1`).
+pub const SDES_CNAME: u8 = 1;
+
+/// Single RFC 3550 §6.5 RTCP SDES item.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SdesItem {
+    pub item_type: u8,
+    pub value: String,
+}
+
+/// Source description chunk associating an SSRC/CSRC with one or more [`SdesItem`] entries.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SdesChunk {
+    pub ssrc: u32,
+    pub items: Vec<SdesItem>,
+}
 
 /// RTCP reception report block (24 bytes, RFC 3550 Section 6.4.1).
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -111,6 +129,9 @@ pub enum RtcpPacket {
         ssrc: u32,
         reports: Vec<ReceptionReportBlock>,
     },
+    Sdes {
+        chunks: Vec<SdesChunk>,
+    },
     Bye {
         sources: Vec<u32>,
         reason: Option<String>,
@@ -187,6 +208,10 @@ impl RtcpPacket {
                     let reports = parse_report_blocks(&body[4..], usize::from(count))?;
                     Self::ReceiverReport { ssrc, reports }
                 }
+                PT_SDES => {
+                    let chunks = parse_sdes_chunks(body, usize::from(count))?;
+                    Self::Sdes { chunks }
+                }
                 PT_BYE => {
                     let sc = usize::from(count);
                     if body.len() < sc * 4 {
@@ -254,6 +279,29 @@ impl RtcpPacket {
                 }
                 (PT_RR, rc as u8)
             }
+            Self::Sdes { chunks } => {
+                let sc = chunks.len().min(31);
+                for chunk in chunks.iter().take(sc) {
+                    let chunk_start = body.len();
+                    body.extend_from_slice(&chunk.ssrc.to_be_bytes());
+                    for item in &chunk.items {
+                        if item.item_type == 0 {
+                            continue;
+                        }
+                        let val_bytes = item.value.as_bytes();
+                        let len = val_bytes.len().min(255);
+                        body.push(item.item_type);
+                        body.push(len as u8);
+                        body.extend_from_slice(&val_bytes[..len]);
+                    }
+                    // RFC 3550 §6.5: END item (0) followed by null padding to a 32-bit chunk boundary.
+                    body.push(0);
+                    while !(body.len() - chunk_start).is_multiple_of(4) {
+                        body.push(0);
+                    }
+                }
+                (PT_SDES, sc as u8)
+            }
             Self::Bye { sources, reason } => {
                 let sc = sources.len().min(31);
                 for src in sources.iter().take(sc) {
@@ -304,6 +352,53 @@ fn parse_report_blocks(raw: &[u8], count: usize) -> Result<Vec<ReceptionReportBl
     Ok(blocks)
 }
 
+fn parse_sdes_chunks(raw: &[u8], count: usize) -> Result<Vec<SdesChunk>, MediaError> {
+    let mut chunks = Vec::with_capacity(count);
+    let mut pos = 0usize;
+    for _ in 0..count {
+        if raw.len() - pos < 4 {
+            return Err(MediaError::PacketTooShort);
+        }
+        let chunk_start = pos;
+        let ssrc = u32::from_be_bytes([raw[pos], raw[pos + 1], raw[pos + 2], raw[pos + 3]]);
+        pos += 4;
+        let mut items = Vec::new();
+        let mut found_end = false;
+        while pos < raw.len() {
+            let item_type = raw[pos];
+            pos += 1;
+            if item_type == 0 {
+                while !(pos - chunk_start).is_multiple_of(4) {
+                    if pos >= raw.len() {
+                        return Err(MediaError::PacketTooShort);
+                    }
+                    pos += 1;
+                }
+                found_end = true;
+                break;
+            }
+            if pos >= raw.len() {
+                return Err(MediaError::PacketTooShort);
+            }
+            let len = usize::from(raw[pos]);
+            pos += 1;
+            if raw.len() - pos < len {
+                return Err(MediaError::PacketTooShort);
+            }
+            let value = String::from_utf8_lossy(&raw[pos..pos + len]).to_string();
+            pos += len;
+            items.push(SdesItem { item_type, value });
+        }
+        if !found_end {
+            return Err(MediaError::InvalidHeader(
+                "RTCP SDES chunk missing END terminator".to_string(),
+            ));
+        }
+        chunks.push(SdesChunk { ssrc, items });
+    }
+    Ok(chunks)
+}
+
 /// Receiver RTP sequence, loss, and RFC 3550 §6.4.1 interarrival jitter tracker.
 #[derive(Debug, Clone, Default)]
 pub struct RtpStreamStats {
@@ -314,9 +409,11 @@ pub struct RtpStreamStats {
     received: u32,
     expected_prior: u32,
     received_prior: u32,
-    transit: i64,
+    transit: u32,
+    transit_initialized: bool,
     jitter: f64,
     last_sr_lsr: u32,
+    last_sr_received_at_ms: Option<u64>,
 }
 
 impl RtpStreamStats {
@@ -330,19 +427,15 @@ impl RtpStreamStats {
         *self = Self::new();
     }
 
-    /// Records a received RTP packet and updates loss/jitter estimates per RFC 3550 Appendix A.1/A.8.
-    pub fn record_packet(&mut self, seq: u16, rtp_timestamp: u32, arrival_timestamp_samples: u32) {
+    fn record_seq(&mut self, seq: u16) {
         if !self.initialized {
             self.initialized = true;
             self.base_seq = u32::from(seq);
             self.max_seq = seq;
             self.cycles = 0;
             self.received = 1;
-            self.transit = i64::from(arrival_timestamp_samples) - i64::from(rtp_timestamp);
-            self.jitter = 0.0;
             return;
         }
-
         self.received = self.received.saturating_add(1);
         let udelta = seq.wrapping_sub(self.max_seq);
         if udelta < 32768 {
@@ -351,16 +444,40 @@ impl RtpStreamStats {
             }
             self.max_seq = seq;
         }
+    }
 
-        let transit = i64::from(arrival_timestamp_samples) - i64::from(rtp_timestamp);
-        let d = (transit - self.transit).abs() as f64;
+    /// Records a received non-audio RTP packet (DTMF `telephone-event`, Comfort Noise) for sequence/loss tracking without disturbing jitter.
+    pub fn record_non_audio_packet(&mut self, seq: u16) {
+        self.record_seq(seq);
+    }
+
+    /// Records a received RTP audio packet and updates loss/jitter estimates per RFC 3550 Appendix A.1/A.8.
+    pub fn record_packet(&mut self, seq: u16, rtp_timestamp: u32, arrival_timestamp_samples: u32) {
+        self.record_seq(seq);
+
+        let transit = arrival_timestamp_samples.wrapping_sub(rtp_timestamp);
+        if !self.transit_initialized {
+            self.transit_initialized = true;
+            self.transit = transit;
+            self.jitter = 0.0;
+            return;
+        }
+
+        let d = (transit.wrapping_sub(self.transit) as i32).unsigned_abs() as f64;
         self.transit = transit;
         self.jitter += (d - self.jitter) / 16.0;
     }
 
-    /// Records NTP timestamp from an inbound RTCP Sender Report (`LSR`).
+    /// Records NTP timestamp from an inbound RTCP Sender Report (`LSR`) without an arrival timestamp (`DLSR = 0`).
     pub fn record_sender_report(&mut self, ntp_timestamp: u64) {
         self.last_sr_lsr = ((ntp_timestamp >> 16) & 0xffff_ffff) as u32;
+        self.last_sr_received_at_ms = None;
+    }
+
+    /// Records NTP timestamp from an inbound RTCP Sender Report (`LSR`) together with its monotonic arrival timestamp in ms (`DLSR`).
+    pub fn record_sender_report_at(&mut self, ntp_timestamp: u64, now_ms: u64) {
+        self.last_sr_lsr = ((ntp_timestamp >> 16) & 0xffff_ffff) as u32;
+        self.last_sr_received_at_ms = Some(now_ms);
     }
 
     /// Returns total received RTP packet count.
@@ -383,8 +500,17 @@ impl RtpStreamStats {
         expected as i32 - self.received as i32
     }
 
-    /// Builds a non-mutating [`ReceptionReportBlock`] snapshot for `source_ssrc`.
+    /// Builds a non-mutating [`ReceptionReportBlock`] snapshot for `source_ssrc` with `DLSR = 0`.
     pub fn snapshot_reception_report(&self, source_ssrc: u32) -> ReceptionReportBlock {
+        self.snapshot_reception_report_at(source_ssrc, None)
+    }
+
+    /// Builds a non-mutating [`ReceptionReportBlock`] snapshot for `source_ssrc`, computing `DLSR` when `now_ms` and SR arrival time are present.
+    pub fn snapshot_reception_report_at(
+        &self,
+        source_ssrc: u32,
+        now_ms: Option<u64>,
+    ) -> ReceptionReportBlock {
         let extended_max = if self.initialized {
             self.cycles + u32::from(self.max_seq)
         } else {
@@ -404,6 +530,13 @@ impl RtpStreamStats {
             ((lost_interval as u64 * 256) / u64::from(expected_interval)).min(255) as u8
         };
 
+        let dlsr = match (self.last_sr_lsr != 0, self.last_sr_received_at_ms, now_ms) {
+            (true, Some(rx_ms), Some(cur_ms)) => (((cur_ms.saturating_sub(rx_ms) as u128) * 65_536)
+                / 1_000)
+                .min(u128::from(u32::MAX)) as u32,
+            _ => 0,
+        };
+
         ReceptionReportBlock {
             ssrc: source_ssrc,
             fraction_lost,
@@ -411,13 +544,22 @@ impl RtpStreamStats {
             extended_highest_seq: extended_max,
             jitter: self.jitter(),
             lsr: self.last_sr_lsr,
-            dlsr: 0,
+            dlsr,
         }
     }
 
-    /// Builds a [`ReceptionReportBlock`] and advances interval counters for the next RTCP cycle.
+    /// Builds a [`ReceptionReportBlock`] (`DLSR = 0`) and advances interval counters for the next RTCP cycle.
     pub fn build_reception_report(&mut self, source_ssrc: u32) -> ReceptionReportBlock {
-        let block = self.snapshot_reception_report(source_ssrc);
+        self.build_reception_report_at(source_ssrc, None)
+    }
+
+    /// Builds a [`ReceptionReportBlock`] with optional monotonic `now_ms` (`DLSR`) and advances interval counters.
+    pub fn build_reception_report_at(
+        &mut self,
+        source_ssrc: u32,
+        now_ms: Option<u64>,
+    ) -> ReceptionReportBlock {
+        let block = self.snapshot_reception_report_at(source_ssrc, now_ms);
         if self.initialized {
             self.expected_prior = block.extended_highest_seq.saturating_sub(self.base_seq) + 1;
             self.received_prior = self.received;
@@ -476,5 +618,41 @@ mod tests {
         assert_eq!(report.extended_highest_seq, 65537);
         assert_eq!(report.cumulative_lost, 1);
         assert_eq!(report.fraction_lost, 64);
+    }
+
+    #[test]
+    fn sdes_cname_packet_roundtrips() {
+        let sdes = RtcpPacket::Sdes {
+            chunks: vec![SdesChunk {
+                ssrc: 0x1234_5678,
+                items: vec![SdesItem {
+                    item_type: SDES_CNAME,
+                    value: "alice@example.com".to_string(),
+                }],
+            }],
+        };
+        let wire = sdes.to_bytes();
+        assert_eq!(wire.len() % 4, 0);
+        let parsed = RtcpPacket::parse_compound(&wire).unwrap();
+        assert_eq!(parsed, vec![sdes]);
+    }
+
+    #[test]
+    fn stream_stats_handles_32bit_timestamp_wrap_non_audio_and_dlsr() {
+        let mut stats = RtpStreamStats::new();
+        stats.record_packet(1, u32::MAX - 79, 10_000);
+        stats.record_packet(2, 80, 10_160);
+        assert_eq!(stats.jitter(), 0);
+
+        stats.record_non_audio_packet(3);
+        stats.record_packet(4, 400, 10_480);
+        assert_eq!(stats.received_count(), 4);
+        assert_eq!(stats.cumulative_lost(), 0);
+        assert_eq!(stats.jitter(), 0);
+
+        stats.record_sender_report_at(0x0102_0304_0506_0708, 1_000);
+        let report = stats.build_reception_report_at(0x5555, Some(2_500));
+        assert_eq!(report.lsr, 0x0304_0506);
+        assert_eq!(report.dlsr, 98_304);
     }
 }

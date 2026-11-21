@@ -877,3 +877,80 @@ fn p0_ffi_poll_event_does_not_block_concurrent_commands() {
     client.shutdown();
     poll_thread.join().unwrap();
 }
+
+#[test]
+fn c_api_bounds_check_pcm_and_expose_addr_and_telemetry() {
+    use bmsip_ffi::{
+        bmsip_client_free, bmsip_client_local_sip_addr, bmsip_client_new_ex,
+        bmsip_client_poll_event_json, bmsip_client_pop_pcm, bmsip_client_push_pcm,
+        bmsip_client_request_telemetry, bmsip_string_free,
+    };
+    use std::ffi::{CStr, CString};
+
+    let user = CString::new("1001").unwrap();
+    let pass = CString::new("pw").unwrap();
+    let domain = CString::new("127.0.0.1").unwrap();
+    let reg = CString::new("127.0.0.1:59998").unwrap();
+    let bind = CString::new("127.0.0.1").unwrap();
+
+    // SAFETY: all pointers are valid NUL-terminated C strings.
+    let handle = unsafe {
+        bmsip_client_new_ex(
+            user.as_ptr(),
+            pass.as_ptr(),
+            domain.as_ptr(),
+            reg.as_ptr(),
+            bind.as_ptr(),
+            0,
+            0,
+            8_000,
+        )
+    };
+    assert!(!handle.is_null());
+
+    // SAFETY: valid handle; mismatched PCM lengths/capacities must fail with -1.
+    unsafe {
+        let short_samples = [0i16; 159];
+        let valid_samples = [0i16; 160];
+        let long_samples = [0i16; 161];
+        assert_eq!(
+            bmsip_client_push_pcm(handle, short_samples.as_ptr(), short_samples.len()),
+            -1
+        );
+        assert_eq!(
+            bmsip_client_push_pcm(handle, long_samples.as_ptr(), long_samples.len()),
+            -1
+        );
+        assert_eq!(
+            bmsip_client_push_pcm(handle, valid_samples.as_ptr(), valid_samples.len()),
+            0
+        );
+
+        let mut out = [0i16; 160];
+        assert_eq!(bmsip_client_pop_pcm(handle, out.as_mut_ptr(), 159), -1);
+        assert_eq!(bmsip_client_pop_pcm(handle, out.as_mut_ptr(), 160), 0);
+
+        let addr_ptr = bmsip_client_local_sip_addr(handle);
+        assert!(!addr_ptr.is_null());
+        let addr_str = CStr::from_ptr(addr_ptr).to_str().unwrap();
+        assert!(addr_str.starts_with("127.0.0.1:"));
+        bmsip_string_free(addr_ptr);
+
+        assert_eq!(bmsip_client_request_telemetry(handle, std::ptr::null()), 0);
+        let mut saw_telemetry = false;
+        let dl = Instant::now() + Duration::from_secs(2);
+        while Instant::now() < dl {
+            let ev_ptr = bmsip_client_poll_event_json(handle, 50);
+            if !ev_ptr.is_null() {
+                let ev_json = CStr::from_ptr(ev_ptr).to_str().unwrap().to_string();
+                bmsip_string_free(ev_ptr);
+                if ev_json.contains("\"TelemetryExported\"") {
+                    saw_telemetry = true;
+                    break;
+                }
+            }
+        }
+        assert!(saw_telemetry);
+        bmsip_client_free(handle);
+    }
+}

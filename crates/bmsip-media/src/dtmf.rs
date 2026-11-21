@@ -170,6 +170,7 @@ pub struct QueuedDtmfPacket {
 #[derive(Debug, Default)]
 pub struct DtmfSender {
     queue: VecDeque<QueuedDtmfPacket>,
+    next_min_timestamp: Option<u32>,
 }
 
 impl DtmfSender {
@@ -186,19 +187,25 @@ impl DtmfSender {
     /// Enqueues a 100 ms DTMF tone starting at `event_timestamp`, scaling RFC 4733 duration ticks by `clock_rate_hz`.
     ///
     /// At `8000` Hz each 20 ms step is `160` ticks (`800` total); at `48000` Hz each 20 ms step is `960` ticks (`4800` total).
+    /// When consecutive digits are queued faster than tone duration (or in the same tick), event timestamps advance monotonically.
     pub fn queue_digit_with_clock_rate(
         &mut self,
         digit: DtmfDigit,
         event_timestamp: u32,
         clock_rate_hz: u32,
     ) {
+        let effective_ts = match self.next_min_timestamp {
+            Some(min_ts) if (event_timestamp.wrapping_sub(min_ts) as i32) < 0 => min_ts,
+            _ => event_timestamp,
+        };
         let volume = 10;
         let step_ticks = (clock_rate_hz.max(8_000) / 50).clamp(1, u32::from(u16::MAX) / 5) as u16;
         let total_ticks = step_ticks.saturating_mul(5);
+        self.next_min_timestamp = Some(effective_ts.wrapping_add(u32::from(total_ticks)));
         for step in 1..=4u16 {
             self.queue.push_back(QueuedDtmfPacket {
                 marker: step == 1,
-                timestamp: event_timestamp,
+                timestamp: effective_ts,
                 payload: DtmfEventPayload {
                     digit,
                     end_of_event: false,
@@ -211,7 +218,7 @@ impl DtmfSender {
         for _ in 0..3 {
             self.queue.push_back(QueuedDtmfPacket {
                 marker: false,
-                timestamp: event_timestamp,
+                timestamp: effective_ts,
                 payload: DtmfEventPayload {
                     digit,
                     end_of_event: true,
@@ -228,10 +235,10 @@ impl DtmfSender {
     }
 }
 
-/// Deduplicates inbound RFC 4733 packets by RTP event timestamp.
+/// Deduplicates inbound RFC 4733 packets by `(RTP event timestamp, digit)`.
 #[derive(Debug, Default)]
 pub struct DtmfDetector {
-    last_event_timestamp: Option<u32>,
+    last_event: Option<(u32, DtmfDigit)>,
 }
 
 impl DtmfDetector {
@@ -242,16 +249,17 @@ impl DtmfDetector {
 
     /// Feeds one parsed [`DtmfEventPayload`] and its RTP timestamp, emitting `Some(digit)` once per tone.
     pub fn feed(&mut self, rtp_timestamp: u32, event: DtmfEventPayload) -> Option<DtmfDigit> {
-        if self.last_event_timestamp == Some(rtp_timestamp) {
+        let key = (rtp_timestamp, event.digit);
+        if self.last_event == Some(key) {
             return None;
         }
-        self.last_event_timestamp = Some(rtp_timestamp);
+        self.last_event = Some(key);
         Some(event.digit)
     }
 
     /// Resets deduplication state (e.g., after a mid-call remote SSRC change).
     pub fn reset(&mut self) {
-        self.last_event_timestamp = None;
+        self.last_event = None;
     }
 }
 
@@ -280,5 +288,27 @@ mod tests {
 
         assert_eq!(count, 14); // 7 packets per digit (4 active + 3 E-bit repeats)
         assert_eq!(detected, vec![DtmfDigit::Pound, DtmfDigit::D5]);
+    }
+
+    #[test]
+    fn consecutive_digits_in_same_tick_get_distinct_monotonic_timestamps() {
+        let mut sender = DtmfSender::new();
+        sender.queue_digit(DtmfDigit::D1, 1600);
+        sender.queue_digit(DtmfDigit::D2, 1600);
+        sender.queue_digit(DtmfDigit::D2, 1600);
+
+        let mut detector = DtmfDetector::new();
+        let mut detected = Vec::new();
+        let mut first_timestamps = Vec::new();
+        while let Some(pkt) = sender.pop_packet() {
+            if pkt.marker {
+                first_timestamps.push(pkt.timestamp);
+            }
+            if let Some(d) = detector.feed(pkt.timestamp, pkt.payload) {
+                detected.push(d);
+            }
+        }
+        assert_eq!(first_timestamps, vec![1600, 2400, 3200]);
+        assert_eq!(detected, vec![DtmfDigit::D1, DtmfDigit::D2, DtmfDigit::D2]);
     }
 }

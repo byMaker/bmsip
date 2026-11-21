@@ -18,7 +18,7 @@ use crate::opus::{
     PCM_FRAME_SAMPLES_48KHZ_20MS, PCM_FRAME_SAMPLES_8KHZ_20MS,
 };
 use crate::plugin::AudioCodecPlugin;
-use crate::rtcp::{RtcpPacket, RtpStreamStats};
+use crate::rtcp::{RtcpPacket, RtpStreamStats, SdesChunk, SdesItem, SDES_CNAME};
 use crate::rtp::{RtpPacketRef, RtpPacketizer};
 use crate::srtp::SrtpContext;
 
@@ -89,6 +89,8 @@ pub struct MediaSession {
     dtmf_detector: DtmfDetector,
     cn_generator: ComfortNoiseGenerator,
     remote_ssrc: Option<u32>,
+    next_audio_marker: bool,
+    cname: String,
     srtp_tx: Option<SrtpContext>,
     srtp_rx: Option<SrtpContext>,
     srtp_tx_key_fingerprint: Option<(SrtpSuite, [u8; 30])>,
@@ -155,6 +157,8 @@ impl MediaSession {
             dtmf_detector: DtmfDetector::new(),
             cn_generator: ComfortNoiseGenerator::new(),
             remote_ssrc: None,
+            next_audio_marker: false,
+            cname: format!("bmsip-{local_ssrc:08x}@local"),
             srtp_tx: None,
             srtp_rx: None,
             srtp_tx_key_fingerprint: None,
@@ -199,6 +203,15 @@ impl MediaSession {
     /// Sets the negotiated RFC 3389 Comfort Noise payload type (defaults to `13`).
     pub fn with_cn_payload_type(mut self, payload_type: u8) -> Self {
         self.cn_payload_type = payload_type;
+        self
+    }
+
+    /// Sets the RFC 3550 §6.5 SDES `CNAME` emitted alongside compound Receiver Reports.
+    pub fn with_cname(mut self, cname: impl Into<String>) -> Self {
+        let value = cname.into();
+        if !value.trim().is_empty() {
+            self.cname = value;
+        }
         self
     }
 
@@ -384,9 +397,10 @@ impl MediaSession {
                 }
             }
         };
+        let marker = std::mem::replace(&mut self.next_audio_marker, false);
         let rtp_pkt = self
             .packetizer
-            .next_packet_bytes(&encoded, ts_advance, false);
+            .next_packet_bytes(&encoded, ts_advance, marker);
         if let Some(srtp) = self.srtp_tx.as_mut() {
             srtp.protect_rtp(&rtp_pkt)
         } else {
@@ -404,6 +418,7 @@ impl MediaSession {
     /// Pops the next queued RFC 4733 DTMF RTP (or SRTP) datagram for paced 20 ms transmission.
     pub fn pop_dtmf_packet(&mut self) -> Option<Vec<u8>> {
         self.dtmf_sender.pop_packet().and_then(|spec| {
+            self.next_audio_marker = true;
             let payload = spec.payload.to_bytes();
             let raw = self.packetizer.build_custom_packet_bytes(
                 self.dtmf_payload_type,
@@ -455,6 +470,9 @@ impl MediaSession {
             false,
             &sid.to_bytes(),
         );
+        let step_samples = (self.codec.clock_rate_hz() / 50).max(160);
+        self.packetizer.advance_timestamp(step_samples);
+        self.next_audio_marker = true;
         match self.srtp_tx.as_mut() {
             Some(srtp) => srtp.protect_rtp(&raw).unwrap_or(raw),
             None => raw,
@@ -485,19 +503,16 @@ impl MediaSession {
             }
         }
         self.remote_ssrc = Some(pkt.ssrc);
-        self.stats.record_packet(
-            pkt.sequence_number,
-            pkt.timestamp,
-            arrival_timestamp_samples,
-        );
 
         if pkt.payload_type == self.dtmf_payload_type {
+            self.stats.record_non_audio_packet(pkt.sequence_number);
             let ev = DtmfEventPayload::parse(pkt.payload)?;
             self.jitter.mark_non_audio_seq(pkt.sequence_number);
             return Ok(self.dtmf_detector.feed(pkt.timestamp, ev));
         }
 
         if pkt.payload_type == self.cn_payload_type || pkt.payload_type == CN_PAYLOAD_TYPE {
+            self.stats.record_non_audio_packet(pkt.sequence_number);
             let cn_pkt = ComfortNoisePacket::parse(pkt.payload)?;
             self.cn_generator.update_from_packet(&cn_pkt);
             let cn_pcm = self.cn_generator.generate_frame(self.frame_samples);
@@ -506,6 +521,11 @@ impl MediaSession {
             return Ok(None);
         }
 
+        self.stats.record_packet(
+            pkt.sequence_number,
+            pkt.timestamp,
+            arrival_timestamp_samples,
+        );
         self.cn_generator.deactivate();
 
         let pcm = if let Some(plugin) = self.custom_plugin.as_mut() {
@@ -566,6 +586,15 @@ impl MediaSession {
 
     /// Processes an inbound compound RTCP (or SRTCP) datagram, recording any Sender Report NTP timestamps (`LSR`).
     pub fn receive_rtcp(&mut self, raw: &[u8]) -> Result<usize, MediaError> {
+        self.receive_rtcp_inner(raw, None)
+    }
+
+    /// Processes an inbound compound RTCP (or SRTCP) datagram with monotonic arrival time in ms (`LSR` + `DLSR`).
+    pub fn receive_rtcp_at(&mut self, raw: &[u8], now_ms: u64) -> Result<usize, MediaError> {
+        self.receive_rtcp_inner(raw, Some(now_ms))
+    }
+
+    fn receive_rtcp_inner(&mut self, raw: &[u8], now_ms: Option<u64>) -> Result<usize, MediaError> {
         let decrypted_buf;
         let rtcp_bytes = if let Some(srtp) = self.srtp_rx.as_mut() {
             decrypted_buf = srtp.unprotect_rtcp(raw)?;
@@ -577,7 +606,12 @@ impl MediaSession {
         let count = packets.len();
         for pkt in packets {
             if let RtcpPacket::SenderReport { sender_info, .. } = pkt {
-                self.stats.record_sender_report(sender_info.ntp_timestamp);
+                if let Some(ts_ms) = now_ms {
+                    self.stats
+                        .record_sender_report_at(sender_info.ntp_timestamp, ts_ms);
+                } else {
+                    self.stats.record_sender_report(sender_info.ntp_timestamp);
+                }
             }
         }
         Ok(count)
@@ -599,34 +633,54 @@ impl MediaSession {
         frame
     }
 
-    /// Builds an RTCP (or SRTCP when SRTP is active) Receiver Report (`RR`) packet and advances RFC 3550 §6.4.1 interval loss counters.
-    pub fn build_rtcp_receiver_report(&mut self) -> Vec<u8> {
-        let reports = match self.remote_ssrc {
-            Some(rssrc) => vec![self.stats.build_reception_report(rssrc)],
-            None => Vec::new(),
-        };
-        let raw = RtcpPacket::ReceiverReport {
-            ssrc: self.packetizer.ssrc(),
-            reports,
+    fn encode_compound_rr_sdes(
+        &self,
+        report: Option<crate::rtcp::ReceptionReportBlock>,
+    ) -> Vec<u8> {
+        let ssrc = self.packetizer.ssrc();
+        let mut raw = RtcpPacket::ReceiverReport {
+            ssrc,
+            reports: report.into_iter().collect(),
         }
         .to_bytes();
+        raw.extend_from_slice(
+            &RtcpPacket::Sdes {
+                chunks: vec![SdesChunk {
+                    ssrc,
+                    items: vec![SdesItem {
+                        item_type: SDES_CNAME,
+                        value: self.cname.clone(),
+                    }],
+                }],
+            }
+            .to_bytes(),
+        );
+        raw
+    }
+
+    /// Builds an RTCP (or SRTCP when SRTP is active) compound `RR + SDES(CNAME)` packet and advances RFC 3550 §6.4.1 interval loss counters.
+    pub fn build_rtcp_receiver_report(&mut self) -> Vec<u8> {
+        self.build_rtcp_receiver_report_at(None)
+    }
+
+    /// Builds a compound `RR + SDES(CNAME)` packet with optional monotonic `now_ms` (`DLSR`) and advances interval loss counters.
+    pub fn build_rtcp_receiver_report_at(&mut self, now_ms: Option<u64>) -> Vec<u8> {
+        let report = self
+            .remote_ssrc
+            .map(|rssrc| self.stats.build_reception_report_at(rssrc, now_ms));
+        let raw = self.encode_compound_rr_sdes(report);
         match self.srtp_tx.as_mut() {
             Some(srtp) => srtp.protect_rtcp(&raw).unwrap_or(raw),
             None => raw,
         }
     }
 
-    /// Builds a non-mutating snapshot RTCP Receiver Report (`RR`) packet without advancing interval counters.
+    /// Builds a non-mutating snapshot compound RTCP `RR + SDES(CNAME)` packet without advancing interval counters.
     pub fn snapshot_rtcp_receiver_report(&self) -> Vec<u8> {
-        let reports = match self.remote_ssrc {
-            Some(rssrc) => vec![self.stats.snapshot_reception_report(rssrc)],
-            None => Vec::new(),
-        };
-        RtcpPacket::ReceiverReport {
-            ssrc: self.packetizer.ssrc(),
-            reports,
-        }
-        .to_bytes()
+        let report = self
+            .remote_ssrc
+            .map(|rssrc| self.stats.snapshot_reception_report(rssrc));
+        self.encode_compound_rr_sdes(report)
     }
 
     /// Returns receiver RTP statistics.
@@ -714,10 +768,13 @@ mod tests {
         let parsed_rr = RtcpPacket::parse_compound(&rr_bytes).unwrap();
         assert!(matches!(
             parsed_rr.as_slice(),
-            [RtcpPacket::ReceiverReport {
-                ssrc: 0xbbbb_0002,
-                ..
-            }]
+            [
+                RtcpPacket::ReceiverReport {
+                    ssrc: 0xbbbb_0002,
+                    ..
+                },
+                RtcpPacket::Sdes { .. }
+            ]
         ));
     }
 
@@ -1067,5 +1124,75 @@ mod tests {
         // Outbound TX packets continue seamlessly under unchanged tx_key.
         let p_a2 = alice.encode_pcm_frame(&frame).unwrap();
         assert!(bob_leg1.receive_rtp(&p_a2, 160).is_ok());
+    }
+
+    #[test]
+    fn comfort_noise_dtmf_marker_sdes_cname_and_dlsr_roundtrip() {
+        let cfg = JitterBufferConfig {
+            min_depth_frames: 1,
+            max_depth_frames: 4,
+            initial_depth_frames: 1,
+            frame_samples: 160,
+        };
+        let mut tx =
+            MediaSession::new(G711Kind::Pcmu, 101, 0xaaaa_3001, cfg).with_cname("tx@example.org");
+        let mut rx =
+            MediaSession::new(G711Kind::Pcmu, 101, 0xbbbb_4002, cfg).with_cname("rx@example.org");
+
+        let frame = [0i16; 160];
+        let p0 = tx.encode_pcm_frame(&frame).unwrap();
+        rx.receive_rtp(&p0, 0).unwrap();
+
+        let cn_wire = tx.build_comfort_noise_packet(40, &[]);
+        rx.receive_rtp(&cn_wire, 160).unwrap();
+
+        let p_after_cn = tx.encode_pcm_frame(&frame).unwrap();
+        let parsed_after_cn = RtpPacket::parse(&p_after_cn).unwrap();
+        assert!(parsed_after_cn.header.marker);
+        assert_eq!(parsed_after_cn.header.timestamp, 320);
+        rx.receive_rtp(&p_after_cn, 320).unwrap();
+
+        tx.queue_dtmf(DtmfDigit::D4);
+        let dtmf_pkt = tx.pop_dtmf_packet().unwrap();
+        assert_eq!(rx.receive_rtp(&dtmf_pkt, 480).unwrap(), Some(DtmfDigit::D4));
+        let p_after_dtmf = tx.encode_pcm_frame(&frame).unwrap();
+        assert!(RtpPacket::parse(&p_after_dtmf).unwrap().header.marker);
+        rx.receive_rtp(&p_after_dtmf, 480).unwrap();
+        assert_eq!(rx.stats().jitter(), 0);
+
+        let sr = RtcpPacket::SenderReport {
+            ssrc: 0xaaaa_3001,
+            sender_info: crate::rtcp::RtcpSenderInfo {
+                ntp_timestamp: 0x1122_3344_5566_7788,
+                rtp_timestamp: 480,
+                sender_packet_count: 3,
+                sender_octet_count: 480,
+            },
+            reports: vec![],
+        }
+        .to_bytes();
+        rx.receive_rtcp_at(&sr, 1_000).unwrap();
+        let rr_wire = rx.build_rtcp_receiver_report_at(Some(2_000));
+        let compound = RtcpPacket::parse_compound(&rr_wire).unwrap();
+        assert_eq!(compound.len(), 2);
+        match &compound[0] {
+            RtcpPacket::ReceiverReport { reports, .. } => {
+                assert_eq!(reports[0].lsr, 0x3344_5566);
+                assert_eq!(reports[0].dlsr, 65_536);
+            }
+            other => panic!("expected RR first, got {other:?}"),
+        }
+        assert_eq!(
+            compound[1],
+            RtcpPacket::Sdes {
+                chunks: vec![SdesChunk {
+                    ssrc: 0xbbbb_4002,
+                    items: vec![SdesItem {
+                        item_type: SDES_CNAME,
+                        value: "rx@example.org".to_string(),
+                    }],
+                }],
+            }
+        );
     }
 }

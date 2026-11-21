@@ -114,6 +114,11 @@ char *bmsip_client_poll_event_json(
     const BmsipClientHandle *client,
     uint32_t timeout_ms
 );
+char *bmsip_client_local_sip_addr(const BmsipClientHandle *client);
+int32_t bmsip_client_request_telemetry(
+    const BmsipClientHandle *client,
+    const char *call_id
+);
 void bmsip_string_free(char *s);
 void bmsip_client_free(BmsipClientHandle *client);
 

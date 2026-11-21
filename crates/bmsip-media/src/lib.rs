@@ -42,7 +42,10 @@ pub use plugin::{
     AudioCodecDescriptor, AudioCodecFactory, AudioCodecPlugin, CodecRegistry, FnCodecFactory,
     G711CodecPlugin, OpusPluginAdapter,
 };
-pub use rtcp::{ReceptionReportBlock, RtcpPacket, RtcpSenderInfo, RtpStreamStats};
+pub use rtcp::{
+    ReceptionReportBlock, RtcpPacket, RtcpSenderInfo, RtpStreamStats, SdesChunk, SdesItem,
+    SDES_CNAME,
+};
 pub use rtp::{RtpExtensionHeader, RtpHeader, RtpPacket, RtpPacketRef, RtpPacketizer};
 pub use session::{MediaSession, SessionCodec};
 pub use srtp::{
