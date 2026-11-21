@@ -226,7 +226,7 @@ fn print_usage() {
            bmsip-cli interop [--asterisk <host:port>] [--freeswitch <host:port>] [--kamailio <host:port>] [--duration-ms <ms>]\n\n\
          OPTIONS:\n  \
            --transport <proto>    SIP signaling transport: udp (default), tcp, or tls\n  \
-           --srtp <mode>          SRTP media encryption: off (default), optional, sdes, or dtls\n  \
+           --srtp <mode>          SRTP media encryption: off (default), optional, or sdes (requires --transport tls)\n  \
            --tls-ca <path>        PEM CA certificate bundle for TLS server verification\n  \
            --tls-server-name <hn> Explicit TLS SNI / certificate hostname override\n  \
            --tls-insecure         Disable TLS certificate verification (lab/self-signed servers only)\n  \

@@ -2,7 +2,7 @@
 
 **bmsip** is a modern, embeddable, cross-platform SIP & RTP telephony library written in Rust from the ground up for **Linux**, **iOS**, and **Android**, complete with a live-audio Linux CLI softphone and an automated multi-server SIP interoperability lab.
 
-- **Current Version:** `0.13.0` ([CHANGELOG.md](./CHANGELOG.md))
+- **Current Version:** `0.14.0` ([CHANGELOG.md](./CHANGELOG.md))
 - **Architecture Specification:** [ARCHITECTURE.md](./ARCHITECTURE.md)
 - **Developer Guides:** [SDK Guide](./docs/SDK_GUIDE.md) · [Codecs & Audio Pipeline](./docs/CODECS_AND_AUDIO.md) · [CLI & Interop Lab](./docs/CLI_AND_TESTING.md)
 - **License:** `AGPL-3.0-only` ([LICENSE](./LICENSE) · [NOTICE](./NOTICE) · commercial licensing: [bymaker.com](https://bymaker.com))
@@ -14,7 +14,7 @@
 Legacy C/C++ SIP stacks often suffer from hidden global state, callback re-entrancy deadlocks, entangled socket/audio I/O, and awkward mobile OS integration. `bmsip` solves these by design:
 
 - **100% Sans-I/O Protocol Core (`bmsip-core`):** `#![forbid(unsafe_code)]`, zero external crate dependencies, zero sockets/threads/system-clock calls. All time and network I/O are injected explicitly for deterministic simulation under packet loss, reordering, and duplication.
-- **Multi-Transport SIP Signaling & SRTP Media Encryption:** Pure-Rust `rustls` TLS 1.2–1.3 (`ring`, RFC 5922, mTLS), TCP/TLS stream framing (`SipStreamFramer`, RFC 5626 keep-alive), and 100% safe-Rust **SRTP / SRTCP** (`AES_CM_128_HMAC_SHA1_80` / `_32`, RFC 3711) with **SDES** (`RTP/SAVP`, `a=crypto:`, RFC 4568) and **DTLS-SRTP** (`UDP/TLS/RTP/SAVP`, `a=fingerprint:sha-256`, RFC 5763 / RFC 5764).
+- **Multi-Transport SIP Signaling & SRTP Media Encryption:** Pure-Rust `rustls` TLS 1.2–1.3 (`ring`, RFC 5922, mTLS), non-blocking TCP/TLS connection setup and stream framing (`SipStreamFramer`, RFC 5626 keep-alive), and 100% safe-Rust **SRTP / SRTCP** (`AES_CM_128_HMAC_SHA1_80` / `_32`, RFC 3711) with **SDES** (`RTP/SAVP`, `a=crypto:`, RFC 4568) backed by 256-bit OS CSPRNG keys, per-SSRC ROC/replay tracking, and TLS-enforced key transport.
 - **Lock-Safe Command/Event Runtime (`bmsip-engine`):** Multiple independent `SipEngine` instances run safely in one process. Applications interact strictly via non-blocking `EngineCommand` / `EngineEvent` queues — zero callbacks under mutexes.
 - **Built-in "Golden Trio" Audio Codecs + Pluggable Registry (`bmsip-media`):**
   - **Opus (`48 kHz` Fullband HD):** Native `libopus` C FFI integration (`LibOpusCodec`) with pure-Rust RFC 6716 TOC fallback (`BuiltInOpusCodec`).

@@ -5,11 +5,19 @@ edition.workspace = true
 license.workspace = true
 description = "Lock-safe SIP runtime connecting bmsip-core and bmsip-media with OS I/O"
 
+[features]
+default = []
+experimental-dtls = ["bmsip-core/experimental-dtls", "dep:rcgen"]
+
 [dependencies]
 bmsip-core = { path = "../bmsip-core" }
 bmsip-media = { path = "../bmsip-media" }
-rcgen = "0.13"
+rcgen = { version = "0.13", optional = true }
+ring = "0.17"
 rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12"] }
 rustls-pemfile = "2"
 webpki-roots = "0.26"
+
+[dev-dependencies]
+rcgen = "0.13"
 

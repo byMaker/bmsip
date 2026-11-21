@@ -5,5 +5,9 @@ edition.workspace = true
 license.workspace = true
 description = "Sans-I/O SIP, SDP, Digest Auth, and RFC 3261 transaction core"
 
+[features]
+default = []
+experimental-dtls = []
+
 [dependencies]
 

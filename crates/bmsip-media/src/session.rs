@@ -91,6 +91,25 @@ pub struct MediaSession {
     remote_ssrc: Option<u32>,
     srtp_tx: Option<SrtpContext>,
     srtp_rx: Option<SrtpContext>,
+    srtp_tx_key_fingerprint: Option<(SrtpSuite, [u8; 30])>,
+    srtp_rx_key_fingerprint: Option<(SrtpSuite, [u8; 30])>,
+}
+
+impl Drop for MediaSession {
+    fn drop(&mut self) {
+        if let Some((_, ref mut key)) = self.srtp_tx_key_fingerprint {
+            for b in key.iter_mut() {
+                *b = 0;
+            }
+            std::hint::black_box(key);
+        }
+        if let Some((_, ref mut key)) = self.srtp_rx_key_fingerprint {
+            for b in key.iter_mut() {
+                *b = 0;
+            }
+            std::hint::black_box(key);
+        }
+    }
 }
 
 impl MediaSession {
@@ -138,6 +157,8 @@ impl MediaSession {
             remote_ssrc: None,
             srtp_tx: None,
             srtp_rx: None,
+            srtp_tx_key_fingerprint: None,
+            srtp_rx_key_fingerprint: None,
         }
     }
 
@@ -192,7 +213,7 @@ impl MediaSession {
         self
     }
 
-    /// Installs or updates outbound TX and inbound RX RFC 3711 SRTP/SRTCP contexts (e.g., from SDES or DTLS-SRTP).
+    /// Installs or replaces outbound TX and inbound RX RFC 3711 SRTP/SRTCP contexts unconditionally.
     pub fn set_srtp_keys(
         &mut self,
         suite: SrtpSuite,
@@ -201,12 +222,43 @@ impl MediaSession {
     ) {
         self.srtp_tx = Some(SrtpContext::from_key_salt(suite, tx_key_salt));
         self.srtp_rx = Some(SrtpContext::from_key_salt(suite, rx_key_salt));
+        self.srtp_tx_key_fingerprint = Some((suite, *tx_key_salt));
+        self.srtp_rx_key_fingerprint = Some((suite, *rx_key_salt));
+    }
+
+    /// Installs or selectively rotates TX and/or RX SRTP contexts only for directions whose suite or key changed.
+    ///
+    /// Preserves existing ROC and replay windows across mid-call `re-INVITE` exchanges when keys remain unchanged
+    /// (RFC 4568 §6.1.3), while immediately rotating RX keys on `183 -> 200 OK` forking or PBX re-keying.
+    /// Returns `true` if either direction was newly initialized or rotated.
+    pub fn update_srtp_keys(
+        &mut self,
+        suite: SrtpSuite,
+        tx_key_salt: &[u8; 30],
+        rx_key_salt: &[u8; 30],
+    ) -> bool {
+        let mut changed = false;
+        let next_tx = (suite, *tx_key_salt);
+        if self.srtp_tx.is_none() || self.srtp_tx_key_fingerprint.as_ref() != Some(&next_tx) {
+            self.srtp_tx = Some(SrtpContext::from_key_salt(suite, tx_key_salt));
+            self.srtp_tx_key_fingerprint = Some(next_tx);
+            changed = true;
+        }
+        let next_rx = (suite, *rx_key_salt);
+        if self.srtp_rx.is_none() || self.srtp_rx_key_fingerprint.as_ref() != Some(&next_rx) {
+            self.srtp_rx = Some(SrtpContext::from_key_salt(suite, rx_key_salt));
+            self.srtp_rx_key_fingerprint = Some(next_rx);
+            changed = true;
+        }
+        changed
     }
 
     /// Clears any installed SRTP/SRTCP keys, reverting to plain RTP/RTCP.
     pub fn clear_srtp(&mut self) {
         self.srtp_tx = None;
         self.srtp_rx = None;
+        self.srtp_tx_key_fingerprint = None;
+        self.srtp_rx_key_fingerprint = None;
     }
 
     /// Returns `true` when SRTP media encryption is active on this session.
@@ -977,5 +1029,42 @@ mod tests {
         let next_voice = tx.encode_pcm_frame(&voice.samples[..160]).unwrap();
         rx.receive_rtp(&next_voice, ts + 480).unwrap();
         assert!(!rx.is_comfort_noise_active());
+    }
+
+    #[test]
+    fn update_srtp_keys_rotates_only_changed_direction_and_preserves_unchanged_state() {
+        let cfg = JitterBufferConfig::default();
+        let tx_key = [0x11u8; 30];
+        let rx_key_1 = [0x22u8; 30];
+        let rx_key_2 = [0x33u8; 30];
+
+        let mut alice = MediaSession::new(G711Kind::Pcmu, 101, 0x1000_0001, cfg);
+        let mut bob_leg1 = MediaSession::new(G711Kind::Pcmu, 101, 0x2000_0001, cfg);
+        let mut bob_leg2 = MediaSession::new(G711Kind::Pcmu, 101, 0x3000_0001, cfg);
+
+        assert!(alice.update_srtp_keys(SrtpSuite::AesCm128HmacSha1_80, &tx_key, &rx_key_1));
+        // Calling with identical keys (e.g., hold re-INVITE) must be a no-op returning false.
+        assert!(!alice.update_srtp_keys(SrtpSuite::AesCm128HmacSha1_80, &tx_key, &rx_key_1));
+
+        bob_leg1.set_srtp_keys(SrtpSuite::AesCm128HmacSha1_80, &rx_key_1, &tx_key);
+        bob_leg2.set_srtp_keys(SrtpSuite::AesCm128HmacSha1_80, &rx_key_2, &tx_key);
+
+        let frame = [0i16; 160];
+        let p_a1 = alice.encode_pcm_frame(&frame).unwrap();
+        assert!(bob_leg1.receive_rtp(&p_a1, 0).is_ok());
+
+        let p_b1 = bob_leg1.encode_pcm_frame(&frame).unwrap();
+        assert!(alice.receive_rtp(&p_b1, 0).is_ok());
+
+        // Remote re-INVITE / 183->200 OK rotates RX key to rx_key_2 while TX key stays tx_key.
+        assert!(alice.update_srtp_keys(SrtpSuite::AesCm128HmacSha1_80, &tx_key, &rx_key_2));
+        let p_b2 = bob_leg2.encode_pcm_frame(&frame).unwrap();
+        assert!(alice.receive_rtp(&p_b2, 160).is_ok());
+        // Old RX key packets must now fail authentication.
+        let p_b1_old = bob_leg1.encode_pcm_frame(&frame).unwrap();
+        assert!(alice.receive_rtp(&p_b1_old, 320).is_err());
+        // Outbound TX packets continue seamlessly under unchanged tx_key.
+        let p_a2 = alice.encode_pcm_frame(&frame).unwrap();
+        assert!(bob_leg1.receive_rtp(&p_a2, 160).is_ok());
     }
 }

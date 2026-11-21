@@ -1,6 +1,6 @@
-//! MODULE_CONTRACT: Dependency-free, `#![forbid(unsafe_code)]` MD5 and SHA-256 primitives for Digest authentication.
-//! INVARIANTS: Constant-chunk processing via `as_chunks`; outputs match RFC 1321 and NIST FIPS 180-4 test vectors.
-//! RFC_REFS: RFC 1321 (MD5), FIPS 180-4 (SHA-256).
+//! MODULE_CONTRACT: Dependency-free, `#![forbid(unsafe_code)]` MD5, SHA-256, and HMAC-SHA256 primitives for Digest authentication and SDES key derivation.
+//! INVARIANTS: Constant-chunk processing via `as_chunks`; outputs match RFC 1321, NIST FIPS 180-4, and RFC 4231 test vectors; intermediate HMAC key material is wiped before returning.
+//! RFC_REFS: RFC 1321 (MD5), FIPS 180-4 (SHA-256), RFC 2104 (HMAC), RFC 4231 (HMAC-SHA256 Test Vectors).
 
 use std::fmt::Write;
 
@@ -165,6 +165,46 @@ pub fn sha256_hex(data: &[u8]) -> String {
     hex_lower(&sha256(data))
 }
 
+/// Computes the 32-byte RFC 2104 HMAC-SHA256 of `data` under `key`.
+pub fn hmac_sha256(key: &[u8], data: &[u8]) -> [u8; 32] {
+    let mut k_block = [0u8; 64];
+    if key.len() > 64 {
+        let mut hashed = sha256(key);
+        k_block[..32].copy_from_slice(&hashed);
+        zeroize_bytes(&mut hashed);
+    } else {
+        k_block[..key.len()].copy_from_slice(key);
+    }
+
+    let mut inner = Vec::with_capacity(64 + data.len());
+    for &b in &k_block {
+        inner.push(b ^ 0x36);
+    }
+    inner.extend_from_slice(data);
+    let mut inner_hash = sha256(&inner);
+    zeroize_bytes(&mut inner);
+
+    let mut outer = [0u8; 64 + 32];
+    for (i, &b) in k_block.iter().enumerate() {
+        outer[i] = b ^ 0x5c;
+    }
+    outer[64..96].copy_from_slice(&inner_hash);
+    let mac = sha256(&outer);
+
+    zeroize_bytes(&mut k_block);
+    zeroize_bytes(&mut inner_hash);
+    zeroize_bytes(&mut outer);
+    mac
+}
+
+/// Wipes sensitive bytes in place without `unsafe` code by inhibiting dead-store elimination.
+pub(crate) fn zeroize_bytes(buf: &mut [u8]) {
+    for byte in buf.iter_mut() {
+        *byte = 0;
+    }
+    std::hint::black_box(buf);
+}
+
 fn hex_lower(bytes: &[u8]) -> String {
     let mut out = String::with_capacity(bytes.len() * 2);
     for byte in bytes {
@@ -205,6 +245,23 @@ mod tests {
         assert_eq!(
             sha256_hex(b"abcdbcdecdefdefgefghfghighijhijkijkljklmklmnlmnomnopnopq"),
             "248d6a61d20638b8e5c026930c3e6039a33ce45964ff2167f6ecedd419db06c1"
+        );
+    }
+
+    #[test]
+    fn verifies_rfc4231_hmac_sha256_vectors() {
+        // RFC 4231 Test Case 2: Key = "Jefe", Data = "what do ya want for nothing?"
+        let mac = hmac_sha256(b"Jefe", b"what do ya want for nothing?");
+        assert_eq!(
+            hex_lower(&mac),
+            "5bdcc146bf60754e6a042426089575c75a003f089d2739839dec58b964ec3843"
+        );
+
+        // RFC 4231 Test Case 1: Key = 20 bytes of 0x0b, Data = "Hi There"
+        let mac1 = hmac_sha256(&[0x0bu8; 20], b"Hi There");
+        assert_eq!(
+            hex_lower(&mac1),
+            "b0344c61d8db38535ca8afceaf0bf12b881dc200c9833da726e9376c2e32cff7"
         );
     }
 }

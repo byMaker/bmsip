@@ -4,9 +4,11 @@ use std::thread;
 use std::time::{Duration, Instant};
 
 use bmsip_core::dialog::{CallState, RegistrationState, UaConfig, UaEvent, UserAgent};
-use bmsip_core::sdp::{DtlsFingerprint, RtpCodec, SrtpMode};
+use bmsip_core::sdp::{RtpCodec, SrtpMode};
 use bmsip_core::sip::{SipTransport, SipUri};
-use bmsip_engine::{EngineCommand, EngineConfig, EngineEvent, SipEngine, TlsConfig, WavAudioPort};
+use bmsip_engine::{
+    EngineCommand, EngineConfig, EngineError, EngineEvent, SipEngine, TlsConfig, WavAudioPort,
+};
 use bmsip_media::{
     AudioCodecDescriptor, AudioCodecPlugin, DtmfDigit, FnCodecFactory, G711Kind,
     JitterBufferConfig, MediaError, MediaSession, PlayoutFrame, WavPcm16,
@@ -2274,52 +2276,133 @@ fn live_asterisk_tls_plus_sdes_srtp_encrypted_echo_call() {
 }
 
 #[test]
-fn live_p2p_dtls_srtp_encrypted_audio_and_fingerprint_mismatch_rejection() {
+fn enforces_sdes_requires_tls_nonblocking_tcp_connect_and_p2p_tls_sdes_hold_call() {
     let dummy_registrar = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 1);
 
-    // 1. Spawn Bob in DTLS-SRTP mode (`UDP/TLS/RTP/SAVP`).
-    let bob_ua = UaConfig::new(
-        "bob",
+    // 1. SdesRequired over unencrypted UDP or TCP must be rejected by default (RFC 4568 §8).
+    for insecure_transport in [SipTransport::Udp, SipTransport::Tcp] {
+        let ua = UaConfig::new(
+            "alice",
+            "pw",
+            "127.0.0.1",
+            SipUri::parse("sip:127.0.0.1:1").unwrap(),
+            "127.0.0.1",
+            0,
+        )
+        .with_transport(insecure_transport)
+        .with_srtp_mode(SrtpMode::SdesRequired);
+        let (port, _) = WavAudioPort::new(WavPcm16::new(8_000, vec![0; 160]), true);
+        let err = SipEngine::spawn(
+            EngineConfig::new(ua, dummy_registrar, IpAddr::V4(Ipv4Addr::LOCALHOST), 0),
+            Box::new(port),
+        )
+        .err()
+        .expect("SdesRequired without TLS must fail to spawn");
+        assert!(
+            matches!(err, EngineError::InvalidConfig(_)),
+            "expected InvalidConfig for SdesRequired over {insecure_transport}, got {err:?}"
+        );
+    }
+
+    // 2. Non-blocking TCP connect: dialing an unreachable blackhole IP (RFC 5737 TEST-NET-1)
+    //    must NEVER freeze the engine worker thread during the 3 s TCP connect timeout.
+    let blackhole_addr = SocketAddr::new(IpAddr::V4(Ipv4Addr::new(192, 0, 2, 1)), 5060);
+    let nb_ua = UaConfig::new(
+        "alice",
         "pw",
-        "127.0.0.1",
-        SipUri::parse("sip:127.0.0.1:1").unwrap(),
+        "192.0.2.1",
+        SipUri::parse("sip:192.0.2.1:5060;transport=tcp").unwrap(),
         "127.0.0.1",
         0,
     )
-    .with_srtp_mode(SrtpMode::DtlsSrtp);
+    .with_transport(SipTransport::Tcp);
+    let (nb_port, _) = WavAudioPort::new(WavPcm16::new(8_000, vec![0; 160]), true);
+    let nb_eng = SipEngine::spawn(
+        EngineConfig::new(nb_ua, blackhole_addr, IpAddr::V4(Ipv4Addr::LOCALHOST), 0),
+        Box::new(nb_port),
+    )
+    .unwrap();
+    let t_start = Instant::now();
+    nb_eng.send_command(EngineCommand::Register).unwrap();
+    nb_eng
+        .send_command(EngineCommand::ExportTelemetry { call_id: None })
+        .unwrap();
+    let telem = wait_for_engine_event(&nb_eng, Duration::from_millis(800), |e| {
+        matches!(e, EngineEvent::TelemetryExported { .. })
+    });
+    assert!(
+        telem.is_some(),
+        "engine worker must stay responsive while TCP connect is pending"
+    );
+    assert!(
+        t_start.elapsed() < Duration::from_millis(800),
+        "non-blocking TCP connect stalled worker for {:?}",
+        t_start.elapsed()
+    );
+    nb_eng.shutdown().unwrap();
+
+    // 3. Live P2P verified TLS + SDES-SRTP (`SdesRequired`) call with DTMF + mid-call Hold/Resume re-INVITE.
+    let mut ca_params = rcgen::CertificateParams::new(Vec::new()).unwrap();
+    ca_params.is_ca = rcgen::IsCa::Ca(rcgen::BasicConstraints::Unconstrained);
+    let ca_key = rcgen::KeyPair::generate().unwrap();
+    let ca_cert = ca_params.self_signed(&ca_key).unwrap();
+    let ca_pem = ca_cert.pem();
+
+    let srv_params =
+        rcgen::CertificateParams::new(vec!["localhost".to_string(), "127.0.0.1".to_string()])
+            .unwrap();
+    let srv_key = rcgen::KeyPair::generate().unwrap();
+    let srv_cert = srv_params.signed_by(&srv_key, &ca_cert, &ca_key).unwrap();
+
+    let bob_tls = TlsConfig::new().with_server_identity(srv_cert.pem(), srv_key.serialize_pem());
+    let bob_ua = UaConfig::new(
+        "bob",
+        "pw",
+        "localhost",
+        SipUri::parse("sip:127.0.0.1:1;transport=tls").unwrap(),
+        "127.0.0.1",
+        0,
+    )
+    .with_transport(SipTransport::Tls)
+    .with_srtp_mode(SrtpMode::SdesRequired);
     let (bob_port, bob_handle) = WavAudioPort::new(WavPcm16::new(8_000, vec![0; 160]), true);
     let eng_bob = SipEngine::spawn(
-        EngineConfig::new(bob_ua, dummy_registrar, IpAddr::V4(Ipv4Addr::LOCALHOST), 0),
+        EngineConfig::new(bob_ua, dummy_registrar, IpAddr::V4(Ipv4Addr::LOCALHOST), 0)
+            .with_tls_config(bob_tls),
         Box::new(bob_port),
     )
     .unwrap();
     let bob_addr = eng_bob.local_sip_addr();
 
-    // 2. Spawn Alice in DTLS-SRTP mode and place a direct P2P encrypted call to Bob.
+    let alice_tls = TlsConfig::new()
+        .with_server_name("localhost")
+        .with_ca_cert_pem(ca_pem);
     let alice_ua = UaConfig::new(
         "alice",
         "pw",
-        "127.0.0.1",
-        SipUri::parse(&format!("sip:{bob_addr}")).unwrap(),
+        "localhost",
+        SipUri::parse(&format!("sip:{bob_addr};transport=tls")).unwrap(),
         "127.0.0.1",
         0,
     )
-    .with_srtp_mode(SrtpMode::DtlsSrtp);
-    let tone = WavPcm16::generate_sine_wave(8_000, 500, 1_200, 12_000);
+    .with_transport(SipTransport::Tls)
+    .with_srtp_mode(SrtpMode::SdesRequired);
+    let tone = WavPcm16::generate_sine_wave(8_000, 500, 1_500, 12_000);
     let (alice_port, _) = WavAudioPort::new(tone, true);
     let eng_alice = SipEngine::spawn(
-        EngineConfig::new(alice_ua, bob_addr, IpAddr::V4(Ipv4Addr::LOCALHOST), 0),
+        EngineConfig::new(alice_ua, bob_addr, IpAddr::V4(Ipv4Addr::LOCALHOST), 0)
+            .with_tls_config(alice_tls),
         Box::new(alice_port),
     )
     .unwrap();
 
     eng_alice
         .send_command(EngineCommand::Dial {
-            target_uri: SipUri::parse(&format!("sip:bob@{bob_addr}")).unwrap(),
+            target_uri: SipUri::parse(&format!("sip:bob@{bob_addr};transport=tls")).unwrap(),
         })
         .unwrap();
 
-    let call_alice = match wait_for_engine_event(&eng_alice, Duration::from_secs(5), |e| {
+    let call_alice = match wait_for_engine_event(&eng_alice, Duration::from_secs(6), |e| {
         matches!(e, EngineEvent::OutboundCallStarted { .. })
     })
     .expect("OutboundCallStarted on alice")
@@ -2328,7 +2411,7 @@ fn live_p2p_dtls_srtp_encrypted_audio_and_fingerprint_mismatch_rejection() {
         _ => unreachable!(),
     };
 
-    let call_bob = match wait_for_engine_event(&eng_bob, Duration::from_secs(5), |e| {
+    let call_bob = match wait_for_engine_event(&eng_bob, Duration::from_secs(6), |e| {
         matches!(e, EngineEvent::IncomingCall { .. })
     })
     .expect("IncomingCall on bob")
@@ -2343,29 +2426,70 @@ fn live_p2p_dtls_srtp_encrypted_audio_and_fingerprint_mismatch_rejection() {
         .unwrap();
 
     assert!(
-        wait_for_engine_event(&eng_alice, Duration::from_secs(5), |e| matches!(
+        wait_for_engine_event(&eng_alice, Duration::from_secs(6), |e| matches!(
             e,
             EngineEvent::CallEstablished { .. }
         ))
         .is_some()
     );
     assert!(
-        wait_for_engine_event(&eng_bob, Duration::from_secs(5), |e| matches!(
+        wait_for_engine_event(&eng_bob, Duration::from_secs(6), |e| matches!(
             e,
             EngineEvent::CallEstablished { .. }
         ))
         .is_some()
     );
 
-    // Wait for in-band DTLS-SRTP handshake to complete and exchange encrypted SRTP audio + DTMF.
-    thread::sleep(Duration::from_millis(120));
+    // Exchange encrypted SRTP audio + DTMF, then exercise mid-call Hold & Resume over TLS + SDES-SRTP.
+    thread::sleep(Duration::from_millis(160));
+    eng_alice
+        .send_command(EngineCommand::Hold {
+            call_id: call_alice.clone(),
+        })
+        .unwrap();
+    assert!(
+        wait_for_engine_event(&eng_bob, Duration::from_secs(5), |e| matches!(
+            e,
+            EngineEvent::CallHoldChanged {
+                remote_hold: true,
+                ..
+            }
+        ))
+        .is_some(),
+        "expected remote_hold=true on bob"
+    );
+    assert!(
+        wait_for_engine_event(&eng_alice, Duration::from_secs(5), |e| matches!(
+            e,
+            EngineEvent::CallMediaUpdated { .. }
+        ))
+        .is_some(),
+        "expected hold re-INVITE 200 OK completion on alice"
+    );
+
+    eng_alice
+        .send_command(EngineCommand::ResumeCall {
+            call_id: call_alice.clone(),
+        })
+        .unwrap();
+    assert!(
+        wait_for_engine_event(&eng_bob, Duration::from_secs(5), |e| matches!(
+            e,
+            EngineEvent::CallHoldChanged {
+                remote_hold: false,
+                ..
+            }
+        ))
+        .is_some(),
+        "expected remote_hold=false on bob after resume"
+    );
+
     eng_alice
         .send_command(EngineCommand::SendDtmf {
             call_id: call_alice.clone(),
             digit: DtmfDigit::D7,
         })
         .unwrap();
-
     assert!(
         wait_for_engine_event(&eng_bob, Duration::from_secs(5), |e| matches!(
             e,
@@ -2375,9 +2499,9 @@ fn live_p2p_dtls_srtp_encrypted_audio_and_fingerprint_mismatch_rejection() {
             }
         ))
         .is_some(),
-        "expected encrypted RFC 4733 DTMF '7' over DTLS-SRTP on bob"
+        "expected encrypted RFC 4733 DTMF '7' over TLS+SDES-SRTP on bob after hold/resume"
     );
-    thread::sleep(Duration::from_millis(250));
+    thread::sleep(Duration::from_millis(200));
 
     eng_alice
         .send_command(EngineCommand::Hangup {
@@ -2390,8 +2514,8 @@ fn live_p2p_dtls_srtp_encrypted_audio_and_fingerprint_mismatch_rejection() {
     .expect("alice CallTerminated");
     if let EngineEvent::CallTerminated { black_box_json, .. } = term_alice {
         assert!(
-            black_box_json.contains("DTLS-SRTP handshake established"),
-            "expected DTLS-SRTP telemetry entry in black_box_json: {black_box_json}"
+            black_box_json.contains("SRTP (SDES) enabled"),
+            "expected SDES-SRTP telemetry entry in black_box_json: {black_box_json}"
         );
     }
     let _ = wait_for_engine_event(&eng_bob, Duration::from_secs(5), |e| {
@@ -2400,64 +2524,10 @@ fn live_p2p_dtls_srtp_encrypted_audio_and_fingerprint_mismatch_rejection() {
 
     assert!(
         bob_handle.recorded_wav().rms_energy() > 1000,
-        "expected decrypted DTLS-SRTP audio RMS > 1000 on bob, got {}",
+        "expected decrypted SDES-SRTP audio RMS > 1000 on bob, got {}",
         bob_handle.recorded_wav().rms_energy()
     );
 
-    // 3. Verify MITM / mismatched SDP `a=fingerprint:sha-256` is rejected by the DTLS-SRTP verifier.
-    let forged_fp = DtlsFingerprint::sha256_from_der(b"forged-mitm-cert");
-    let mitm_ua = UaConfig::new(
-        "mitm",
-        "pw",
-        "127.0.0.1",
-        SipUri::parse(&format!("sip:{bob_addr}")).unwrap(),
-        "127.0.0.1",
-        0,
-    )
-    .with_srtp_mode(SrtpMode::DtlsSrtp)
-    .with_dtls_fingerprint(forged_fp);
-    let (mitm_port, _) =
-        WavAudioPort::new(WavPcm16::generate_sine_wave(8_000, 440, 800, 12_000), true);
-    let eng_mitm = SipEngine::spawn(
-        EngineConfig::new(mitm_ua, bob_addr, IpAddr::V4(Ipv4Addr::LOCALHOST), 0),
-        Box::new(mitm_port),
-    )
-    .unwrap();
-
-    eng_mitm
-        .send_command(EngineCommand::Dial {
-            target_uri: SipUri::parse(&format!("sip:bob@{bob_addr}")).unwrap(),
-        })
-        .unwrap();
-    let call_bob_2 = match wait_for_engine_event(&eng_bob, Duration::from_secs(5), |e| {
-        matches!(e, EngineEvent::IncomingCall { .. })
-    })
-    .expect("IncomingCall from mitm")
-    {
-        EngineEvent::IncomingCall { call_id, .. } => call_id,
-        _ => unreachable!(),
-    };
-    eng_bob
-        .send_command(EngineCommand::Answer {
-            call_id: call_bob_2.clone(),
-        })
-        .unwrap();
-
-    let fp_warning = wait_for_engine_event(&eng_bob, Duration::from_secs(5), |e| {
-        matches!(
-            e,
-            EngineEvent::Warning(msg) if msg.contains("DTLS-SRTP peer certificate fingerprint mismatch")
-        )
-    });
-    assert!(
-        fp_warning.is_some(),
-        "expected DTLS-SRTP fingerprint mismatch warning on bob"
-    );
-
-    let _ = eng_bob.send_command(EngineCommand::Hangup {
-        call_id: call_bob_2,
-    });
-    eng_mitm.shutdown().unwrap();
     eng_alice.shutdown().unwrap();
     eng_bob.shutdown().unwrap();
 }

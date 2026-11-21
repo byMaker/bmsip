@@ -1758,28 +1758,84 @@ fn tcp_and_tls_transport_sets_via_contact_and_skips_udp_retransmits() {
 }
 
 #[test]
-fn sdes_srtp_and_dtls_srtp_dialog_negotiation_and_hold_reinvite() {
-    use bmsip_core::sdp::{
-        DtlsFingerprint, DtlsSetupRole, NegotiatedSrtp, SdpMediaProfile, SrtpMode, SrtpSuite,
-    };
+fn sdes_srtp_tls_enforcement_crypto_seed_hold_and_dtls_488_rejection() {
+    use bmsip_core::sdp::{NegotiatedSrtp, SdpMediaProfile, SrtpMode, SrtpSuite};
+    use bmsip_core::sip::SipTransport;
 
     let t0 = Instant::now();
-    let reg = SipUri::parse("sip:pbx.local:5060").unwrap();
+    let reg_tls = SipUri::parse("sip:pbx.local:5061;transport=tls").unwrap();
+    let reg_udp = SipUri::parse("sip:pbx.local:5060").unwrap();
 
-    // 1. SDES-SRTP (`SrtpMode::SdesRequired`) dialog + mid-call Hold re-INVITE key continuity.
+    // 1. SdesRequired over unencrypted UDP is rejected by default (RFC 4568 §8).
+    let mut insecure_ua = UserAgent::new(
+        UaConfig::new(
+            "alice",
+            "pw",
+            "pbx.local",
+            reg_udp.clone(),
+            "10.0.0.1",
+            5060,
+        )
+        .with_srtp_mode(SrtpMode::SdesRequired),
+    );
+    assert!(
+        insecure_ua
+            .dial(SipUri::parse("sip:bob@10.0.0.2:5062").unwrap(), 40000, t0)
+            .is_err(),
+        "SdesRequired over plain UDP must be rejected unless allow_insecure_cleartext_sdes is set"
+    );
+
+    // 2. SdesOptional over plain UDP must NOT leak a=crypto keys in cleartext SDP.
+    let mut opt_udp = UserAgent::new(
+        UaConfig::new(
+            "alice",
+            "pw",
+            "pbx.local",
+            reg_udp.clone(),
+            "10.0.0.1",
+            5060,
+        )
+        .with_srtp_mode(SrtpMode::SdesOptional),
+    );
+    let _ = opt_udp
+        .dial(SipUri::parse("sip:bob@10.0.0.2:5062").unwrap(), 40000, t0)
+        .unwrap();
+    let opt_inv = String::from_utf8(opt_udp.poll_transmit().remove(0)).unwrap();
+    assert!(
+        !opt_inv.contains("a=crypto:"),
+        "SdesOptional over plain UDP must not emit a=crypto keys in cleartext"
+    );
+
+    // 3. SDES-SRTP (`SrtpMode::SdesRequired`) over TLS with independent 256-bit `crypto_seed`s
+    //    + mid-call Hold re-INVITE key continuity.
     let mut alice = UserAgent::new(
-        UaConfig::new("alice", "pw", "pbx.local", reg.clone(), "10.0.0.1", 5060)
-            .with_instance_seed(0x1111)
-            .with_srtp_mode(SrtpMode::SdesRequired),
+        UaConfig::new(
+            "alice",
+            "pw",
+            "pbx.local",
+            reg_tls.clone(),
+            "10.0.0.1",
+            5061,
+        )
+        .with_transport(SipTransport::Tls)
+        .with_instance_seed(0x1111)
+        .with_crypto_seed([0xAAu8; 32])
+        .with_srtp_mode(SrtpMode::SdesRequired),
     );
     let mut bob = UserAgent::new(
-        UaConfig::new("bob", "pw", "pbx.local", reg.clone(), "10.0.0.2", 5062)
-            .with_instance_seed(0x2222)
+        UaConfig::new("bob", "pw", "pbx.local", reg_tls.clone(), "10.0.0.2", 5063)
+            .with_transport(SipTransport::Tls)
+            .with_instance_seed(0x1111) // Same instance_seed, different crypto_seed -> must produce distinct keys!
+            .with_crypto_seed([0xBBu8; 32])
             .with_srtp_mode(SrtpMode::SdesRequired),
     );
 
     let cid = alice
-        .dial(SipUri::parse("sip:bob@10.0.0.2:5062").unwrap(), 40000, t0)
+        .dial(
+            SipUri::parse("sip:bob@10.0.0.2:5063;transport=tls").unwrap(),
+            40000,
+            t0,
+        )
         .unwrap();
     let inv_pkt = alice.poll_transmit().remove(0);
     let b_evs = bob.receive_datagram(&inv_pkt, t0);
@@ -1811,7 +1867,6 @@ fn sdes_srtp_and_dtls_srtp_dialog_negotiation_and_hold_reinvite() {
             assert_eq!(*suite, SrtpSuite::AesCm128HmacSha1_80);
             (*local_key_salt, *remote_key_salt)
         }
-        other => panic!("unexpected alice SRTP: {other:?}"),
     };
     let (b_tx, b_rx) = match bob.negotiated_srtp(&cid).expect("bob SDES") {
         NegotiatedSrtp::Sdes {
@@ -1822,7 +1877,6 @@ fn sdes_srtp_and_dtls_srtp_dialog_negotiation_and_hold_reinvite() {
             assert_eq!(*suite, SrtpSuite::AesCm128HmacSha1_80);
             (*local_key_salt, *remote_key_salt)
         }
-        other => panic!("unexpected bob SRTP: {other:?}"),
     };
     assert_eq!(a_tx, b_rx);
     assert_eq!(b_tx, a_rx);
@@ -1849,42 +1903,42 @@ fn sdes_srtp_and_dtls_srtp_dialog_negotiation_and_hold_reinvite() {
         })
     );
 
-    // 2. DTLS-SRTP (`SrtpMode::DtlsSrtp`) dialog negotiation.
-    let fp_a = DtlsFingerprint::sha256_from_der(b"alice-dtls-cert");
-    let fp_b = DtlsFingerprint::sha256_from_der(b"bob-dtls-cert");
-    let mut dtls_alice = UserAgent::new(
-        UaConfig::new("alice", "pw", "pbx.local", reg.clone(), "10.0.0.1", 5060)
-            .with_srtp_mode(SrtpMode::DtlsSrtp)
-            .with_dtls_fingerprint(fp_a.clone()),
+    // 4. Incoming DTLS-SRTP (`UDP/TLS/RTP/SAVPF`) offer must be rejected cleanly with 488 Not Acceptable Here.
+    let dtls_sdp = "\
+        v=0\r\n\
+        o=webrtc 99 99 IN IP4 10.0.0.9\r\n\
+        s=WebRTC\r\n\
+        c=IN IP4 10.0.0.9\r\n\
+        t=0 0\r\n\
+        m=audio 40100 UDP/TLS/RTP/SAVPF 0\r\n\
+        a=fingerprint:sha-256 AA:BB:CC:DD:EE:FF:00:11\r\n\
+        a=setup:actpass\r\n\
+        a=sendrecv\r\n";
+    let dtls_inv = format!(
+        "INVITE sip:bob@10.0.0.2:5063;transport=tls SIP/2.0\r\n\
+         Via: SIP/2.0/TLS 10.0.0.9:5061;branch=z9hG4bKdtls488\r\n\
+         Max-Forwards: 70\r\n\
+         From: <sip:webrtc@pbx.local>;tag=wtag1\r\n\
+         To: <sip:bob@pbx.local>\r\n\
+         Call-ID: dtls-reject-call@10.0.0.9\r\n\
+         CSeq: 1 INVITE\r\n\
+         Contact: <sip:webrtc@10.0.0.9:5061;transport=tls>\r\n\
+         Content-Type: application/sdp\r\n\
+         Content-Length: {}\r\n\r\n{dtls_sdp}",
+        dtls_sdp.len()
     );
-    let mut dtls_bob = UserAgent::new(
-        UaConfig::new("bob", "pw", "pbx.local", reg, "10.0.0.2", 5062)
-            .with_srtp_mode(SrtpMode::DtlsSrtp)
-            .with_dtls_fingerprint(fp_b.clone()),
-    );
-
-    let dcid = dtls_alice
-        .dial(SipUri::parse("sip:bob@10.0.0.2:5062").unwrap(), 40100, t0)
-        .unwrap();
-    let dinv = dtls_alice.poll_transmit().remove(0);
-    let _ = dtls_bob.receive_datagram(&dinv, t0);
-    let _ = dtls_bob.poll_transmit();
-    dtls_bob.answer(&dcid, 50100, t0).unwrap();
-    let dok = dtls_bob.poll_transmit().remove(0);
-    let _ = dtls_alice.receive_datagram(&dok, t0);
-
-    assert_eq!(
-        dtls_alice.negotiated_srtp(&dcid),
-        Some(&NegotiatedSrtp::Dtls {
-            local_role: DtlsSetupRole::Passive,
-            remote_fingerprint: fp_b,
-        })
-    );
-    assert_eq!(
-        dtls_bob.negotiated_srtp(&dcid),
-        Some(&NegotiatedSrtp::Dtls {
-            local_role: DtlsSetupRole::Active,
-            remote_fingerprint: fp_a,
-        })
+    let _ = bob.receive_datagram(dtls_inv.as_bytes(), t0 + Duration::from_secs(2));
+    let _ = bob.poll_transmit(); // 100 Trying
+    assert!(bob
+        .answer(
+            "dtls-reject-call@10.0.0.9",
+            50100,
+            t0 + Duration::from_secs(2)
+        )
+        .is_err());
+    let resp_488 = String::from_utf8(bob.poll_transmit().remove(0)).unwrap();
+    assert!(
+        resp_488.starts_with("SIP/2.0 488 "),
+        "expected 488 Not Acceptable Here for DTLS-SRTP offer, got: {resp_488}"
     );
 }

@@ -57,7 +57,7 @@ let mut engine_cfg = EngineConfig::new(
 engine_cfg.telemetry_capacity = 512; // Bounded global ring size (minimum 16)
 ```
 
-Optional transport (`UDP`/`TCP`/`TLS`), SRTP media encryption (`Disabled`/`SdesOptional`/`SdesRequired`/`DtlsSrtp`), RFC 4028 Session-Timers, and RFC 3323/3325 Caller-ID builders on `UaConfig` and `EngineConfig`:
+Optional transport (`UDP`/`TCP`/`TLS`), SRTP media encryption (`Disabled`/`SdesOptional`/`SdesRequired`), RFC 4028 Session-Timers, and RFC 3323/3325 Caller-ID builders on `UaConfig` and `EngineConfig`:
 
 ```rust
 use bmsip_engine::bmsip_core::sdp::SrtpMode;
@@ -66,7 +66,7 @@ use bmsip_engine::TlsConfig;
 
 let ua_cfg = ua_cfg
     .with_transport(SipTransport::Tls) // SipTransport::Udp (default), Tcp, or Tls
-    .with_srtp_mode(SrtpMode::SdesRequired) // Disabled (default), SdesOptional, SdesRequired, or DtlsSrtp
+    .with_srtp_mode(SrtpMode::SdesRequired) // Disabled (default), SdesOptional, or SdesRequired (requires TLS)
     .with_session_timers(Some(1800), 90) // Session-Expires (s), Min-SE (s); pass None to disable
     .with_caller_identity(
         Some(NameAddr::parse("\"Alice\" <sip:+15550100@pbx.example.com>")?),
@@ -146,7 +146,7 @@ Defined in [`crates/bmsip-ffi/src/bmsip.udl`](../crates/bmsip-ffi/src/bmsip.udl)
 
 - **Configuration (`FfiConfig`):** `username`, `password`, `domain`, `registrar_addr`, `bind_ip`, `sip_port`, `enable_opus`.
   When `enable_opus` is `true`, `BmsipClient` offers `[Opus, G722, PCMU, PCMA, CN, telephone-event/48000, telephone-event/8000]`; when `false`, it offers `[G722, PCMU, PCMA, CN, telephone-event/8000]`.
-- **Sample Rate, Transport & SRTP Selection:** Default `BmsipClient(config)` uses UDP + plain RTP with an `8000` Hz (`160` samples/20 ms) bridge; use `BmsipClient.with_sample_rate(config, 16000 | 48000)` for wideband/fullband PCM, `BmsipClient.with_transport(...)` for TCP/TLS, or `BmsipClient.with_security(config, sample_rate_hz, FfiTransport.Tls, FfiSrtpMode.SdesRequired, tls_ca_pem, tls_insecure)` to combine TLS signaling with SDES-SRTP or DTLS-SRTP media encryption.
+- **Sample Rate, Transport & SRTP Selection:** Default `BmsipClient(config)` uses UDP + plain RTP with an `8000` Hz (`160` samples/20 ms) bridge; use `BmsipClient.with_sample_rate(config, 16000 | 48000)` for wideband/fullband PCM, `BmsipClient.with_transport(...)` for TCP/TLS, or `BmsipClient.with_security(config, sample_rate_hz, FfiTransport.Tls, FfiSrtpMode.SdesRequired, tls_ca_pem, tls_insecure)` to combine TLS signaling with RFC 4568 SDES-SRTP media encryption (CSPRNG keys, enforced over TLS).
 - **Audio Exchange:**
   - `push_captured_pcm(samples)` — pushes one 20 ms (`160` @ 8 kHz, `320` @ 16 kHz, or `960` @ 48 kHz) mono PCM frame captured from OS audio.
   - `pop_playout_pcm() -> sequence<i16>?` — pops the next decoded 20 ms frame sized for `audio_sample_rate_hz()`.
@@ -174,7 +174,7 @@ Defined in [`crates/bmsip-ffi/src/bmsip.udl`](../crates/bmsip-ffi/src/bmsip.udl)
 
 [`crates/bmsip-ffi/include/bmsip.h`](../crates/bmsip-ffi/include/bmsip.h) provides an opaque pointer ABI (`BmsipClientHandle *`):
 
-- **Constructors:** `bmsip_client_new(...)` creates an 8 kHz UDP client (G.722/PCMU/PCMA); `bmsip_client_new_ex(..., enable_opus, sample_rate_hz)` enables Opus (`enable_opus != 0`) and selects `8000`, `16000`, or `48000` Hz PCM framing (queryable via `bmsip_client_audio_sample_rate_hz`); `bmsip_client_new_transport(..., transport, tls_ca_pem, tls_insecure)` selects `"udp"`, `"tcp"`, or `"tls"`; `bmsip_client_new_secure(..., transport, srtp_mode, tls_ca_pem, tls_insecure)` additionally configures SRTP (`"off"`, `"optional"`, `"sdes"`, `"dtls"`).
+- **Constructors:** `bmsip_client_new(...)` creates an 8 kHz UDP client (G.722/PCMU/PCMA); `bmsip_client_new_ex(..., enable_opus, sample_rate_hz)` enables Opus (`enable_opus != 0`) and selects `8000`, `16000`, or `48000` Hz PCM framing (queryable via `bmsip_client_audio_sample_rate_hz`); `bmsip_client_new_transport(..., transport, tls_ca_pem, tls_insecure)` selects `"udp"`, `"tcp"`, or `"tls"`; `bmsip_client_new_secure(..., transport, srtp_mode, tls_ca_pem, tls_insecure)` additionally configures SRTP (`"off"`, `"optional"`, or `"sdes"` — `"sdes"` requires `"tls"`).
 - **Return Convention:** Action functions (`bmsip_client_register`, `bmsip_client_dial`, `bmsip_client_ring_early_media`, `bmsip_client_answer`, `bmsip_client_hangup`, `bmsip_client_hold`, `bmsip_client_resume_call`, `bmsip_client_transfer`, `bmsip_client_attended_transfer`, `bmsip_client_send_dtmf`, `bmsip_client_send_info_dtmf`, etc.) return `0` on success or `-1` on error.
 - **PCM Functions:**
   - `bmsip_client_push_pcm(client, samples, len)` returns `0` on success (`-1` if `len` does not match the 20 ms frame length for the configured sample rate: `160`, `320`, or `960`).

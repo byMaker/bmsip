@@ -1,10 +1,21 @@
-//! MODULE_CONTRACT: Pure-Rust `#![forbid(unsafe_code)]` RFC 3711 SRTP & SRTCP cryptographic engine (`AES_CM_128_HMAC_SHA1_80` / `AES_CM_128_HMAC_SHA1_32`) and RFC 5764 DTLS-SRTP key material splitter.
-//! INVARIANTS: `#![forbid(unsafe_code)]`; zero external crate dependencies; implements FIPS 197 AES-128, FIPS 180-4 SHA-1, RFC 2104 HMAC-SHA1, RFC 3711 §4.3.1 KDF, 48-bit ROC estimation, 64-packet sliding replay window, and constant-time MAC verification.
+//! MODULE_CONTRACT: Pure-Rust `#![forbid(unsafe_code)]` RFC 3711 SRTP & SRTCP cryptographic engine (`AES_CM_128_HMAC_SHA1_80` / `AES_CM_128_HMAC_SHA1_32`) and RFC 5764 key material splitter.
+//! INVARIANTS: `#![forbid(unsafe_code)]`; zero external crate dependencies; implements FIPS 197 AES-128, FIPS 180-4 SHA-1, RFC 2104 HMAC-SHA1, RFC 3711 §4.3.1 KDF, per-SSRC 48-bit ROC & 64-packet sliding replay window (authenticated before state mutation), RFC 3711 §9.2 key lifetime enforcement, constant-time MAC verification, and zeroization of key material on `Drop`.
 //! RFC_REFS: FIPS 197 (AES-128), FIPS 180-4 (SHA-1), RFC 2104 (HMAC), RFC 3711 (SRTP/SRTCP), RFC 4568 (SDES), RFC 5764 (DTLS-SRTP).
 
 use bmsip_core::sdp::SrtpSuite;
 
 use crate::error::MediaError;
+
+const MAX_TRACKED_SSRCS: usize = 16;
+const MAX_SRTP_PACKETS: u64 = (1u64 << 48) - 1;
+const MAX_SRTCP_INDEX: u32 = 0x7fff_ffff;
+
+fn zeroize_bytes(buf: &mut [u8]) {
+    for b in buf.iter_mut() {
+        *b = 0;
+    }
+    std::hint::black_box(buf);
+}
 
 const AES_SBOX: [u8; 256] = [
     0x63, 0x7c, 0x77, 0x7b, 0xf2, 0x6b, 0x6f, 0xc5, 0x30, 0x01, 0x67, 0x2b, 0xfe, 0xd7, 0xab, 0x76,
@@ -34,11 +45,18 @@ const LABEL_SRTCP_ENC: u8 = 0x03;
 const LABEL_SRTCP_AUTH: u8 = 0x04;
 const LABEL_SRTCP_SALT: u8 = 0x05;
 
-/// 30-byte SRTP master key (16 bytes) and master salt (14 bytes).
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+/// 30-byte SRTP master key (16 bytes) and master salt (14 bytes). Wiped on [`Drop`].
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SrtpKeyMaterial {
     pub master_key: [u8; 16],
     pub master_salt: [u8; 14],
+}
+
+impl Drop for SrtpKeyMaterial {
+    fn drop(&mut self) {
+        zeroize_bytes(&mut self.master_key);
+        zeroize_bytes(&mut self.master_salt);
+    }
 }
 
 impl SrtpKeyMaterial {
@@ -99,7 +117,7 @@ impl SrtpKeyMaterial {
     }
 }
 
-/// Derived RFC 3711 §4.3 session keys for one direction (TX or RX).
+/// Derived RFC 3711 §4.3 session keys for one direction (TX or RX). Wiped on [`Drop`].
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct DerivedSrtpKeys {
     pub rtp_cipher_key: [u8; 16],
@@ -108,6 +126,17 @@ pub struct DerivedSrtpKeys {
     pub rtcp_cipher_key: [u8; 16],
     pub rtcp_auth_key: [u8; 20],
     pub rtcp_salt: [u8; 14],
+}
+
+impl Drop for DerivedSrtpKeys {
+    fn drop(&mut self) {
+        zeroize_bytes(&mut self.rtp_cipher_key);
+        zeroize_bytes(&mut self.rtp_auth_key);
+        zeroize_bytes(&mut self.rtp_salt);
+        zeroize_bytes(&mut self.rtcp_cipher_key);
+        zeroize_bytes(&mut self.rtcp_auth_key);
+        zeroize_bytes(&mut self.rtcp_salt);
+    }
 }
 
 /// Derives SRTP and SRTCP session encryption, authentication, and salt keys per RFC 3711 §4.3.1 & §4.3.2.
@@ -166,227 +195,61 @@ pub fn derive_srtp_session_keys(material: &SrtpKeyMaterial) -> DerivedSrtpKeys {
     }
 }
 
-/// Stateful RFC 3711 SRTP & SRTCP cryptographic context for one stream direction.
 #[derive(Debug, Clone)]
-pub struct SrtpContext {
-    suite: SrtpSuite,
-    keys: DerivedSrtpKeys,
-    rtp_round_keys: [[u8; 16]; 11],
-    rtcp_round_keys: [[u8; 16]; 11],
+struct SsrcStreamState {
+    ssrc: u32,
     roc: u32,
     highest_seq: Option<u16>,
     rtp_replay_window: u64,
     highest_rtp_index: Option<u64>,
+    rtp_packets_processed: u64,
     srtcp_index: u32,
     rtcp_replay_window: u64,
     highest_rtcp_index: Option<u32>,
+    last_used_tick: u64,
 }
 
-impl SrtpContext {
-    /// Initializes an [`SrtpContext`] from [`SrtpSuite`] and [`SrtpKeyMaterial`].
-    pub fn new(suite: SrtpSuite, material: SrtpKeyMaterial) -> Self {
-        let keys = derive_srtp_session_keys(&material);
-        let rtp_round_keys = aes128_expand_key(&keys.rtp_cipher_key);
-        let rtcp_round_keys = aes128_expand_key(&keys.rtcp_cipher_key);
+impl SsrcStreamState {
+    fn new(ssrc: u32, tick: u64) -> Self {
         Self {
-            suite,
-            keys,
-            rtp_round_keys,
-            rtcp_round_keys,
+            ssrc,
             roc: 0,
             highest_seq: None,
             rtp_replay_window: 0,
             highest_rtp_index: None,
+            rtp_packets_processed: 0,
             srtcp_index: 0,
             rtcp_replay_window: 0,
             highest_rtcp_index: None,
+            last_used_tick: tick,
         }
     }
 
-    /// Initializes an [`SrtpContext`] directly from a 30-byte `master_key || master_salt` array.
-    pub fn from_key_salt(suite: SrtpSuite, key_salt: &[u8; 30]) -> Self {
-        Self::new(suite, SrtpKeyMaterial::from_key_salt(key_salt))
-    }
-
-    /// Returns the configured [`SrtpSuite`].
-    pub fn suite(&self) -> SrtpSuite {
-        self.suite
-    }
-
-    /// Returns the current 32-bit SRTP Rollover Counter (`ROC`).
-    pub fn roc(&self) -> u32 {
-        self.roc
-    }
-
-    /// Encrypts and authenticates an outbound RTP packet into an SRTP wire packet (RFC 3711 §3.3).
-    pub fn protect_rtp(&mut self, rtp_packet: &[u8]) -> Result<Vec<u8>, MediaError> {
-        let header_len = rtp_header_len(rtp_packet)?;
-        let seq = u16::from_be_bytes([rtp_packet[2], rtp_packet[3]]);
-        let ssrc =
-            u32::from_be_bytes([rtp_packet[8], rtp_packet[9], rtp_packet[10], rtp_packet[11]]);
-
-        let (est_roc, pkt_index) = self.estimate_packet_index(seq);
-        self.advance_seq_state(seq, est_roc, pkt_index);
-
-        let tag_len = self.suite.rtp_auth_tag_len();
-        let mut out = Vec::with_capacity(rtp_packet.len() + tag_len);
-        out.extend_from_slice(rtp_packet);
-
-        aes128_cm_xor(
-            &self.rtp_round_keys,
-            &self.keys.rtp_salt,
-            ssrc,
-            pkt_index,
-            &mut out[header_len..],
-        );
-
-        let tag = compute_srtp_auth_tag(&self.keys.rtp_auth_key, &out, est_roc);
-        out.extend_from_slice(&tag[..tag_len]);
-        Ok(out)
-    }
-
-    /// Verifies replay window, authenticates HMAC-SHA1 tag, and decrypts an inbound SRTP packet into a plaintext RTP packet.
-    pub fn unprotect_rtp(&mut self, srtp_packet: &[u8]) -> Result<Vec<u8>, MediaError> {
-        let tag_len = self.suite.rtp_auth_tag_len();
-        if srtp_packet.len() < 12 + tag_len {
-            return Err(MediaError::PacketTooShort);
-        }
-        let signed_len = srtp_packet.len() - tag_len;
-        let signed_portion = &srtp_packet[..signed_len];
-        let wire_tag = &srtp_packet[signed_len..];
-
-        let header_len = rtp_header_len(signed_portion)?;
-        let seq = u16::from_be_bytes([signed_portion[2], signed_portion[3]]);
-        let ssrc = u32::from_be_bytes([
-            signed_portion[8],
-            signed_portion[9],
-            signed_portion[10],
-            signed_portion[11],
-        ]);
-
-        let (est_roc, pkt_index) = self.estimate_packet_index(seq);
-        self.check_rtp_replay(pkt_index)?;
-
-        let expected_tag = compute_srtp_auth_tag(&self.keys.rtp_auth_key, signed_portion, est_roc);
-        if !constant_time_eq(wire_tag, &expected_tag[..tag_len]) {
-            return Err(MediaError::SrtpError(
-                "SRTP authentication tag verification failed".to_string(),
-            ));
-        }
-
-        self.advance_seq_state(seq, est_roc, pkt_index);
-
-        let mut out = signed_portion.to_vec();
-        aes128_cm_xor(
-            &self.rtp_round_keys,
-            &self.keys.rtp_salt,
-            ssrc,
-            pkt_index,
-            &mut out[header_len..],
-        );
-        Ok(out)
-    }
-
-    /// Encrypts and authenticates an outbound compound RTCP packet into an SRTCP packet (RFC 3711 §3.4).
-    pub fn protect_rtcp(&mut self, rtcp_packet: &[u8]) -> Result<Vec<u8>, MediaError> {
-        if rtcp_packet.len() < 8 {
-            return Err(MediaError::PacketTooShort);
-        }
-        let ssrc = u32::from_be_bytes([
-            rtcp_packet[4],
-            rtcp_packet[5],
-            rtcp_packet[6],
-            rtcp_packet[7],
-        ]);
-        self.srtcp_index = (self.srtcp_index.wrapping_add(1)) & 0x7fff_ffff;
-        let idx = self.srtcp_index;
-
-        let tag_len = self.suite.rtcp_auth_tag_len();
-        let mut out = Vec::with_capacity(rtcp_packet.len() + 4 + tag_len);
-        out.extend_from_slice(rtcp_packet);
-
-        // RFC 3711 §3.4: first 8 bytes (RTCP fixed header + sender SSRC) stay in the clear;
-        // remaining compound RTCP bytes are encrypted with AES-CM.
-        aes128_cm_xor(
-            &self.rtcp_round_keys,
-            &self.keys.rtcp_salt,
-            ssrc,
-            u64::from(idx),
-            &mut out[8..],
-        );
-
-        let e_and_index = 0x8000_0000u32 | idx;
-        out.extend_from_slice(&e_and_index.to_be_bytes());
-        let tag = hmac_sha1(&self.keys.rtcp_auth_key, &out);
-        out.extend_from_slice(&tag[..tag_len]);
-        Ok(out)
-    }
-
-    /// Verifies replay window, authenticates HMAC-SHA1 tag, and decrypts an inbound SRTCP packet into a compound RTCP packet.
-    pub fn unprotect_rtcp(&mut self, srtcp_packet: &[u8]) -> Result<Vec<u8>, MediaError> {
-        let tag_len = self.suite.rtcp_auth_tag_len();
-        if srtcp_packet.len() < 8 + 4 + tag_len {
-            return Err(MediaError::PacketTooShort);
-        }
-        let signed_len = srtcp_packet.len() - tag_len;
-        let rtcp_len = signed_len - 4;
-        let signed_portion = &srtcp_packet[..signed_len];
-        let wire_tag = &srtcp_packet[signed_len..];
-
-        let e_and_index = u32::from_be_bytes([
-            signed_portion[rtcp_len],
-            signed_portion[rtcp_len + 1],
-            signed_portion[rtcp_len + 2],
-            signed_portion[rtcp_len + 3],
-        ]);
-        let is_encrypted = (e_and_index & 0x8000_0000) != 0;
-        let idx = e_and_index & 0x7fff_ffff;
-
-        self.check_rtcp_replay(idx)?;
-
-        let expected_tag = hmac_sha1(&self.keys.rtcp_auth_key, signed_portion);
-        if !constant_time_eq(wire_tag, &expected_tag[..tag_len]) {
-            return Err(MediaError::SrtpError(
-                "SRTCP authentication tag verification failed".to_string(),
-            ));
-        }
-
-        self.commit_rtcp_replay(idx);
-
-        let mut out = signed_portion[..rtcp_len].to_vec();
-        if is_encrypted {
-            let ssrc = u32::from_be_bytes([out[4], out[5], out[6], out[7]]);
-            aes128_cm_xor(
-                &self.rtcp_round_keys,
-                &self.keys.rtcp_salt,
-                ssrc,
-                u64::from(idx),
-                &mut out[8..],
-            );
-        }
-        Ok(out)
-    }
-
-    fn estimate_packet_index(&self, seq: u16) -> (u32, u64) {
+    fn estimate_packet_index(&self, seq: u16) -> Result<(u32, u64), MediaError> {
         let Some(s_l) = self.highest_seq else {
             let idx = (u64::from(self.roc) << 16) | u64::from(seq);
-            return (self.roc, idx);
+            return Ok((self.roc, idx));
         };
 
         // RFC 3711 Appendix A: estimate v (candidate ROC) from s_l and seq.
         let v = if s_l < 32_768 {
             if seq > s_l && (seq - s_l) > 32_768 {
-                self.roc.wrapping_sub(1)
+                if self.roc == 0 {
+                    return Err(MediaError::SrtpError(
+                        "SRTP packet precedes initial ROC=0 window".to_string(),
+                    ));
+                }
+                self.roc - 1
             } else {
                 self.roc
             }
         } else if s_l >= 32_768 && (s_l - 32_768) > seq {
-            self.roc.wrapping_add(1)
+            self.roc.checked_add(1).ok_or(MediaError::SrtpKeyExpired)?
         } else {
             self.roc
         };
         let idx = (u64::from(v) << 16) | u64::from(seq);
-        (v, idx)
+        Ok((v, idx))
     }
 
     fn advance_seq_state(&mut self, seq: u16, est_roc: u32, pkt_index: u64) {
@@ -488,6 +351,284 @@ impl SrtpContext {
     }
 }
 
+/// Stateful RFC 3711 SRTP & SRTCP cryptographic context for one stream direction with per-SSRC ROC and replay tracking.
+#[derive(Debug, Clone)]
+pub struct SrtpContext {
+    suite: SrtpSuite,
+    keys: DerivedSrtpKeys,
+    rtp_round_keys: [[u8; 16]; 11],
+    rtcp_round_keys: [[u8; 16]; 11],
+    streams: Vec<SsrcStreamState>,
+    access_tick: u64,
+    last_active_ssrc: Option<u32>,
+}
+
+impl Drop for SrtpContext {
+    fn drop(&mut self) {
+        for rk in &mut self.rtp_round_keys {
+            zeroize_bytes(rk);
+        }
+        for rk in &mut self.rtcp_round_keys {
+            zeroize_bytes(rk);
+        }
+    }
+}
+
+impl SrtpContext {
+    /// Initializes an [`SrtpContext`] from [`SrtpSuite`] and [`SrtpKeyMaterial`].
+    pub fn new(suite: SrtpSuite, material: SrtpKeyMaterial) -> Self {
+        let keys = derive_srtp_session_keys(&material);
+        let rtp_round_keys = aes128_expand_key(&keys.rtp_cipher_key);
+        let rtcp_round_keys = aes128_expand_key(&keys.rtcp_cipher_key);
+        Self {
+            suite,
+            keys,
+            rtp_round_keys,
+            rtcp_round_keys,
+            streams: Vec::new(),
+            access_tick: 0,
+            last_active_ssrc: None,
+        }
+    }
+
+    /// Initializes an [`SrtpContext`] directly from a 30-byte `master_key || master_salt` array.
+    pub fn from_key_salt(suite: SrtpSuite, key_salt: &[u8; 30]) -> Self {
+        Self::new(suite, SrtpKeyMaterial::from_key_salt(key_salt))
+    }
+
+    /// Returns the configured [`SrtpSuite`].
+    pub fn suite(&self) -> SrtpSuite {
+        self.suite
+    }
+
+    /// Returns the 32-bit SRTP Rollover Counter (`ROC`) of the most recently active SSRC (or `0` if none).
+    pub fn roc(&self) -> u32 {
+        self.last_active_ssrc
+            .and_then(|ssrc| self.roc_for_ssrc(ssrc))
+            .unwrap_or(0)
+    }
+
+    /// Returns the 32-bit SRTP Rollover Counter (`ROC`) tracked for a specific `ssrc`, if known.
+    pub fn roc_for_ssrc(&self, ssrc: u32) -> Option<u32> {
+        self.streams.iter().find(|s| s.ssrc == ssrc).map(|s| s.roc)
+    }
+
+    /// Returns the number of distinct authenticated SSRCs currently tracked in this context.
+    pub fn tracked_ssrc_count(&self) -> usize {
+        self.streams.len()
+    }
+
+    fn find_or_insert_stream(&mut self, ssrc: u32) -> &mut SsrcStreamState {
+        self.access_tick = self.access_tick.saturating_add(1);
+        let tick = self.access_tick;
+        self.last_active_ssrc = Some(ssrc);
+
+        if let Some(pos) = self.streams.iter().position(|s| s.ssrc == ssrc) {
+            self.streams[pos].last_used_tick = tick;
+            return &mut self.streams[pos];
+        }
+
+        if self.streams.len() >= MAX_TRACKED_SSRCS {
+            if let Some((evict_idx, _)) = self
+                .streams
+                .iter()
+                .enumerate()
+                .min_by_key(|(_, s)| s.last_used_tick)
+            {
+                self.streams.swap_remove(evict_idx);
+            }
+        }
+        self.streams.push(SsrcStreamState::new(ssrc, tick));
+        let idx = self.streams.len() - 1;
+        &mut self.streams[idx]
+    }
+
+    /// Encrypts and authenticates an outbound RTP packet into an SRTP wire packet (RFC 3711 §3.3).
+    pub fn protect_rtp(&mut self, rtp_packet: &[u8]) -> Result<Vec<u8>, MediaError> {
+        let header_len = rtp_header_len(rtp_packet)?;
+        let seq = u16::from_be_bytes([rtp_packet[2], rtp_packet[3]]);
+        let ssrc =
+            u32::from_be_bytes([rtp_packet[8], rtp_packet[9], rtp_packet[10], rtp_packet[11]]);
+
+        let (est_roc, pkt_index) = {
+            let stream = self.find_or_insert_stream(ssrc);
+            if stream.rtp_packets_processed >= MAX_SRTP_PACKETS {
+                return Err(MediaError::SrtpKeyExpired);
+            }
+            let (est_roc, pkt_index) = stream.estimate_packet_index(seq)?;
+            stream.advance_seq_state(seq, est_roc, pkt_index);
+            stream.rtp_packets_processed = stream.rtp_packets_processed.saturating_add(1);
+            (est_roc, pkt_index)
+        };
+
+        let tag_len = self.suite.rtp_auth_tag_len();
+        let mut out = Vec::with_capacity(rtp_packet.len() + tag_len);
+        out.extend_from_slice(rtp_packet);
+
+        aes128_cm_xor(
+            &self.rtp_round_keys,
+            &self.keys.rtp_salt,
+            ssrc,
+            pkt_index,
+            &mut out[header_len..],
+        );
+
+        let tag = compute_srtp_auth_tag(&self.keys.rtp_auth_key, &out, est_roc);
+        out.extend_from_slice(&tag[..tag_len]);
+        Ok(out)
+    }
+
+    /// Verifies per-SSRC replay window, authenticates HMAC-SHA1 tag, and decrypts an inbound SRTP packet into a plaintext RTP packet.
+    ///
+    /// New SSRC entries are allocated strictly after HMAC authentication succeeds so forged SSRCs cannot evict active streams.
+    pub fn unprotect_rtp(&mut self, srtp_packet: &[u8]) -> Result<Vec<u8>, MediaError> {
+        let tag_len = self.suite.rtp_auth_tag_len();
+        if srtp_packet.len() < 12 + tag_len {
+            return Err(MediaError::PacketTooShort);
+        }
+        let signed_len = srtp_packet.len() - tag_len;
+        let signed_portion = &srtp_packet[..signed_len];
+        let wire_tag = &srtp_packet[signed_len..];
+
+        let header_len = rtp_header_len(signed_portion)?;
+        let seq = u16::from_be_bytes([signed_portion[2], signed_portion[3]]);
+        let ssrc = u32::from_be_bytes([
+            signed_portion[8],
+            signed_portion[9],
+            signed_portion[10],
+            signed_portion[11],
+        ]);
+
+        let (est_roc, pkt_index) =
+            if let Some(stream) = self.streams.iter().find(|s| s.ssrc == ssrc) {
+                if stream.rtp_packets_processed >= MAX_SRTP_PACKETS {
+                    return Err(MediaError::SrtpKeyExpired);
+                }
+                let (est_roc, pkt_index) = stream.estimate_packet_index(seq)?;
+                stream.check_rtp_replay(pkt_index)?;
+                (est_roc, pkt_index)
+            } else {
+                // RFC 3711 §3.3.1: newly observed SSRC begins at ROC = 0.
+                (0u32, u64::from(seq))
+            };
+
+        let expected_tag = compute_srtp_auth_tag(&self.keys.rtp_auth_key, signed_portion, est_roc);
+        if !constant_time_eq(wire_tag, &expected_tag[..tag_len]) {
+            return Err(MediaError::SrtpError(
+                "SRTP authentication tag verification failed".to_string(),
+            ));
+        }
+
+        let stream = self.find_or_insert_stream(ssrc);
+        stream.advance_seq_state(seq, est_roc, pkt_index);
+        stream.rtp_packets_processed = stream.rtp_packets_processed.saturating_add(1);
+
+        let mut out = signed_portion.to_vec();
+        aes128_cm_xor(
+            &self.rtp_round_keys,
+            &self.keys.rtp_salt,
+            ssrc,
+            pkt_index,
+            &mut out[header_len..],
+        );
+        Ok(out)
+    }
+
+    /// Encrypts and authenticates an outbound compound RTCP packet into an SRTCP packet (RFC 3711 §3.4).
+    pub fn protect_rtcp(&mut self, rtcp_packet: &[u8]) -> Result<Vec<u8>, MediaError> {
+        if rtcp_packet.len() < 8 {
+            return Err(MediaError::PacketTooShort);
+        }
+        let ssrc = u32::from_be_bytes([
+            rtcp_packet[4],
+            rtcp_packet[5],
+            rtcp_packet[6],
+            rtcp_packet[7],
+        ]);
+        let idx = {
+            let stream = self.find_or_insert_stream(ssrc);
+            if stream.srtcp_index >= MAX_SRTCP_INDEX {
+                return Err(MediaError::SrtpKeyExpired);
+            }
+            stream.srtcp_index += 1;
+            stream.srtcp_index
+        };
+
+        let tag_len = self.suite.rtcp_auth_tag_len();
+        let mut out = Vec::with_capacity(rtcp_packet.len() + 4 + tag_len);
+        out.extend_from_slice(rtcp_packet);
+
+        // RFC 3711 §3.4: first 8 bytes (RTCP fixed header + sender SSRC) stay in the clear;
+        // remaining compound RTCP bytes are encrypted with AES-CM.
+        aes128_cm_xor(
+            &self.rtcp_round_keys,
+            &self.keys.rtcp_salt,
+            ssrc,
+            u64::from(idx),
+            &mut out[8..],
+        );
+
+        let e_and_index = 0x8000_0000u32 | idx;
+        out.extend_from_slice(&e_and_index.to_be_bytes());
+        let tag = hmac_sha1(&self.keys.rtcp_auth_key, &out);
+        out.extend_from_slice(&tag[..tag_len]);
+        Ok(out)
+    }
+
+    /// Verifies per-SSRC replay window, authenticates HMAC-SHA1 tag, and decrypts an inbound SRTCP packet into a compound RTCP packet.
+    pub fn unprotect_rtcp(&mut self, srtcp_packet: &[u8]) -> Result<Vec<u8>, MediaError> {
+        let tag_len = self.suite.rtcp_auth_tag_len();
+        if srtcp_packet.len() < 8 + 4 + tag_len {
+            return Err(MediaError::PacketTooShort);
+        }
+        let signed_len = srtcp_packet.len() - tag_len;
+        let rtcp_len = signed_len - 4;
+        let signed_portion = &srtcp_packet[..signed_len];
+        let wire_tag = &srtcp_packet[signed_len..];
+
+        let ssrc = u32::from_be_bytes([
+            signed_portion[4],
+            signed_portion[5],
+            signed_portion[6],
+            signed_portion[7],
+        ]);
+        let e_and_index = u32::from_be_bytes([
+            signed_portion[rtcp_len],
+            signed_portion[rtcp_len + 1],
+            signed_portion[rtcp_len + 2],
+            signed_portion[rtcp_len + 3],
+        ]);
+        let is_encrypted = (e_and_index & 0x8000_0000) != 0;
+        let idx = e_and_index & 0x7fff_ffff;
+
+        if let Some(stream) = self.streams.iter().find(|s| s.ssrc == ssrc) {
+            stream.check_rtcp_replay(idx)?;
+        }
+
+        let expected_tag = hmac_sha1(&self.keys.rtcp_auth_key, signed_portion);
+        if !constant_time_eq(wire_tag, &expected_tag[..tag_len]) {
+            return Err(MediaError::SrtpError(
+                "SRTCP authentication tag verification failed".to_string(),
+            ));
+        }
+
+        let stream = self.find_or_insert_stream(ssrc);
+        stream.commit_rtcp_replay(idx);
+
+        let mut out = signed_portion[..rtcp_len].to_vec();
+        if is_encrypted {
+            aes128_cm_xor(
+                &self.rtcp_round_keys,
+                &self.keys.rtcp_salt,
+                ssrc,
+                u64::from(idx),
+                &mut out[8..],
+            );
+        }
+        Ok(out)
+    }
+}
+
 fn rtp_header_len(raw: &[u8]) -> Result<usize, MediaError> {
     if raw.len() < 12 {
         return Err(MediaError::PacketTooShort);
@@ -516,7 +657,7 @@ fn rtp_header_len(raw: &[u8]) -> Result<usize, MediaError> {
 }
 
 fn kdf_prf_aes128(master_key: &[u8; 16], master_salt: &[u8; 14], label: u8, out: &mut [u8]) {
-    let round_keys = aes128_expand_key(master_key);
+    let mut round_keys = aes128_expand_key(master_key);
     let mut x = *master_salt;
     // RFC 3711 §4.3.1: key_id = <label> || r (r = 0 for k_dr = 0), XORed at byte 7 (48 bits from right).
     x[7] ^= label;
@@ -527,12 +668,17 @@ fn kdf_prf_aes128(master_key: &[u8; 16], master_salt: &[u8; 14], label: u8, out:
         let mut iv = [0u8; 16];
         iv[..14].copy_from_slice(&x);
         iv[14..16].copy_from_slice(&block_num.to_be_bytes());
-        let keystream = aes128_encrypt_with_round_keys(&round_keys, &iv);
+        let mut keystream = aes128_encrypt_with_round_keys(&round_keys, &iv);
         let take = (out.len() - written).min(16);
         out[written..written + take].copy_from_slice(&keystream[..take]);
+        zeroize_bytes(&mut keystream);
         written += take;
         block_num = block_num.wrapping_add(1);
     }
+    for rk in &mut round_keys {
+        zeroize_bytes(rk);
+    }
+    zeroize_bytes(&mut x);
 }
 
 fn aes128_cm_xor(
@@ -601,6 +747,7 @@ fn aes128_expand_key(key: &[u8; 16]) -> [[u8; 16]; 11] {
     for (r, rk) in round_keys.iter_mut().enumerate() {
         rk.copy_from_slice(&w[r * 16..(r + 1) * 16]);
     }
+    zeroize_bytes(&mut w);
     round_keys
 }
 
@@ -735,7 +882,11 @@ pub fn hmac_sha1(key: &[u8], data: &[u8]) -> [u8; 20] {
         outer[i] = b ^ 0x5c;
     }
     outer[64..84].copy_from_slice(&inner_hash);
-    sha1(&outer)
+    let mac = sha1(&outer);
+    zeroize_bytes(&mut k_block);
+    zeroize_bytes(&mut inner);
+    zeroize_bytes(&mut outer);
+    mac
 }
 
 fn compute_srtp_auth_tag(auth_key: &[u8; 20], packet: &[u8], roc: u32) -> [u8; 20] {
@@ -876,5 +1027,71 @@ mod tests {
             assert_eq!(rtcp_dec, rtcp_plain);
             assert!(rx.unprotect_rtcp(&srtcp).is_err());
         }
+    }
+
+    #[test]
+    fn per_ssrc_srtp_survives_mid_call_ssrc_switch_and_resists_forged_ssrc_flood() {
+        let key_salt = [0x77u8; 30];
+        let mut tx_a = SrtpContext::from_key_salt(SrtpSuite::AesCm128HmacSha1_80, &key_salt);
+        let mut tx_b = SrtpContext::from_key_salt(SrtpSuite::AesCm128HmacSha1_80, &key_salt);
+        let mut rx = SrtpContext::from_key_salt(SrtpSuite::AesCm128HmacSha1_80, &key_salt);
+
+        // Stream A (e.g., IVR / MOH) advances to high sequence number 45_000.
+        let mut pkt_a = RtpPacketizer::new(0xAAAA_0001, 0, 45_000, 160);
+        for i in 0..3 {
+            let plain = pkt_a.next_packet_bytes(&[i as u8; 160], 160, false);
+            let enc = tx_a.protect_rtp(&plain).unwrap();
+            assert_eq!(rx.unprotect_rtp(&enc).unwrap(), plain);
+        }
+        assert_eq!(rx.roc_for_ssrc(0xAAAA_0001), Some(0));
+
+        // Attacker floods 64 bogus SSRCs with invalid HMAC tags: MUST NOT evict or pollute SSRC table.
+        for bogus in 1..=64u32 {
+            let mut forged = RtpPacketizer::new(0xDEAD_0000 + bogus, 0, 1, 160).next_packet_bytes(
+                &[0x55; 160],
+                160,
+                false,
+            );
+            forged.extend_from_slice(&[0x00; 10]);
+            assert!(rx.unprotect_rtp(&forged).is_err());
+        }
+        assert_eq!(
+            rx.tracked_ssrc_count(),
+            1,
+            "unauthenticated SSRCs must not enter SSRC state table"
+        );
+
+        // Stream B (e.g., agent after PBX bridge/transfer) starts at low sequence 100:
+        // must NOT falsely increment ROC due to Stream A's seq 45_002!
+        let mut pkt_b = RtpPacketizer::new(0xBBBB_0002, 0, 100, 160);
+        for i in 0..3 {
+            let plain = pkt_b.next_packet_bytes(&[(i + 10) as u8; 160], 160, false);
+            let enc = tx_b.protect_rtp(&plain).unwrap();
+            assert_eq!(rx.unprotect_rtp(&enc).unwrap(), plain);
+        }
+        assert_eq!(rx.roc_for_ssrc(0xBBBB_0002), Some(0));
+        assert_eq!(rx.tracked_ssrc_count(), 2);
+
+        // Interleaved packets from Stream A still decrypt cleanly too.
+        let plain_a_next = pkt_a.next_packet_bytes(&[0x33; 160], 160, false);
+        let enc_a_next = tx_a.protect_rtp(&plain_a_next).unwrap();
+        assert_eq!(rx.unprotect_rtp(&enc_a_next).unwrap(), plain_a_next);
+    }
+
+    #[test]
+    fn enforces_rfc3711_key_lifetime_limit_on_srtcp_index_exhaustion() {
+        let mut ctx = SrtpContext::from_key_salt(SrtpSuite::AesCm128HmacSha1_80, &[0x12u8; 30]);
+        let rtcp_plain = RtcpPacket::ReceiverReport {
+            ssrc: 0x0102_0304,
+            reports: Vec::new(),
+        }
+        .to_bytes();
+        let _ = ctx.protect_rtcp(&rtcp_plain).unwrap();
+        // Fast-forward SRTCP index to maximum 31-bit boundary (2^31 - 1) to verify hard KeyExpired error.
+        ctx.streams[0].srtcp_index = MAX_SRTCP_INDEX;
+        assert_eq!(
+            ctx.protect_rtcp(&rtcp_plain),
+            Err(MediaError::SrtpKeyExpired)
+        );
     }
 }

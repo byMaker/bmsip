@@ -140,7 +140,7 @@ pub unsafe extern "C" fn bmsip_client_new_transport(
 }
 
 /// Allocates and starts a new SIP client handle with explicit SIP transport (`"udp"`, `"tcp"`, `"tls"`),
-/// SRTP media encryption mode (`"off"`, `"optional"`, `"sdes"`, `"dtls"`, nullable -> `"off"`),
+/// SRTP media encryption mode (`"off"`, `"optional"`, `"sdes"`, nullable -> `"off"`),
 /// optional PEM CA certificate bundle (`tls_ca_pem`, nullable), and optional insecure TLS bypass (`tls_insecure != 0`).
 ///
 /// # Safety

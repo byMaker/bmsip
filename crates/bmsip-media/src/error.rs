@@ -15,6 +15,7 @@ pub enum MediaError {
     InvalidWav(String),
     BufferError(String),
     SrtpError(String),
+    SrtpKeyExpired,
 }
 
 impl fmt::Display for MediaError {
@@ -28,6 +29,10 @@ impl fmt::Display for MediaError {
             Self::InvalidWav(msg) => write!(f, "invalid WAV data: {msg}"),
             Self::BufferError(msg) => write!(f, "media buffer error: {msg}"),
             Self::SrtpError(msg) => write!(f, "SRTP/SRTCP error: {msg}"),
+            Self::SrtpKeyExpired => write!(
+                f,
+                "SRTP/SRTCP master key packet limit exhausted (RFC 3711 §9.2)"
+            ),
         }
     }
 }

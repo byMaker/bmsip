@@ -1,10 +1,10 @@
-//! MODULE_CONTRACT: Audio SDP session parser/formatter (`SdpSession`), SRTP SDES (`a=crypto:`, RFC 4568) & DTLS-SRTP (`a=fingerprint:` / `a=setup:`, RFC 5763/5764) attributes, and RFC 3264 Offer/Answer negotiator.
-//! INVARIANTS: Populates static RTP payload types (`0` PCMU, `8` PCMA, `3` GSM, `9` G722, `13` CN) if `a=rtpmap` is omitted; `negotiate_offer_answer` preserves offerer payload type numbers and requires at least one non-DTMF/non-CN audio codec.
-//! RFC_REFS: RFC 3264 Section 6.1, RFC 3551, RFC 3711, RFC 4145, RFC 4566, RFC 4568, RFC 4572, RFC 5763, RFC 5764.
+//! MODULE_CONTRACT: Audio SDP session parser/formatter (`SdpSession`), RFC 4568 SDES (`a=crypto:`) attributes, and RFC 3264 Offer/Answer negotiator.
+//! INVARIANTS: Populates static RTP payload types (`0` PCMU, `8` PCMA, `3` GSM, `9` G722, `13` CN) if `a=rtpmap` is omitted; `negotiate_offer_answer` preserves offerer payload type numbers and requires at least one non-DTMF/non-CN audio codec; rejects unsupported SDES MKI parameters and wipes SDES key material on drop.
+//! RFC_REFS: RFC 3264 Section 6.1, RFC 3551, RFC 3711, RFC 4566, RFC 4568.
 
 use std::fmt;
 
-use crate::auth::hash::sha256;
+use crate::auth::hash::{hmac_sha256, sha256, zeroize_bytes};
 use crate::error::SipError;
 
 /// SDP `m=audio` transport protocol profile.
@@ -124,9 +124,28 @@ impl SdesCryptoAttr {
 
     /// Deterministically derives a 30-byte `master_key || master_salt` from an injected seed using SHA-256.
     pub fn from_seed(tag: u32, suite: SrtpSuite, seed: &[u8]) -> Self {
-        let digest = sha256(seed);
+        let mut digest = sha256(seed);
         let mut key_salt = [0u8; 30];
         key_salt.copy_from_slice(&digest[..30]);
+        zeroize_bytes(&mut digest);
+        Self {
+            tag,
+            suite,
+            key_salt,
+        }
+    }
+
+    /// Derives a 30-byte `master_key || master_salt` using HMAC-SHA256 over a 256-bit CSPRNG secret and domain-separated context.
+    pub fn derive_from_secret(
+        tag: u32,
+        suite: SrtpSuite,
+        secret: &[u8; 32],
+        context: &[u8],
+    ) -> Self {
+        let mut mac = hmac_sha256(secret, context);
+        let mut key_salt = [0u8; 30];
+        key_salt.copy_from_slice(&mac[..30]);
+        zeroize_bytes(&mut mac);
         Self {
             tag,
             suite,
@@ -154,6 +173,9 @@ impl SdesCryptoAttr {
     }
 
     /// Parses an `a=crypto:` value (after `"crypto:"`), e.g. `"1 AES_CM_128_HMAC_SHA1_80 inline:d0RmdmcmVCspeEc3QGZiNWpVLFJhQX1cfHAwJSoj|2^20"`.
+    ///
+    /// Rejects lines that negotiate an RFC 4568 Master Key Identifier (`MKI`, `<value>:<length>`) because
+    /// wire SRTP MKI trailers are not supported, allowing callers to fall back to a non-MKI candidate.
     pub fn parse(raw: &str) -> Result<Self, SipError> {
         let mut parts = raw.split_whitespace();
         let tag_str = parts
@@ -177,28 +199,40 @@ impl SdesCryptoAttr {
         let inline_raw = key_param.ok_or_else(|| {
             SipError::InvalidSdp(format!("missing inline: key parameter in a=crypto:{raw}"))
         })?;
-        let b64_part = inline_raw
-            .split('|')
-            .next()
-            .unwrap_or(inline_raw)
-            .split(';')
-            .next()
-            .unwrap_or(inline_raw)
-            .trim();
-        let decoded = base64_decode(b64_part)?;
-        if decoded.len() < 30 {
+        // RFC 4568 §6.1: multiple key-params may be separated by ';'; inspect the primary inline parameter.
+        let primary_param = inline_raw.split(';').next().unwrap_or(inline_raw);
+        let mut pipe_parts = primary_param.split('|');
+        let b64_part = pipe_parts.next().unwrap_or("").trim();
+        for trailing in pipe_parts {
+            let trimmed = trailing.trim();
+            if trimmed.contains(':') {
+                return Err(SipError::InvalidSdp(format!(
+                    "unsupported SDES MKI parameter '{trimmed}' in a=crypto:{raw}"
+                )));
+            }
+        }
+        let mut decoded = base64_decode(b64_part)?;
+        if decoded.len() != 30 {
+            zeroize_bytes(&mut decoded);
             return Err(SipError::InvalidSdp(format!(
-                "SDES inline key+salt too short: expected >= 30 bytes, got {}",
+                "SDES inline key+salt length mismatch: expected 30 bytes, got {}",
                 decoded.len()
             )));
         }
         let mut key_salt = [0u8; 30];
         key_salt.copy_from_slice(&decoded[..30]);
+        zeroize_bytes(&mut decoded);
         Ok(Self {
             tag,
             suite,
             key_salt,
         })
+    }
+}
+
+impl Drop for SdesCryptoAttr {
+    fn drop(&mut self) {
+        zeroize_bytes(&mut self.key_salt);
     }
 }
 
@@ -215,6 +249,7 @@ impl fmt::Display for SdesCryptoAttr {
 }
 
 /// RFC 4145 / RFC 5763 DTLS-SRTP connection setup role (`a=setup:`).
+#[cfg(feature = "experimental-dtls")]
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum DtlsSetupRole {
     /// Offerer accepts either active (client) or passive (server) role (`actpass`).
@@ -226,6 +261,7 @@ pub enum DtlsSetupRole {
     Passive,
 }
 
+#[cfg(feature = "experimental-dtls")]
 impl DtlsSetupRole {
     /// Returns the SDP `a=setup:` attribute value.
     pub fn as_str(self) -> &'static str {
@@ -257,6 +293,7 @@ impl DtlsSetupRole {
     }
 }
 
+#[cfg(feature = "experimental-dtls")]
 impl fmt::Display for DtlsSetupRole {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.write_str(self.as_str())
@@ -264,12 +301,14 @@ impl fmt::Display for DtlsSetupRole {
 }
 
 /// RFC 4572 / RFC 5763 certificate fingerprint (`a=fingerprint:<hash> <hex>`).
+#[cfg(feature = "experimental-dtls")]
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct DtlsFingerprint {
     pub hash_func: String,
     pub fingerprint: String,
 }
 
+#[cfg(feature = "experimental-dtls")]
 impl DtlsFingerprint {
     /// Computes an RFC 4572 `"sha-256"` fingerprint (`AA:BB:CC:...`) over a DER-encoded X.509 certificate.
     pub fn sha256_from_der(cert_der: &[u8]) -> Self {
@@ -316,6 +355,7 @@ impl DtlsFingerprint {
     }
 }
 
+#[cfg(feature = "experimental-dtls")]
 impl fmt::Display for DtlsFingerprint {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         write!(f, "{} {}", self.hash_func, self.fingerprint)
@@ -328,24 +368,21 @@ pub enum SrtpMode {
     /// Plain RTP (`RTP/AVP`); secure `RTP/SAVP` / `UDP/TLS/RTP/SAVP` offers are rejected.
     #[default]
     Disabled,
-    /// Offers `RTP/AVP` with opportunistic `a=crypto:` and accepts either plain `RTP/AVP` or `RTP/SAVP` SDES.
+    /// Offers `RTP/AVP` with opportunistic `a=crypto:` (over TLS) and accepts either plain `RTP/AVP` or `RTP/SAVP` SDES.
     SdesOptional,
-    /// Offers `RTP/SAVP` with mandatory RFC 4568 `a=crypto:` SDES key exchange.
+    /// Offers `RTP/SAVP` with mandatory RFC 4568 `a=crypto:` SDES key exchange (requires SIP over TLS by default).
     SdesRequired,
-    /// Offers `UDP/TLS/RTP/SAVP` with mandatory RFC 5763 / RFC 5764 DTLS-SRTP (`a=fingerprint:` + `a=setup:`).
-    DtlsSrtp,
 }
 
 impl SrtpMode {
-    /// Parses `"disabled"`/`"off"`/`"none"`, `"sdes-optional"`/`"optional"`, `"sdes"`/`"sdes-required"`, or `"dtls"`/`"dtls-srtp"`.
+    /// Parses `"disabled"`/`"off"`/`"none"`, `"sdes-optional"`/`"optional"`, or `"sdes"`/`"sdes-required"`/`"required"`.
     pub fn parse(raw: &str) -> Result<Self, SipError> {
         match raw.trim().to_ascii_lowercase().as_str() {
             "disabled" | "off" | "none" => Ok(Self::Disabled),
             "sdes-optional" | "optional" => Ok(Self::SdesOptional),
             "sdes" | "sdes-required" | "required" => Ok(Self::SdesRequired),
-            "dtls" | "dtls-srtp" => Ok(Self::DtlsSrtp),
             _ => Err(SipError::ParseError(format!(
-                "unsupported SRTP mode '{raw}' (expected off, optional, sdes, or dtls)"
+                "unsupported SRTP mode '{raw}' (expected off, optional, or sdes)"
             ))),
         }
     }
@@ -360,11 +397,21 @@ pub enum NegotiatedSrtp {
         local_key_salt: [u8; 30],
         remote_key_salt: [u8; 30],
     },
-    /// RFC 5763 / RFC 5764 DTLS-SRTP role and expected peer certificate fingerprint.
-    Dtls {
-        local_role: DtlsSetupRole,
-        remote_fingerprint: DtlsFingerprint,
-    },
+}
+
+impl Drop for NegotiatedSrtp {
+    fn drop(&mut self) {
+        match self {
+            Self::Sdes {
+                local_key_salt,
+                remote_key_salt,
+                ..
+            } => {
+                zeroize_bytes(local_key_salt);
+                zeroize_bytes(remote_key_salt);
+            }
+        }
+    }
 }
 
 /// Media stream direction attribute (RFC 3264 / RFC 4566).
@@ -523,8 +570,6 @@ pub struct SdpSession {
     pub codecs: Vec<RtpCodec>,
     pub ptime: Option<u32>,
     pub crypto: Vec<SdesCryptoAttr>,
-    pub dtls_fingerprint: Option<DtlsFingerprint>,
-    pub dtls_setup: Option<DtlsSetupRole>,
 }
 
 impl SdpSession {
@@ -548,8 +593,6 @@ impl SdpSession {
             codecs,
             ptime: Some(20),
             crypto: Vec::new(),
-            dtls_fingerprint: None,
-            dtls_setup: None,
         }
     }
 
@@ -572,8 +615,6 @@ impl SdpSession {
         let mut rtpmaps: Vec<(u8, String, u32, Option<u8>)> = Vec::new();
         let mut fmtps: Vec<(u8, String)> = Vec::new();
         let mut crypto: Vec<SdesCryptoAttr> = Vec::new();
-        let mut dtls_fingerprint: Option<DtlsFingerprint> = None;
-        let mut dtls_setup: Option<DtlsSetupRole> = None;
 
         for raw_line in text.lines() {
             let line = raw_line.trim();
@@ -658,18 +699,6 @@ impl SdpSession {
                         if in_audio_section || !saw_audio {
                             direction = Direction::Inactive;
                         }
-                    } else if let Some(rest) = strip_prefix_ci(attr, "fingerprint:") {
-                        if in_audio_section || !saw_audio {
-                            if let Ok(fp) = DtlsFingerprint::parse(rest) {
-                                dtls_fingerprint = Some(fp);
-                            }
-                        }
-                    } else if let Some(rest) = strip_prefix_ci(attr, "setup:") {
-                        if in_audio_section || !saw_audio {
-                            if let Ok(role) = DtlsSetupRole::parse(rest) {
-                                dtls_setup = Some(role);
-                            }
-                        }
                     } else if in_audio_section {
                         if let Some(rest) = strip_prefix_ci(attr, "rtpmap:") {
                             let (pt, name, rate, ch) = parse_rtpmap(rest)?;
@@ -740,8 +769,6 @@ impl SdpSession {
             codecs,
             ptime,
             crypto,
-            dtls_fingerprint,
-            dtls_setup,
         })
     }
 }
@@ -791,12 +818,6 @@ impl fmt::Display for SdpSession {
         for c in &self.crypto {
             write!(f, "a=crypto:{c}\r\n")?;
         }
-        if let Some(fp) = &self.dtls_fingerprint {
-            write!(f, "a=fingerprint:{fp}\r\n")?;
-        }
-        if let Some(setup) = self.dtls_setup {
-            write!(f, "a=setup:{setup}\r\n")?;
-        }
 
         if let Some(ptime) = self.ptime {
             write!(f, "a=ptime:{ptime}\r\n")?;
@@ -823,12 +844,11 @@ pub fn negotiate_offer_answer(
         local_port,
         SrtpMode::Disabled,
         &[],
-        None,
     )?;
     Ok((answer, negotiated))
 }
 
-/// Performs RFC 3264 + RFC 4568 (SDES) + RFC 5763 (DTLS-SRTP) Offer/Answer negotiation.
+/// Performs RFC 3264 + RFC 4568 (SDES) Offer/Answer negotiation.
 pub fn negotiate_offer_answer_with_srtp(
     offer: &SdpSession,
     local_supported: &[RtpCodec],
@@ -836,7 +856,6 @@ pub fn negotiate_offer_answer_with_srtp(
     local_port: u16,
     srtp_mode: SrtpMode,
     local_sdes_candidates: &[SdesCryptoAttr],
-    local_dtls_fingerprint: Option<&DtlsFingerprint>,
 ) -> Result<(SdpSession, Vec<RtpCodec>, Option<NegotiatedSrtp>), SipError> {
     if offer.audio_port == 0 {
         return Err(SipError::InvalidSdp(
@@ -869,7 +888,13 @@ pub fn negotiate_offer_answer_with_srtp(
         ));
     }
 
-    let (profile, answer_crypto, answer_fp, answer_setup, negotiated_srtp) = match srtp_mode {
+    if offer.profile == SdpMediaProfile::UdpTlsRtpSavp {
+        return Err(SipError::InvalidSdp(
+            "DTLS-SRTP (UDP/TLS/RTP/SAVP) is not supported".to_string(),
+        ));
+    }
+
+    let (profile, answer_crypto, negotiated_srtp) = match srtp_mode {
         SrtpMode::Disabled => {
             if offer.profile != SdpMediaProfile::RtpAvp {
                 return Err(SipError::InvalidSdp(format!(
@@ -877,45 +902,22 @@ pub fn negotiate_offer_answer_with_srtp(
                     offer.profile
                 )));
             }
-            (SdpMediaProfile::RtpAvp, Vec::new(), None, None, None)
+            (SdpMediaProfile::RtpAvp, Vec::new(), None)
         }
         SrtpMode::SdesOptional => {
-            if offer.profile == SdpMediaProfile::UdpTlsRtpSavp {
-                if let (Some(remote_fp), Some(local_fp)) =
-                    (offer.dtls_fingerprint.clone(), local_dtls_fingerprint)
-                {
-                    let local_role = offer
-                        .dtls_setup
-                        .unwrap_or(DtlsSetupRole::ActPass)
-                        .answer_role();
-                    (
-                        SdpMediaProfile::UdpTlsRtpSavp,
-                        Vec::new(),
-                        Some(local_fp.clone()),
-                        Some(local_role),
-                        Some(NegotiatedSrtp::Dtls {
-                            local_role,
-                            remote_fingerprint: remote_fp,
-                        }),
-                    )
-                } else {
-                    return Err(SipError::InvalidSdp(
-                        "DTLS-SRTP offer lacked fingerprint or local DTLS certificate".to_string(),
-                    ));
-                }
-            } else if let Some(remote_c) = offer.crypto.first() {
+            if let Some(remote_c) = offer.crypto.first() {
                 let local_key_salt = local_sdes_candidates
                     .iter()
                     .find(|c| c.suite == remote_c.suite)
                     .or_else(|| local_sdes_candidates.first())
                     .map(|c| c.key_salt)
-                    .unwrap_or([0x5au8; 30]);
+                    .ok_or_else(|| {
+                        SipError::InvalidSdp("missing local SDES crypto key candidates".to_string())
+                    })?;
                 let ans_attr = SdesCryptoAttr::new(remote_c.tag, remote_c.suite, local_key_salt);
                 (
                     offer.profile,
                     vec![ans_attr],
-                    None,
-                    None,
                     Some(NegotiatedSrtp::Sdes {
                         suite: remote_c.suite,
                         local_key_salt,
@@ -923,22 +925,18 @@ pub fn negotiate_offer_answer_with_srtp(
                     }),
                 )
             } else if offer.profile == SdpMediaProfile::RtpAvp {
-                (SdpMediaProfile::RtpAvp, Vec::new(), None, None, None)
+                (SdpMediaProfile::RtpAvp, Vec::new(), None)
             } else {
                 return Err(SipError::InvalidSdp(
-                    "RTP/SAVP offer lacked a=crypto SDES attributes".to_string(),
+                    "RTP/SAVP offer lacked supported non-MKI a=crypto SDES attributes".to_string(),
                 ));
             }
         }
         SrtpMode::SdesRequired => {
-            if offer.profile == SdpMediaProfile::UdpTlsRtpSavp {
-                return Err(SipError::InvalidSdp(
-                    "SDES SRTP required locally, but remote offered DTLS-SRTP".to_string(),
-                ));
-            }
             let Some(remote_c) = offer.crypto.first() else {
                 return Err(SipError::InvalidSdp(
-                    "SDES SRTP required locally, but remote offer lacked a=crypto".to_string(),
+                    "SDES SRTP required locally, but remote offer lacked supported non-MKI a=crypto"
+                        .to_string(),
                 ));
             };
             let local_key_salt = local_sdes_candidates
@@ -946,50 +944,17 @@ pub fn negotiate_offer_answer_with_srtp(
                 .find(|c| c.suite == remote_c.suite)
                 .or_else(|| local_sdes_candidates.first())
                 .map(|c| c.key_salt)
-                .unwrap_or([0x5au8; 30]);
+                .ok_or_else(|| {
+                    SipError::InvalidSdp("missing local SDES crypto key candidates".to_string())
+                })?;
             let ans_attr = SdesCryptoAttr::new(remote_c.tag, remote_c.suite, local_key_salt);
-            let ans_profile = if offer.profile == SdpMediaProfile::RtpSavp {
-                SdpMediaProfile::RtpSavp
-            } else {
-                offer.profile
-            };
             (
-                ans_profile,
+                offer.profile,
                 vec![ans_attr],
-                None,
-                None,
                 Some(NegotiatedSrtp::Sdes {
                     suite: remote_c.suite,
                     local_key_salt,
                     remote_key_salt: remote_c.key_salt,
-                }),
-            )
-        }
-        SrtpMode::DtlsSrtp => {
-            if offer.profile != SdpMediaProfile::UdpTlsRtpSavp {
-                return Err(SipError::InvalidSdp(format!(
-                    "DTLS-SRTP required locally, but remote offered '{}'",
-                    offer.profile
-                )));
-            }
-            let remote_fp = offer.dtls_fingerprint.clone().ok_or_else(|| {
-                SipError::InvalidSdp("DTLS-SRTP offer missing a=fingerprint".to_string())
-            })?;
-            let local_fp = local_dtls_fingerprint.cloned().ok_or_else(|| {
-                SipError::InvalidSdp("local DTLS-SRTP fingerprint not configured".to_string())
-            })?;
-            let local_role = offer
-                .dtls_setup
-                .unwrap_or(DtlsSetupRole::ActPass)
-                .answer_role();
-            (
-                SdpMediaProfile::UdpTlsRtpSavp,
-                Vec::new(),
-                Some(local_fp),
-                Some(local_role),
-                Some(NegotiatedSrtp::Dtls {
-                    local_role,
-                    remote_fingerprint: remote_fp,
                 }),
             )
         }
@@ -1006,8 +971,6 @@ pub fn negotiate_offer_answer_with_srtp(
         codecs: negotiated.clone(),
         ptime: offer.ptime.or(Some(20)),
         crypto: answer_crypto,
-        dtls_fingerprint: answer_fp,
-        dtls_setup: answer_setup,
     };
 
     Ok((answer, negotiated, negotiated_srtp))
@@ -1019,6 +982,11 @@ pub fn resolve_outbound_answer_srtp(
     remote_answer: &SdpSession,
     srtp_mode: SrtpMode,
 ) -> Result<Option<NegotiatedSrtp>, SipError> {
+    if remote_answer.profile == SdpMediaProfile::UdpTlsRtpSavp {
+        return Err(SipError::InvalidSdp(
+            "DTLS-SRTP (UDP/TLS/RTP/SAVP) is not supported".to_string(),
+        ));
+    }
     match srtp_mode {
         SrtpMode::Disabled => {
             if remote_answer.profile.is_secure() {
@@ -1052,7 +1020,8 @@ pub fn resolve_outbound_answer_srtp(
         SrtpMode::SdesRequired => {
             let rem = remote_answer.crypto.first().ok_or_else(|| {
                 SipError::InvalidSdp(
-                    "SDES SRTP required locally, but remote answer lacked a=crypto".to_string(),
+                    "SDES SRTP required locally, but remote answer lacked supported non-MKI a=crypto"
+                        .to_string(),
                 )
             })?;
             let loc = local_offer
@@ -1069,23 +1038,6 @@ pub fn resolve_outbound_answer_srtp(
                 suite: rem.suite,
                 local_key_salt: loc.key_salt,
                 remote_key_salt: rem.key_salt,
-            }))
-        }
-        SrtpMode::DtlsSrtp => {
-            let remote_fp = remote_answer.dtls_fingerprint.clone().ok_or_else(|| {
-                SipError::InvalidSdp(
-                    "DTLS-SRTP required locally, but remote answer lacked a=fingerprint"
-                        .to_string(),
-                )
-            })?;
-            let remote_role = remote_answer.dtls_setup.unwrap_or(DtlsSetupRole::Passive);
-            let local_role = match remote_role {
-                DtlsSetupRole::Active => DtlsSetupRole::Passive,
-                DtlsSetupRole::Passive | DtlsSetupRole::ActPass => DtlsSetupRole::Active,
-            };
-            Ok(Some(NegotiatedSrtp::Dtls {
-                local_role,
-                remote_fingerprint: remote_fp,
             }))
         }
     }
@@ -1385,11 +1337,52 @@ mod tests {
     }
 
     #[test]
-    fn parses_and_negotiates_sdes_srtp_and_dtls_srtp_profiles() {
-        let k1 = SdesCryptoAttr::from_seed(1, SrtpSuite::AesCm128HmacSha1_80, b"alice-seed-1");
-        let k2 = SdesCryptoAttr::from_seed(1, SrtpSuite::AesCm128HmacSha1_80, b"bob-seed-1");
+    fn parses_and_negotiates_sdes_srtp_rejects_mki_and_dtls_offers() {
+        let secret_a = [0x11u8; 32];
+        let secret_b = [0x22u8; 32];
+        let k1 = SdesCryptoAttr::derive_from_secret(
+            1,
+            SrtpSuite::AesCm128HmacSha1_80,
+            &secret_a,
+            b"alice-call-1",
+        );
+        let k2 = SdesCryptoAttr::derive_from_secret(
+            1,
+            SrtpSuite::AesCm128HmacSha1_80,
+            &secret_b,
+            b"bob-call-1",
+        );
+        assert_ne!(k1.key_salt, k2.key_salt);
         let parsed_k1 = SdesCryptoAttr::parse(&k1.to_string()).unwrap();
         assert_eq!(parsed_k1, k1);
+
+        // Lifetime without MKI is accepted; MKI (`|1:4` or `|2^20|1:4`) MUST be rejected.
+        let with_lifetime = format!(
+            "1 AES_CM_128_HMAC_SHA1_80 inline:{}|2^20",
+            k1.inline_base64()
+        );
+        assert_eq!(SdesCryptoAttr::parse(&with_lifetime).unwrap(), k1);
+        let with_mki = format!(
+            "1 AES_CM_128_HMAC_SHA1_80 inline:{}|2^20|1:4",
+            k1.inline_base64()
+        );
+        assert!(SdesCryptoAttr::parse(&with_mki).is_err());
+
+        // Offer containing MKI line first and non-MKI line second must automatically pick non-MKI.
+        let sdp_with_mki_then_plain = format!(
+            "v=0\r\n\
+             o=alice 10 10 IN IP4 10.0.0.1\r\n\
+             s=Call\r\n\
+             c=IN IP4 10.0.0.1\r\n\
+             t=0 0\r\n\
+             m=audio 40000 RTP/SAVP 0\r\n\
+             a=crypto:{with_mki}\r\n\
+             a=crypto:2 AES_CM_128_HMAC_SHA1_80 inline:{}\r\n",
+            k1.inline_base64()
+        );
+        let parsed_mki_offer = SdpSession::parse(&sdp_with_mki_then_plain).unwrap();
+        assert_eq!(parsed_mki_offer.crypto.len(), 1);
+        assert_eq!(parsed_mki_offer.crypto[0].tag, 2);
 
         let mut offer = SdpSession::new("alice", "10", "10.0.0.1", 40000, vec![RtpCodec::pcmu()]);
         offer.profile = SdpMediaProfile::RtpSavp;
@@ -1405,6 +1398,17 @@ mod tests {
                 .is_err()
         );
 
+        // Missing local SDES candidates must error rather than falling back to a hardcoded key.
+        assert!(negotiate_offer_answer_with_srtp(
+            &reparsed_offer,
+            &[RtpCodec::pcmu()],
+            "10.0.0.2",
+            50000,
+            SrtpMode::SdesRequired,
+            &[],
+        )
+        .is_err());
+
         // SdesRequired mode accepts and produces matching tag/suite with Bob's key_salt.
         let (ans, _, neg_srtp) = negotiate_offer_answer_with_srtp(
             &reparsed_offer,
@@ -1413,7 +1417,6 @@ mod tests {
             50000,
             SrtpMode::SdesRequired,
             std::slice::from_ref(&k2),
-            None,
         )
         .unwrap();
         assert_eq!(ans.profile, SdpMediaProfile::RtpSavp);
@@ -1438,48 +1441,33 @@ mod tests {
             })
         );
 
-        // DTLS-SRTP offer/answer roundtrip.
-        let fp_alice = DtlsFingerprint::sha256_from_der(b"alice-cert-der");
-        let fp_bob = DtlsFingerprint::sha256_from_der(b"bob-cert-der");
-        let mut dtls_offer =
-            SdpSession::new("alice", "20", "10.0.0.1", 40002, vec![RtpCodec::pcmu()]);
-        dtls_offer.profile = SdpMediaProfile::UdpTlsRtpSavp;
-        dtls_offer.dtls_fingerprint = Some(fp_alice.clone());
-        dtls_offer.dtls_setup = Some(DtlsSetupRole::ActPass);
-
-        let reparsed_dtls = SdpSession::parse(&dtls_offer.to_string()).unwrap();
-        assert_eq!(reparsed_dtls.profile, SdpMediaProfile::UdpTlsRtpSavp);
-        assert_eq!(reparsed_dtls.dtls_fingerprint, Some(fp_alice.clone()));
-        assert_eq!(reparsed_dtls.dtls_setup, Some(DtlsSetupRole::ActPass));
-
-        let (dtls_ans, _, dtls_neg_bob) = negotiate_offer_answer_with_srtp(
-            &reparsed_dtls,
-            &[RtpCodec::pcmu()],
-            "10.0.0.2",
-            50002,
-            SrtpMode::DtlsSrtp,
-            &[],
-            Some(&fp_bob),
-        )
-        .unwrap();
-        assert_eq!(dtls_ans.profile, SdpMediaProfile::UdpTlsRtpSavp);
-        assert_eq!(dtls_ans.dtls_setup, Some(DtlsSetupRole::Active));
-        assert_eq!(
-            dtls_neg_bob,
-            Some(NegotiatedSrtp::Dtls {
-                local_role: DtlsSetupRole::Active,
-                remote_fingerprint: fp_alice,
-            })
-        );
-
-        let dtls_neg_alice =
-            resolve_outbound_answer_srtp(&reparsed_dtls, &dtls_ans, SrtpMode::DtlsSrtp).unwrap();
-        assert_eq!(
-            dtls_neg_alice,
-            Some(NegotiatedSrtp::Dtls {
-                local_role: DtlsSetupRole::Passive,
-                remote_fingerprint: fp_bob,
-            })
-        );
+        // DTLS-SRTP offers (`UDP/TLS/RTP/SAVP`) parse cleanly and are explicitly rejected (488).
+        assert!(SrtpMode::parse("dtls").is_err());
+        let dtls_raw = "\
+            v=0\r\n\
+            o=alice 20 20 IN IP4 10.0.0.1\r\n\
+            s=Call\r\n\
+            c=IN IP4 10.0.0.1\r\n\
+            t=0 0\r\n\
+            m=audio 40002 UDP/TLS/RTP/SAVPF 0\r\n\
+            a=fingerprint:sha-256 AA:BB:CC:DD:EE:FF:00:11\r\n\
+            a=setup:actpass\r\n";
+        let dtls_offer = SdpSession::parse(dtls_raw).unwrap();
+        assert_eq!(dtls_offer.profile, SdpMediaProfile::UdpTlsRtpSavp);
+        for mode in [
+            SrtpMode::Disabled,
+            SrtpMode::SdesOptional,
+            SrtpMode::SdesRequired,
+        ] {
+            assert!(negotiate_offer_answer_with_srtp(
+                &dtls_offer,
+                &[RtpCodec::pcmu()],
+                "10.0.0.2",
+                50002,
+                mode,
+                std::slice::from_ref(&k2),
+            )
+            .is_err());
+        }
     }
 }

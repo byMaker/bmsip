@@ -136,14 +136,15 @@ engine_cfg.register_custom_codec(factory);
 
 ---
 
-## 5. SRTP & SRTCP Media Encryption (`RFC 3711`, `SDES`, `DTLS-SRTP`)
+## 5. SRTP & SRTCP Media Encryption (`RFC 3711`, `SDES`)
 
 [`crates/bmsip-media/src/srtp.rs`](../crates/bmsip-media/src/srtp.rs) implements RFC 3711 SRTP & SRTCP completely in Pure Safe Rust (`#![forbid(unsafe_code)]`, zero external crate dependencies):
 
 - **Cryptographic Suites (`SrtpSuite`):**
   - `AES_CM_128_HMAC_SHA1_80` (16-byte master key, 14-byte master salt, 80-bit / 10-byte RTP & SRTCP HMAC-SHA1 tags)
   - `AES_CM_128_HMAC_SHA1_32` (16-byte master key, 14-byte master salt, 32-bit / 4-byte RTP tag, 80-bit / 10-byte SRTCP tag)
-- **RFC 3711 §4.3.1 KDF & Replay Protection:** Derives separate session cipher, auth, and salt keys for RTP and RTCP (verified against RFC 3711 Appendix B.3 test vectors), tracks the 32-bit Rollover Counter (`ROC`), enforces a 64-packet sliding replay window, and compares MAC tags in constant time.
+- **RFC 3711 §4.3.1 KDF, Per-SSRC Replay Protection & Key Hygiene:** Derives separate session cipher, auth, and salt keys for RTP and RTCP (verified against RFC 3711 Appendix B.3 test vectors), tracks 32-bit `ROC` and 64-packet sliding replay windows independently per authenticated SSRC (handling mid-call PBX SSRC switches without ROC desync), enforces RFC 3711 §9.2 packet limits (`MediaError::SrtpKeyExpired`), compares MAC tags in constant time, and wipes key buffers on `Drop`.
 - **Key Exchange Modes (`SrtpMode`):**
-  - `SrtpMode::SdesRequired` / `SrtpMode::SdesOptional` (RFC 4568): Negotiates `RTP/SAVP` with `a=crypto:<tag> <suite> inline:<base64>` in SDP and preserves master keys across mid-call `re-INVITE` / `UPDATE`.
-  - `SrtpMode::DtlsSrtp` (RFC 5763 / RFC 5764): Negotiates `UDP/TLS/RTP/SAVP` with `a=fingerprint:sha-256` and `a=setup:actpass`/`active`/`passive`, demultiplexes DTLS handshake records (`20..=63`) from RTP/SRTP (`128..=191`) on the RTP UDP socket, verifies both peers' X.509 certificate fingerprints against SDP, and derives 60-byte SRTP keys via RFC 5705 `"EXTRACTOR-dtls_srtp"`.
+  - `SrtpMode::SdesRequired` (RFC 4568): Negotiates `RTP/SAVP` with `a=crypto:<tag> <suite> inline:<base64>` derived via HMAC-SHA256 from a 256-bit OS CSPRNG secret (`UaConfig::crypto_seed`), requires `SipTransport::Tls` by default (RFC 4568 §8), rejects unsupported MKI lines, preserves keys across Hold `re-INVITE`, and selectively rotates keys on `re-INVITE` / `183 -> 200 OK` forking (`MediaSession::update_srtp_keys`).
+  - `SrtpMode::SdesOptional`: Offers opportunistic `a=crypto:` over `SipTransport::Tls` (automatically suppressed over unencrypted UDP/TCP unless `allow_insecure_cleartext_sdes` is explicitly enabled) and interoperates with either `RTP/AVP` or `RTP/SAVP`.
+  - Incoming `UDP/TLS/RTP/SAVP(F)` (DTLS-SRTP) offers are rejected with `488 Not Acceptable Here`; internal DTLS scaffolding is isolated behind the off-by-default `experimental-dtls` Cargo feature.

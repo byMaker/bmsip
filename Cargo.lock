@@ -10,22 +10,23 @@ checksum = "72b3254f16251a8381aa12e40e3c4d2f0199f8c6508fbecb9d91f575e0fbb8c6"
 
 [[package]]
 name = "bmsip-cli"
-version = "0.13.0"
+version = "0.14.0"
 dependencies = [
  "bmsip-engine",
 ]
 
 [[package]]
 name = "bmsip-core"
-version = "0.13.0"
+version = "0.14.0"
 
 [[package]]
 name = "bmsip-engine"
-version = "0.13.0"
+version = "0.14.0"
 dependencies = [
  "bmsip-core",
  "bmsip-media",
  "rcgen",
+ "ring",
  "rustls",
  "rustls-pemfile",
  "webpki-roots 0.26.11",
@@ -33,14 +34,14 @@ dependencies = [
 
 [[package]]
 name = "bmsip-ffi"
-version = "0.13.0"
+version = "0.14.0"
 dependencies = [
  "bmsip-engine",
 ]
 
 [[package]]
 name = "bmsip-media"
-version = "0.13.0"
+version = "0.14.0"
 dependencies = [
  "bmsip-core",
 ]

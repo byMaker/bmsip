@@ -709,12 +709,15 @@ fn ffi_and_c_api_tls_transport_live_asterisk_call() {
         }
         bmsip_client_free(handle);
 
-        // 3. C99 ABI `bmsip_client_new_secure` with TLS + SDES-SRTP on Asterisk endpoint 1004.
+        // 3. C99 ABI `bmsip_client_new_secure` with TLS + SDES-SRTP on Asterisk endpoint 1004,
+        //    verifying unsupported `"dtls"` and cleartext `"udp"`+`"sdes"` combinations are rejected.
         let u4 = CString::new("1004").unwrap();
         let p4 = CString::new("secret1004").unwrap();
         let r_tls = CString::new("asterisk:5061").unwrap();
         let tls_t = CString::new("tls").unwrap();
+        let udp_t = CString::new("udp").unwrap();
         let srtp_sdes = CString::new("sdes").unwrap();
+        let dtls_srtp = CString::new("dtls").unwrap();
         let bad_srtp = CString::new("unknown_srtp").unwrap();
         assert!(bmsip_client_new_secure(
             u4.as_ptr(),
@@ -727,6 +730,36 @@ fn ffi_and_c_api_tls_transport_live_asterisk_call() {
             8_000,
             tls_t.as_ptr(),
             bad_srtp.as_ptr(),
+            ptr::null(),
+            1,
+        )
+        .is_null());
+        assert!(bmsip_client_new_secure(
+            u4.as_ptr(),
+            p4.as_ptr(),
+            d.as_ptr(),
+            r_tls.as_ptr(),
+            b.as_ptr(),
+            0,
+            1,
+            8_000,
+            tls_t.as_ptr(),
+            dtls_srtp.as_ptr(),
+            ptr::null(),
+            1,
+        )
+        .is_null());
+        assert!(bmsip_client_new_secure(
+            u4.as_ptr(),
+            p4.as_ptr(),
+            d.as_ptr(),
+            r_tls.as_ptr(),
+            b.as_ptr(),
+            0,
+            1,
+            8_000,
+            udp_t.as_ptr(),
+            srtp_sdes.as_ptr(),
             ptr::null(),
             1,
         )

@@ -5,6 +5,26 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.14.0] - 2026-11-21
+
+### Security & Hardening
+- **Cryptographically Secure SDES Key Generation (`bmsip-core`, `bmsip-engine`):**
+  - Added pure-Rust `hmac_sha256` (RFC 2104 / RFC 4231) and `SdesCryptoAttr::derive_from_secret` in `bmsip-core`, backed by a dedicated 256-bit `UaConfig::crypto_seed: [u8; 32]` populated from OS CSPRNG (`ring::rand::SystemRandom`) in `SipEngine::spawn` (strictly isolated from `instance_seed` / `Call-ID` / `From` tags).
+  - Enforced RFC 4568 §8 by default: `SrtpMode::SdesRequired` over unencrypted `UDP`/`TCP` is rejected with `EngineError::InvalidConfig` / `SipError::TransactionError` unless `UaConfig::allow_insecure_cleartext_sdes` is explicitly opted in for isolated lab testing, and `SdesOptional` suppresses cleartext `a=crypto:` advertisement on non-TLS transports.
+  - Added `Drop` key zeroization across `SdesCryptoAttr`, `NegotiatedSrtp`, `UserAgent`, `SrtpKeyMaterial`, `DerivedSrtpKeys`, `SrtpContext`, and `MediaSession`.
+- **Per-SSRC SRTP State, Lifetime Limits & Selective Re-Keying (`bmsip-media`, `bmsip-core`, `bmsip-engine`):**
+  - Refactored `SrtpContext` to track `(roc, highest_seq, rtp_replay_window, srtcp_index, rtcp_replay_window)` per authenticated SSRC (bounded LRU table of 16 SSRCs; unseen SSRCs are allocated strictly after HMAC-SHA1 verification succeeds), preventing mid-call PBX SSRC switches (transfers / MOH bridges) from desynchronizing ROC and resisting forged-SSRC floods.
+  - Enforced RFC 3711 §9.2 packet limits ($2^{48}-1$ SRTP packets / $2^{31}-1$ SRTCP packets) returning `MediaError::SrtpKeyExpired` instead of wrapping IV counters.
+  - Rejected unsupported RFC 4568 `MKI` (`<value>:<length>`) parameters in `SdesCryptoAttr::parse` so SDP parsing automatically falls back to non-MKI lines, removed the hardcoded fallback key in `negotiate_offer_answer_with_srtp`, and wired `MediaSession::update_srtp_keys` into both `activate_or_update_media` (`183 -> 200 OK` forking) and `CallMediaUpdated` (`re-INVITE` / `UPDATE` key rotation) while preserving unchanged direction ROC state on Hold.
+- **Non-Blocking TCP Connect & Registrar-Protected Peer Pool (`bmsip-engine`):**
+  - Replaced synchronous `TcpStream::connect_timeout` in `SipTransportDriver` with non-blocking background connect channels (`PendingConnect`) so unreachable TCP/TLS peers never stall the 20 ms RTP media worker loop, and replaced arbitrary `HashMap` eviction with registrar-protected LRU eviction.
+  - Added bounded DNS cache for `Route` header hostname resolution in `WorkerCtx`.
+
+### Changed (Breaking Pre-1.0 API)
+- **Isolated Experimental DTLS-SRTP (`bmsip-core`, `bmsip-engine`, `bmsip-ffi`, `bmsip-cli`):**
+  - Removed `SrtpMode::DtlsSrtp`, `NegotiatedSrtp::Dtls`, and `FfiSrtpMode::DtlsSrtp` (`bmsip.udl` / `--srtp dtls`) from public APIs so production surfaces expose strictly standards-compliant, Asterisk/FreeSWITCH-verified SDES-SRTP (`Disabled`, `SdesOptional`, `SdesRequired`). Incoming `UDP/TLS/RTP/SAVP(F)` offers are cleanly rejected with `488 Not Acceptable Here`.
+  - Gated `bmsip_engine::dtls` and `bmsip_core::sdp::{DtlsFingerprint, DtlsSetupRole}` behind the off-by-default `experimental-dtls` Cargo feature for future RFC 6347 DTLS 1.2 integration.
+
 ## [0.13.0] - 2026-11-21
 
 ### Added

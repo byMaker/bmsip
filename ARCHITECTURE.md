@@ -16,7 +16,7 @@ bmsip-ffi  ──┘                 └─────────────�
 |---|---|---|
 | `bmsip-core` | SIP message parser/serializer, URI/header types, SDP offer/answer, Digest Auth, RFC 3261 transactions, dialogs, account registration state | `#![forbid(unsafe_code)]`; empty `[dependencies]`; zero `std::net`, `std::thread`, `std::fs`, `Instant::now()`, `SystemTime::now()`, or async runtimes |
 | `bmsip-media` | RTP/RTCP framing, RFC 3711 SRTP/SRTCP (`AES_CM_128_HMAC_SHA1_80`/`_32`), DTMF (RFC 4733), adaptive jitter buffer, G.711/G.722/Opus codecs, universal `CodecRegistry` plugin API, 20 ms PCM frame pipeline | `#![forbid(unsafe_code)]`; zero direct OS audio device calls (ALSA, PipeWire, CoreAudio, Oboe) |
-| `bmsip-engine` | UDP/TCP/TLS (`rustls`) socket loop, SDES & DTLS-SRTP media security, monotonic timer driver, `Command`/`Event` queues, `AudioPort` trait, call flight recorder | Zero global singletons (`static mut`); zero user callbacks invoked under held locks; multi-instance safe |
+| `bmsip-engine` | Non-blocking UDP/TCP/TLS (`rustls`) socket loop, OS CSPRNG SDES-SRTP media security, monotonic timer driver, `Command`/`Event` queues, `AudioPort` trait, call flight recorder | Zero global singletons (`static mut`); zero user callbacks invoked under held locks; multi-instance safe |
 | `bmsip-ffi` | Public cross-platform SDK boundary (UniFFI for Swift/Kotlin + C-API header for Linux) | Thin translation layer over `bmsip-engine` `Command`/`Event` model |
 | `bmsip-cli` | Linux CLI SIP endpoint and automated integration test runner | Consumes only `bmsip-engine` public API |
 
@@ -56,7 +56,7 @@ bmsip-ffi  ──┘                 └─────────────�
 | RFC 4028 / 3326 / 3323 / 3325 | `Session-Timers` (`Session-Expires`/`Min-SE`/`422`), `Reason` header, `P-Asserted-Identity` & `Privacy` | Implemented (`v0.10.0`) |
 | RFC 3960 / 2976 / 3389 | Early media (`183`/`180` SDP), SIP `INFO` DTMF (`application/dtmf-relay`), Comfort Noise (`CN` PT 13) | Implemented (`v0.11.0`) |
 | RFC 3261 §18 / 5626 / 5922 / 5923 | SIP over TCP & TLS 1.2–1.3 (`rustls`, mTLS), `Content-Length` stream framing, CRLF keep-alive, connection reuse | Implemented (`v0.12.0`) |
-| RFC 3711 / 4568 / 5763 / 5764 | SRTP & SRTCP (`AES_CM_128_HMAC_SHA1_80`/`_32`), SDES (`a=crypto:`), and DTLS-SRTP (`UDP/TLS/RTP/SAVP`, `a=fingerprint:sha-256`) | Implemented (`v0.13.0`) |
+| RFC 3711 / 4568 | Production-hardened SRTP & SRTCP (`AES_CM_128_HMAC_SHA1_80`/`_32`), per-SSRC ROC/replay, RFC 3711 §9.2 key lifetime limits, key zeroization, OS CSPRNG SDES (`a=crypto:`) enforced over TLS | Implemented (`v0.13.0`, hardened `v0.14.0`) |
 
 ---
 
@@ -97,13 +97,14 @@ All workspace crates share a synchronized **SemVer 2.0.0** version in root `Carg
 - **`0.10.0` — Stage 10:** Core Call Control (Hold/Resume via `a=sendonly`/`inactive`/`sendrecv`, Blind `REFER`/`NOTIFY` & Attended `Replaces` transfer, early/in-dialog `UPDATE`, `PRACK`/`100rel`, `Session-Timers` with `422` auto-retry and `UPDATE` refresh, `Reason`, and `P-Asserted-Identity`/`Privacy`) across `bmsip-core`, `bmsip-engine`, `bmsip-ffi` (UniFFI + C99), and `bmsip-cli`.
 - **`0.11.0` — Stage 11:** Early Media (`183`/`180` SDP) RTP activation before `200 OK`, Legacy SIP `INFO` DTMF (`application/dtmf-relay`, RFC 2976) with `--dtmf-mode rfc4733|info`, and RFC 3389 Comfort Noise (`CN` PT 13) SID synthesis across `bmsip-core`, `bmsip-media`, `bmsip-engine`, `bmsip-ffi`, and `bmsip-cli`.
 - **`0.12.0` — Stage 12:** SIP over TCP and TLS 1.2–1.3 (`rustls`, mTLS, RFC 5922) with Sans-I/O `SipStreamFramer` (RFC 3261 §18.3), RFC 3261 §17 reliable-transport transaction timers, RFC 5626 CRLF keep-alive, and RFC 5923 connection reuse across all crates and the Docker Compose lab.
-- **`0.13.0` — Stage 13 (Current):** Pure-Rust RFC 3711 SRTP & SRTCP (`AES_CM_128_HMAC_SHA1_80` / `_32`) with RFC 4568 SDES (`RTP/SAVP`, `a=crypto:`) and RFC 5763 / RFC 5764 DTLS-SRTP (`UDP/TLS/RTP/SAVP`, `a=fingerprint:sha-256`, `a=setup:`, RFC 5705 key export) across `bmsip-core`, `bmsip-media`, `bmsip-engine`, `bmsip-ffi`, and `bmsip-cli`.
+- **`0.13.0` — Stage 13:** Pure-Rust RFC 3711 SRTP & SRTCP (`AES_CM_128_HMAC_SHA1_80` / `_32`) and RFC 4568 SDES (`RTP/SAVP`, `a=crypto:`) across `bmsip-core`, `bmsip-media`, `bmsip-engine`, `bmsip-ffi`, and `bmsip-cli`.
+- **`0.14.0` — Security & Production Hardening (Current):** 256-bit OS CSPRNG (`ring::rand::SystemRandom`) + HMAC-SHA256 SDES key derivation (`UaConfig::crypto_seed`), per-SSRC SRTP ROC/replay state (authenticated before mutation), RFC 3711 §9.2 `SrtpKeyExpired` lifetime limits, key zeroization on `Drop`, RFC 4568 §8 TLS enforcement for SDES, MKI rejection, `re-INVITE`/`183->200 OK` selective SRTP re-keying, non-blocking outbound TCP connect with registrar-protected LRU peer eviction, and isolation of experimental DTLS-SRTP scaffolding behind the off-by-default `experimental-dtls` Cargo feature (public API exposes strictly standards-compliant SDES-SRTP).
 
 ---
 
 ## 6. Future Roadmap / TODO
 
-- **TODO 1 — Transport Security & Media Encryption:** *Completed in `v0.12.0` (TCP/TLS) and `v0.13.0` (SRTP/SDES/DTLS-SRTP).*
+- **TODO 1 — Transport Security & Media Encryption:** *Completed for PBX production in `v0.12.0` (TCP/TLS), `v0.13.0` (SRTP/SDES), and `v0.14.0` (CSPRNG + per-SSRC + non-blocking hardening). Full RFC 6347 DTLS 1.2 + `use_srtp` (WebRTC interop) remains gated behind `experimental-dtls` until a wire-compatible DTLS 1.2 stack is integrated.*
 - **TODO 2 — Core Call Control (Softphone Essentials):** *Completed in `v0.10.0`.*
 - **TODO 3 — Early Media, Legacy DTMF & Comfort Noise:** *Completed in `v0.11.0`.*
 - **TODO 4 — DNS Discovery & Public Internet NAT Traversal:**

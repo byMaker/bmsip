@@ -72,17 +72,15 @@ pub enum FfiSrtpMode {
     Disabled,
     SdesOptional,
     SdesRequired,
-    DtlsSrtp,
 }
 
 impl FfiSrtpMode {
-    /// Parses a case-insensitive SRTP mode string (`"off"`, `"optional"`, `"sdes"`, `"dtls"`).
+    /// Parses a case-insensitive SRTP mode string (`"off"`, `"optional"`, `"sdes"`).
     pub fn parse_str(raw: &str) -> Option<Self> {
         match SrtpMode::parse(raw).ok()? {
             SrtpMode::Disabled => Some(Self::Disabled),
             SrtpMode::SdesOptional => Some(Self::SdesOptional),
             SrtpMode::SdesRequired => Some(Self::SdesRequired),
-            SrtpMode::DtlsSrtp => Some(Self::DtlsSrtp),
         }
     }
 
@@ -91,7 +89,6 @@ impl FfiSrtpMode {
             Self::Disabled => SrtpMode::Disabled,
             Self::SdesOptional => SrtpMode::SdesOptional,
             Self::SdesRequired => SrtpMode::SdesRequired,
-            Self::DtlsSrtp => SrtpMode::DtlsSrtp,
         }
     }
 }
@@ -223,7 +220,7 @@ impl BmsipClient {
     }
 
     /// Creates and starts a new [`BmsipClient`] with explicit PCM bridge rate, SIP transport (`Udp`/`Tcp`/`Tls`),
-    /// SRTP media encryption mode (`Disabled`/`SdesOptional`/`SdesRequired`/`DtlsSrtp`), optional PEM CA trust bundle,
+    /// SRTP media encryption mode (`Disabled`/`SdesOptional`/`SdesRequired`), optional PEM CA trust bundle,
     /// and optional insecure TLS bypass flag.
     pub fn new_with_security(
         config: FfiConfig,

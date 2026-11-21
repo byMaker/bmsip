@@ -5,12 +5,12 @@
 use std::collections::{HashMap, VecDeque};
 use std::time::{Duration, Instant};
 
+use crate::auth::hash::zeroize_bytes;
 use crate::auth::{DigestChallenge, DigestCredentials};
 use crate::error::SipError;
 use crate::sdp::{
-    negotiate_offer_answer_with_srtp, resolve_outbound_answer_srtp, Direction, DtlsFingerprint,
-    DtlsSetupRole, NegotiatedSrtp, RtpCodec, SdesCryptoAttr, SdpMediaProfile, SdpSession, SrtpMode,
-    SrtpSuite,
+    negotiate_offer_answer_with_srtp, resolve_outbound_answer_srtp, Direction, NegotiatedSrtp,
+    RtpCodec, SdesCryptoAttr, SdpMediaProfile, SdpSession, SrtpMode, SrtpSuite,
 };
 use crate::sip::{
     CSeq, CallerIdentity, Method, NameAddr, RAck, ReasonHeader, ReplacesHeader, SessionExpires,
@@ -87,6 +87,9 @@ pub struct UaConfig {
     /// Optional per-instance entropy seed mixed into Call-IDs, tags, branches, and cnonces
     /// to prevent collisions across process restarts on fixed ports while keeping Sans-I/O determinism (`0` = deterministic default).
     pub instance_seed: u64,
+    /// Dedicated 256-bit CSPRNG secret used exclusively for HMAC-SHA256 SDES master key derivation
+    /// (never exposed in SIP `Call-ID`, `From` tags, or `Via` branches; populated by `SipEngine` from OS CSPRNG).
+    pub crypto_seed: [u8; 32],
     /// Optional RFC 4028 Session-Timers interval in seconds (default `Some(1800)`, `None` disables Session-Timers).
     pub session_expires_secs: Option<u32>,
     /// Minimum acceptable RFC 4028 session interval (`Min-SE`, default `90` seconds).
@@ -95,10 +98,11 @@ pub struct UaConfig {
     pub asserted_identity: Option<NameAddr>,
     /// Optional privacy directive attached via `Privacy` (RFC 3323, e.g., `"id"`).
     pub privacy: Option<String>,
-    /// SRTP media encryption policy (`Disabled`, `SdesOptional`, `SdesRequired`, or `DtlsSrtp`).
+    /// SRTP media encryption policy (`Disabled`, `SdesOptional`, or `SdesRequired`).
     pub srtp_mode: SrtpMode,
-    /// Optional local X.509 certificate SHA-256 fingerprint advertised in `a=fingerprint:` when `srtp_mode` is `DtlsSrtp`.
-    pub dtls_fingerprint: Option<DtlsFingerprint>,
+    /// Explicit opt-in allowing RFC 4568 SDES `a=crypto:` keys over unencrypted UDP/TCP signaling (default `false`;
+    /// strictly for isolated lab/test environments — RFC 4568 §8 requires TLS in production).
+    pub allow_insecure_cleartext_sdes: bool,
 }
 
 impl UaConfig {
@@ -129,12 +133,13 @@ impl UaConfig {
             ],
             timers: RfcTimers::default(),
             instance_seed: 0,
+            crypto_seed: [0u8; 32],
             session_expires_secs: Some(1800),
             min_se_secs: 90,
             asserted_identity: None,
             privacy: None,
             srtp_mode: SrtpMode::Disabled,
-            dtls_fingerprint: None,
+            allow_insecure_cleartext_sdes: false,
         }
     }
 
@@ -147,6 +152,12 @@ impl UaConfig {
     /// Sets an explicit instance seed for unique Call-ID, tag, branch, and Digest `cnonce` generation across restarts.
     pub fn with_instance_seed(mut self, seed: u64) -> Self {
         self.instance_seed = seed;
+        self
+    }
+
+    /// Injects a 256-bit OS CSPRNG secret exclusively for HMAC-SHA256 SDES master key derivation.
+    pub fn with_crypto_seed(mut self, seed: [u8; 32]) -> Self {
+        self.crypto_seed = seed;
         self
     }
 
@@ -172,16 +183,41 @@ impl UaConfig {
         self
     }
 
-    /// Configures the SRTP media encryption mode (`Disabled`, `SdesOptional`, `SdesRequired`, or `DtlsSrtp`).
+    /// Configures the SRTP media encryption mode (`Disabled`, `SdesOptional`, or `SdesRequired`).
     pub fn with_srtp_mode(mut self, srtp_mode: SrtpMode) -> Self {
         self.srtp_mode = srtp_mode;
         self
     }
 
-    /// Sets the local certificate fingerprint advertised in `a=fingerprint:` for DTLS-SRTP offers and answers.
-    pub fn with_dtls_fingerprint(mut self, fingerprint: DtlsFingerprint) -> Self {
-        self.dtls_fingerprint = Some(fingerprint);
+    /// Allows SDES `a=crypto:` key exchange over unencrypted UDP/TCP signaling (default `false`; lab/test use only).
+    pub fn with_allow_insecure_cleartext_sdes(mut self, allow: bool) -> Self {
+        self.allow_insecure_cleartext_sdes = allow;
         self
+    }
+
+    /// Evaluates the effective SRTP mode enforcing RFC 4568 §8 (SDES requires TLS unless explicitly overridden).
+    pub fn effective_srtp_mode(&self) -> Result<SrtpMode, SipError> {
+        let sdes_transport_allowed =
+            self.transport == SipTransport::Tls || self.allow_insecure_cleartext_sdes;
+        match self.srtp_mode {
+            SrtpMode::Disabled => Ok(SrtpMode::Disabled),
+            SrtpMode::SdesOptional => {
+                if sdes_transport_allowed {
+                    Ok(SrtpMode::SdesOptional)
+                } else {
+                    Ok(SrtpMode::Disabled)
+                }
+            }
+            SrtpMode::SdesRequired => {
+                if sdes_transport_allowed {
+                    Ok(SrtpMode::SdesRequired)
+                } else {
+                    Err(SipError::TransactionError(
+                        "SrtpMode::SdesRequired requires SipTransport::Tls unless allow_insecure_cleartext_sdes is explicitly enabled".to_string(),
+                    ))
+                }
+            }
+        }
     }
 
     fn aor_uri(&self) -> SipUri {
@@ -387,6 +423,12 @@ pub struct UserAgent {
     id_counter: u64,
 }
 
+impl Drop for UserAgent {
+    fn drop(&mut self) {
+        zeroize_bytes(&mut self.config.crypto_seed);
+    }
+}
+
 impl UserAgent {
     /// Creates a new [`UserAgent`] initialized in [`RegistrationState::Unregistered`].
     pub fn new(config: UaConfig) -> Self {
@@ -469,7 +511,7 @@ impl UserAgent {
         self.calls.get(call_id).and_then(|c| c.remote_sdp.as_ref())
     }
 
-    /// Returns the negotiated SRTP security parameters (SDES keys or DTLS-SRTP role/fingerprint) for `call_id`, if active.
+    /// Returns the negotiated SRTP security parameters (RFC 4568 SDES keys) for `call_id`, if active.
     pub fn negotiated_srtp(&self, call_id: &str) -> Option<&NegotiatedSrtp> {
         self.calls
             .get(call_id)
@@ -477,31 +519,36 @@ impl UserAgent {
     }
 
     fn generate_sdes_candidates(&mut self, call_id: &str) -> Vec<SdesCryptoAttr> {
-        let s1 = format!(
-            "bmsip-sdes-1-{}-{call_id}-{}-{}:{}",
-            self.config.instance_seed,
-            self.id_counter,
-            self.config.local_host,
-            self.config.local_sip_port
+        let ctx1 = format!(
+            "bmsip-sdes-v2|AES_CM_128_HMAC_SHA1_80|{call_id}|{}|{}:{}",
+            self.id_counter, self.config.local_host, self.config.local_sip_port
         );
         self.id_counter = self.id_counter.wrapping_add(1);
-        let s2 = format!(
-            "bmsip-sdes-2-{}-{call_id}-{}-{}:{}",
-            self.config.instance_seed,
-            self.id_counter,
-            self.config.local_host,
-            self.config.local_sip_port
+        let ctx2 = format!(
+            "bmsip-sdes-v2|AES_CM_128_HMAC_SHA1_32|{call_id}|{}|{}:{}",
+            self.id_counter, self.config.local_host, self.config.local_sip_port
         );
         self.id_counter = self.id_counter.wrapping_add(1);
         vec![
-            SdesCryptoAttr::from_seed(1, SrtpSuite::AesCm128HmacSha1_80, s1.as_bytes()),
-            SdesCryptoAttr::from_seed(2, SrtpSuite::AesCm128HmacSha1_32, s2.as_bytes()),
+            SdesCryptoAttr::derive_from_secret(
+                1,
+                SrtpSuite::AesCm128HmacSha1_80,
+                &self.config.crypto_seed,
+                ctx1.as_bytes(),
+            ),
+            SdesCryptoAttr::derive_from_secret(
+                2,
+                SrtpSuite::AesCm128HmacSha1_32,
+                &self.config.crypto_seed,
+                ctx2.as_bytes(),
+            ),
         ]
     }
 
     #[allow(clippy::too_many_arguments)]
     fn build_local_offer_sdp(
         &self,
+        srtp_mode: SrtpMode,
         sdp_sid: &str,
         sdp_version: u64,
         ip: &str,
@@ -510,16 +557,10 @@ impl UserAgent {
         codecs: Vec<RtpCodec>,
         local_crypto: &[SdesCryptoAttr],
     ) -> SdpSession {
-        let (profile, crypto, dtls_fingerprint, dtls_setup) = match self.config.srtp_mode {
-            SrtpMode::Disabled => (SdpMediaProfile::RtpAvp, Vec::new(), None, None),
-            SrtpMode::SdesOptional => (SdpMediaProfile::RtpAvp, local_crypto.to_vec(), None, None),
-            SrtpMode::SdesRequired => (SdpMediaProfile::RtpSavp, local_crypto.to_vec(), None, None),
-            SrtpMode::DtlsSrtp => (
-                SdpMediaProfile::UdpTlsRtpSavp,
-                Vec::new(),
-                self.config.dtls_fingerprint.clone(),
-                Some(DtlsSetupRole::ActPass),
-            ),
+        let (profile, crypto) = match srtp_mode {
+            SrtpMode::Disabled => (SdpMediaProfile::RtpAvp, Vec::new()),
+            SrtpMode::SdesOptional => (SdpMediaProfile::RtpAvp, local_crypto.to_vec()),
+            SrtpMode::SdesRequired => (SdpMediaProfile::RtpSavp, local_crypto.to_vec()),
         };
         SdpSession {
             origin_username: self.config.username.clone(),
@@ -532,8 +573,6 @@ impl UserAgent {
             codecs,
             ptime: Some(20),
             crypto,
-            dtls_fingerprint,
-            dtls_setup,
         }
     }
 
@@ -596,20 +635,19 @@ impl UserAgent {
         local_rtp_port: u16,
         now: Instant,
     ) -> Result<String, SipError> {
+        let srtp_mode = self.config.effective_srtp_mode()?;
         let call_id = self.next_call_id();
         let local_tag = self.next_tag();
         let sdp_sid = self.next_numeric_id();
         let sdp_version = 1;
-        let local_crypto = if matches!(
-            self.config.srtp_mode,
-            SrtpMode::SdesOptional | SrtpMode::SdesRequired
-        ) {
+        let local_crypto = if matches!(srtp_mode, SrtpMode::SdesOptional | SrtpMode::SdesRequired) {
             self.generate_sdes_candidates(&call_id)
         } else {
             Vec::new()
         };
 
         let local_sdp = self.build_local_offer_sdp(
+            srtp_mode,
             &sdp_sid,
             sdp_version,
             &self.config.local_host,
@@ -859,6 +897,7 @@ impl UserAgent {
             )
         };
 
+        let srtp_mode = self.config.effective_srtp_mode()?;
         let remote_sdp = remote_sdp_opt.ok_or_else(|| {
             SipError::InvalidSdp("inbound INVITE lacked SDP offer for early media".to_string())
         })?;
@@ -871,9 +910,8 @@ impl UserAgent {
             &self.config.supported_codecs,
             &self.config.local_host,
             local_rtp_port,
-            self.config.srtp_mode,
+            srtp_mode,
             &local_candidates,
-            self.config.dtls_fingerprint.as_ref(),
         )?;
         answer_sdp.origin_username = self.config.username.clone();
         answer_sdp.session_id = sdp_sid;
@@ -971,6 +1009,13 @@ impl UserAgent {
             ));
         };
 
+        let srtp_mode = match self.config.effective_srtp_mode() {
+            Ok(mode) => mode,
+            Err(err) => {
+                self.reject_inbound_invite_488(call_id, &tx_id, &req, &local_tag, now);
+                return Err(err);
+            }
+        };
         let local_candidates = match self.calls.get(call_id) {
             Some(c) if !c.local_crypto.is_empty() => c.local_crypto.clone(),
             _ => self.generate_sdes_candidates(call_id),
@@ -980,9 +1025,8 @@ impl UserAgent {
             &self.config.supported_codecs,
             &self.config.local_host,
             effective_rtp_port,
-            self.config.srtp_mode,
+            srtp_mode,
             &local_candidates,
-            self.config.dtls_fingerprint.as_ref(),
         ) {
             Ok(triple) => triple,
             Err(err) => {
@@ -1235,15 +1279,13 @@ impl UserAgent {
         direction: Direction,
         now: Instant,
     ) -> Result<(), SipError> {
+        let srtp_mode = self.config.effective_srtp_mode()?;
         let branch = self.next_branch();
         if self
             .calls
             .get(call_id)
             .is_some_and(|c| c.local_crypto.is_empty())
-            && matches!(
-                self.config.srtp_mode,
-                SrtpMode::SdesOptional | SrtpMode::SdesRequired
-            )
+            && matches!(srtp_mode, SrtpMode::SdesOptional | SrtpMode::SdesRequired)
         {
             let cands = self.generate_sdes_candidates(call_id);
             if let Some(c) = self.calls.get_mut(call_id) {
@@ -1280,6 +1322,7 @@ impl UserAgent {
             )
         };
         let new_sdp = self.build_local_offer_sdp(
+            srtp_mode,
             &sdp_sid,
             sdp_version,
             new_local_ip,
@@ -1318,15 +1361,13 @@ impl UserAgent {
         new_local_rtp_port: Option<u16>,
         now: Instant,
     ) -> Result<(), SipError> {
+        let srtp_mode = self.config.effective_srtp_mode()?;
         let branch = self.next_branch();
         if self
             .calls
             .get(call_id)
             .is_some_and(|c| c.local_crypto.is_empty())
-            && matches!(
-                self.config.srtp_mode,
-                SrtpMode::SdesOptional | SrtpMode::SdesRequired
-            )
+            && matches!(srtp_mode, SrtpMode::SdesOptional | SrtpMode::SdesRequired)
         {
             let cands = self.generate_sdes_candidates(call_id);
             if let Some(c) = self.calls.get_mut(call_id) {
@@ -1380,6 +1421,7 @@ impl UserAgent {
             )
         };
         let sdp = self.build_local_offer_sdp(
+            srtp_mode,
             &sdp_sid,
             sdp_version,
             &ip,
@@ -2815,6 +2857,17 @@ impl UserAgent {
                 None => return,
             };
 
+        let srtp_mode = match self.config.effective_srtp_mode() {
+            Ok(m) => m,
+            Err(_) => {
+                if let Ok(resp) = request.create_response(488, "Not Acceptable Here") {
+                    if let Ok(events) = self.transactions.send_server_response(&tx_id, resp, now) {
+                        self.process_transaction_events(events, now);
+                    }
+                }
+                return;
+            }
+        };
         let local_candidates = match self.calls.get(call_id) {
             Some(c) if !c.local_crypto.is_empty() => c.local_crypto.clone(),
             _ => self.generate_sdes_candidates(call_id),
@@ -2824,9 +2877,8 @@ impl UserAgent {
             &self.config.supported_codecs,
             &self.config.local_host,
             local_rtp_port,
-            self.config.srtp_mode,
+            srtp_mode,
             &local_candidates,
-            self.config.dtls_fingerprint.as_ref(),
         );
         let (mut answer_sdp, negotiated, negotiated_srtp) = match negotiated_res {
             Ok(triple) => triple,
@@ -3147,6 +3199,10 @@ impl UserAgent {
                 None => return,
             };
 
+        let Ok(srtp_mode) = self.config.effective_srtp_mode() else {
+            self.send_simple_server_response(&tx_id, &request, 488, "Not Acceptable Here", now);
+            return;
+        };
         let local_candidates = match self.calls.get(&call_id) {
             Some(c) if !c.local_crypto.is_empty() => c.local_crypto.clone(),
             _ => self.generate_sdes_candidates(&call_id),
@@ -3156,9 +3212,8 @@ impl UserAgent {
             &self.config.supported_codecs,
             &self.config.local_host,
             local_rtp_port,
-            self.config.srtp_mode,
+            srtp_mode,
             &local_candidates,
-            self.config.dtls_fingerprint.as_ref(),
         ) else {
             self.send_simple_server_response(&tx_id, &request, 488, "Not Acceptable Here", now);
             return;
@@ -3501,10 +3556,14 @@ impl UserAgent {
                 if let Some(ref sdp) = early_sdp {
                     call.remote_sdp = Some(sdp.clone());
                     call.remote_hold = is_remote_hold(sdp.direction);
+                    let effective_srtp = self
+                        .config
+                        .effective_srtp_mode()
+                        .unwrap_or(SrtpMode::Disabled);
                     if let Some(ref local_sdp) = call.local_sdp {
                         call.negotiated_codecs = intersect_answer_codecs(local_sdp, sdp);
                         if let Ok(srtp) =
-                            resolve_outbound_answer_srtp(local_sdp, sdp, self.config.srtp_mode)
+                            resolve_outbound_answer_srtp(local_sdp, sdp, effective_srtp)
                         {
                             if let Some(NegotiatedSrtp::Sdes {
                                 suite,
@@ -3527,9 +3586,8 @@ impl UserAgent {
                         &self.config.supported_codecs,
                         &self.config.local_host,
                         call.local_rtp_port,
-                        self.config.srtp_mode,
+                        effective_srtp,
                         &call.local_crypto,
-                        self.config.dtls_fingerprint.as_ref(),
                     ) {
                         call.negotiated_codecs = negotiated;
                         call.negotiated_srtp = srtp;
@@ -3777,11 +3835,12 @@ impl UserAgent {
                     cancelling_race = true;
                 } else if let Some(remote_sdp) = parse_optional_sdp(&response.body) {
                     if let Some(local_sdp) = call.local_sdp.clone() {
-                        match resolve_outbound_answer_srtp(
-                            &local_sdp,
-                            &remote_sdp,
-                            self.config.srtp_mode,
-                        ) {
+                        let effective_srtp = self
+                            .config
+                            .effective_srtp_mode()
+                            .unwrap_or(SrtpMode::Disabled);
+                        match resolve_outbound_answer_srtp(&local_sdp, &remote_sdp, effective_srtp)
+                        {
                             Ok(srtp) => {
                                 if let Some(NegotiatedSrtp::Sdes {
                                     suite,
@@ -4050,11 +4109,13 @@ impl UserAgent {
                     if let (Some(local_sdp), Some(remote_sdp)) =
                         (call.local_sdp.clone(), parse_optional_sdp(&response.body))
                     {
-                        if let Ok(srtp) = resolve_outbound_answer_srtp(
-                            &local_sdp,
-                            &remote_sdp,
-                            self.config.srtp_mode,
-                        ) {
+                        let effective_srtp = self
+                            .config
+                            .effective_srtp_mode()
+                            .unwrap_or(SrtpMode::Disabled);
+                        if let Ok(srtp) =
+                            resolve_outbound_answer_srtp(&local_sdp, &remote_sdp, effective_srtp)
+                        {
                             call.negotiated_srtp = srtp;
                         }
                         let negotiated = intersect_answer_codecs(&local_sdp, &remote_sdp);
