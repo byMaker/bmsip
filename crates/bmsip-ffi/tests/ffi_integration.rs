@@ -43,6 +43,7 @@ fn udl_schema_matches_rust_sdk_surface() {
         "resume_call(string call_id)",
         "transfer(string call_id, string target_uri)",
         "attended_transfer(string call_id, string target_call_id)",
+        "set_active_call(string call_id)",
         "send_dtmf(string call_id, string digit)",
         "send_info_dtmf(string call_id, string digit, u32 duration_ms)",
         "notify_network_changed(string bind_ip, u16 sip_port)",
@@ -953,4 +954,59 @@ fn c_api_bounds_check_pcm_and_expose_addr_and_telemetry() {
         assert!(saw_telemetry);
         bmsip_client_free(handle);
     }
+}
+
+#[test]
+fn p2_ffi_ipv6_resolution_and_set_active_call() {
+    use bmsip_ffi::bmsip_client_set_active_call;
+    use std::ffi::CString;
+
+    assert_eq!(
+        unsafe { bmsip_client_set_active_call(ptr::null(), ptr::null()) },
+        -1
+    );
+
+    // Bracketed and bare IPv6 registrar addresses must parse and bind cleanly.
+    for (reg_addr, bind_ip) in [("::1", "::1"), ("[::1]:5060", "::1")] {
+        let client = BmsipClient::new(FfiConfig {
+            username: "1001".to_string(),
+            password: "pw".to_string(),
+            domain: "localhost".to_string(),
+            registrar_addr: reg_addr.to_string(),
+            bind_ip: bind_ip.to_string(),
+            sip_port: 0,
+            enable_opus: false,
+        })
+        .unwrap();
+        let addr = client.local_sip_address();
+        assert!(
+            addr.starts_with("[::1]:") || addr.starts_with("::1:"),
+            "unexpected IPv6 local_sip_address '{addr}'"
+        );
+        client.set_active_call("call-1".to_string()).unwrap();
+        client.shutdown();
+    }
+
+    let user = CString::new("1001").unwrap();
+    let pass = CString::new("pw").unwrap();
+    let domain = CString::new("127.0.0.1").unwrap();
+    let reg = CString::new("127.0.0.1:59999").unwrap();
+    let bind = CString::new("127.0.0.1").unwrap();
+    let cid = CString::new("call-1").unwrap();
+    let handle = unsafe {
+        bmsip_client_new(
+            user.as_ptr(),
+            pass.as_ptr(),
+            domain.as_ptr(),
+            reg.as_ptr(),
+            bind.as_ptr(),
+            0,
+        )
+    };
+    assert!(!handle.is_null());
+    assert_eq!(
+        unsafe { bmsip_client_set_active_call(handle, cid.as_ptr()) },
+        0
+    );
+    unsafe { bmsip_client_free(handle) };
 }

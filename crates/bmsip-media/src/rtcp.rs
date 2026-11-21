@@ -399,12 +399,28 @@ fn parse_sdes_chunks(raw: &[u8], count: usize) -> Result<Vec<SdesChunk>, MediaEr
     Ok(chunks)
 }
 
+/// Sequence acceptance status returned by [`RtpStreamStats`] per RFC 3550 Appendix A.1.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SeqStatus {
+    /// Normal in-order, small-reorder, or duplicate packet within acceptable window.
+    Accepted,
+    /// Large sequence jump confirmed by two sequential packets; sequence domain resynchronized.
+    Resynced,
+    /// Initial unexpected large sequence jump awaiting a confirming sequential packet.
+    ProbationRejected,
+}
+
+const MAX_DROPOUT: u16 = 3000;
+const MAX_MISORDER: u16 = 100;
+const BAD_SEQ_MOD_LIMIT: u16 = u16::MAX - MAX_MISORDER + 1;
+
 /// Receiver RTP sequence, loss, and RFC 3550 §6.4.1 interarrival jitter tracker.
 #[derive(Debug, Clone, Default)]
 pub struct RtpStreamStats {
     initialized: bool,
     base_seq: u32,
     max_seq: u16,
+    bad_seq: Option<u16>,
     cycles: u32,
     received: u32,
     expected_prior: u32,
@@ -427,45 +443,79 @@ impl RtpStreamStats {
         *self = Self::new();
     }
 
-    fn record_seq(&mut self, seq: u16) {
+    fn record_seq(&mut self, seq: u16) -> SeqStatus {
         if !self.initialized {
             self.initialized = true;
             self.base_seq = u32::from(seq);
             self.max_seq = seq;
+            self.bad_seq = None;
             self.cycles = 0;
             self.received = 1;
-            return;
+            return SeqStatus::Accepted;
         }
-        self.received = self.received.saturating_add(1);
         let udelta = seq.wrapping_sub(self.max_seq);
-        if udelta < 32768 {
+        if udelta < MAX_DROPOUT {
             if seq < self.max_seq {
                 self.cycles = self.cycles.wrapping_add(0x0001_0000);
             }
             self.max_seq = seq;
+            self.bad_seq = None;
+            self.received = self.received.saturating_add(1);
+            SeqStatus::Accepted
+        } else if udelta <= BAD_SEQ_MOD_LIMIT {
+            if self.bad_seq == Some(seq) {
+                // RFC 3550 Appendix A.1: two sequential packets in the new sequence space reset the stream.
+                self.base_seq = u32::from(seq);
+                self.max_seq = seq;
+                self.bad_seq = None;
+                self.cycles = 0;
+                self.received = 1;
+                self.expected_prior = 0;
+                self.received_prior = 0;
+                self.transit_initialized = false;
+                self.jitter = 0.0;
+                SeqStatus::Resynced
+            } else {
+                self.bad_seq = Some(seq.wrapping_add(1));
+                SeqStatus::ProbationRejected
+            }
+        } else {
+            // Reordered or duplicate packet within MAX_MISORDER.
+            self.bad_seq = None;
+            self.received = self.received.saturating_add(1);
+            SeqStatus::Accepted
         }
     }
 
     /// Records a received non-audio RTP packet (DTMF `telephone-event`, Comfort Noise) for sequence/loss tracking without disturbing jitter.
-    pub fn record_non_audio_packet(&mut self, seq: u16) {
-        self.record_seq(seq);
+    pub fn record_non_audio_packet(&mut self, seq: u16) -> SeqStatus {
+        self.record_seq(seq)
     }
 
     /// Records a received RTP audio packet and updates loss/jitter estimates per RFC 3550 Appendix A.1/A.8.
-    pub fn record_packet(&mut self, seq: u16, rtp_timestamp: u32, arrival_timestamp_samples: u32) {
-        self.record_seq(seq);
+    pub fn record_packet(
+        &mut self,
+        seq: u16,
+        rtp_timestamp: u32,
+        arrival_timestamp_samples: u32,
+    ) -> SeqStatus {
+        let status = self.record_seq(seq);
+        if status == SeqStatus::ProbationRejected {
+            return status;
+        }
 
         let transit = arrival_timestamp_samples.wrapping_sub(rtp_timestamp);
         if !self.transit_initialized {
             self.transit_initialized = true;
             self.transit = transit;
             self.jitter = 0.0;
-            return;
+            return status;
         }
 
         let d = (transit.wrapping_sub(self.transit) as i32).unsigned_abs() as f64;
         self.transit = transit;
         self.jitter += (d - self.jitter) / 16.0;
+        status
     }
 
     /// Records NTP timestamp from an inbound RTCP Sender Report (`LSR`) without an arrival timestamp (`DLSR = 0`).
@@ -674,5 +724,33 @@ mod tests {
         let report = stats.build_reception_report(0x7777);
         assert_eq!(report.extended_highest_seq, 0x0000_0001);
         let _ = stats.cumulative_lost();
+    }
+
+    #[test]
+    fn stream_stats_rfc3550_a1_dropout_probation_and_two_packet_resync() {
+        let mut stats = RtpStreamStats::new();
+        assert_eq!(stats.record_packet(10, 160, 160), SeqStatus::Accepted);
+        assert_eq!(stats.record_packet(11, 320, 320), SeqStatus::Accepted);
+        assert_eq!(stats.record_packet(12, 480, 480), SeqStatus::Accepted);
+
+        // Single stray packet with large jump (> MAX_DROPOUT) is placed on probation without disturbing max_seq or received count.
+        assert_eq!(
+            stats.record_packet(20_000, 3_200_000, 640),
+            SeqStatus::ProbationRejected
+        );
+        assert_eq!(stats.received_count(), 3);
+        assert_eq!(stats.snapshot_reception_report(1).extended_highest_seq, 12);
+
+        // Next sequential packet after jump (20_001) resynchronizes the sequence domain.
+        assert_eq!(
+            stats.record_packet(20_001, 3_200_160, 800),
+            SeqStatus::Resynced
+        );
+        assert_eq!(stats.received_count(), 1);
+        assert_eq!(
+            stats.snapshot_reception_report(1).extended_highest_seq,
+            20_001
+        );
+        assert_eq!(stats.cumulative_lost(), 0);
     }
 }

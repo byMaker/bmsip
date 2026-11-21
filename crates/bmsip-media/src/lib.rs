@@ -44,7 +44,7 @@ pub use plugin::{
 };
 pub use rtcp::{
     ReceptionReportBlock, RtcpPacket, RtcpSenderInfo, RtpStreamStats, SdesChunk, SdesItem,
-    SDES_CNAME,
+    SeqStatus, SDES_CNAME,
 };
 pub use rtp::{RtpExtensionHeader, RtpHeader, RtpPacket, RtpPacketRef, RtpPacketizer};
 pub use session::{MediaSession, SessionCodec};

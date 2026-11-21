@@ -22,6 +22,9 @@ use crate::error::EngineError;
 use crate::tls::{build_client_config, build_server_config, resolve_server_name, TlsConfig};
 
 const TCP_CONNECT_TIMEOUT: Duration = Duration::from_secs(3);
+const TLS_HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(10);
+const STREAM_IDLE_TIMEOUT: Duration = Duration::from_secs(180);
+const UDP_WARN_MIN_INTERVAL: Duration = Duration::from_secs(5);
 const RFC5626_KEEPALIVE_INTERVAL: Duration = Duration::from_secs(25);
 const MAX_STREAM_PEERS: usize = 64;
 const MAX_PENDING_CONNECTS: usize = 16;
@@ -89,6 +92,7 @@ struct StreamPeer {
     framer: SipStreamFramer,
     plain_tx: StreamWriteQueue,
     is_outbound: bool,
+    connected_at: Instant,
     next_keepalive_at: Instant,
     last_activity: Instant,
 }
@@ -96,6 +100,7 @@ struct StreamPeer {
 struct PendingConnect {
     rx: Receiver<Result<TcpStream, String>>,
     queued_writes: VecDeque<Vec<u8>>,
+    tls_host_hint: Option<String>,
 }
 
 struct PeerDriveOutput {
@@ -147,6 +152,7 @@ impl StreamPeer {
             framer: SipStreamFramer::new(),
             plain_tx: StreamWriteQueue::default(),
             is_outbound,
+            connected_at: now,
             next_keepalive_at: now + RFC5626_KEEPALIVE_INTERVAL,
             last_activity: now,
         }
@@ -383,6 +389,7 @@ pub(crate) struct SipTransportDriver {
     default_domain: String,
     protected_peer: SocketAddr,
     local_addr: SocketAddr,
+    last_udp_warn_at: Option<Instant>,
 }
 
 impl SipTransportDriver {
@@ -420,6 +427,7 @@ impl SipTransportDriver {
             default_domain,
             protected_peer: remote_probe,
             local_addr,
+            last_udp_warn_at: None,
         })
     }
 
@@ -488,6 +496,7 @@ impl SipTransportDriver {
         &mut self,
         dest: SocketAddr,
         bytes: &[u8],
+        tls_host_hint: Option<&str>,
         now: Instant,
     ) -> Result<(), String> {
         match self.mode {
@@ -521,6 +530,9 @@ impl SipTransportDriver {
                             "SIP TCP/TLS outbound queue full while connecting to {dest}"
                         ));
                     }
+                    if pending.tls_host_hint.is_none() {
+                        pending.tls_host_hint = tls_host_hint.map(str::to_string);
+                    }
                     pending.queued_writes.push_back(bytes.to_vec());
                     return Ok(());
                 }
@@ -546,8 +558,14 @@ impl SipTransportDriver {
                 }
                 let mut queued_writes = VecDeque::new();
                 queued_writes.push_back(bytes.to_vec());
-                self.pending_connects
-                    .insert(dest, PendingConnect { rx, queued_writes });
+                self.pending_connects.insert(
+                    dest,
+                    PendingConnect {
+                        rx,
+                        queued_writes,
+                        tls_host_hint: tls_host_hint.map(str::to_string),
+                    },
+                );
                 Ok(())
             }
         }
@@ -568,7 +586,13 @@ impl SipTransportDriver {
                         }
                         Err(e) if is_would_block(&e) => break,
                         Err(err) => {
-                            warnings.push(format!("SIP UDP recv error: {err}"));
+                            let should_warn = self.last_udp_warn_at.is_none_or(|prev| {
+                                now.saturating_duration_since(prev) >= UDP_WARN_MIN_INTERVAL
+                            });
+                            if should_warn {
+                                self.last_udp_warn_at = Some(now);
+                                warnings.push(format!("SIP UDP recv error: {err}"));
+                            }
                             break;
                         }
                     }
@@ -586,12 +610,13 @@ impl SipTransportDriver {
             };
             match status {
                 Ok(Ok(stream)) => {
-                    let queued = self
-                        .pending_connects
-                        .remove(&dest)
-                        .map(|p| p.queued_writes)
+                    let pending = self.pending_connects.remove(&dest);
+                    let queued = pending
+                        .as_ref()
+                        .map(|p| p.queued_writes.clone())
                         .unwrap_or_default();
-                    match self.finish_outbound_peer(dest, stream, now) {
+                    let hint = pending.and_then(|p| p.tls_host_hint);
+                    match self.finish_outbound_peer(dest, stream, hint.as_deref(), now) {
                         Ok(mut peer) => {
                             for msg_bytes in queued {
                                 peer.enqueue_plaintext(msg_bytes, now);
@@ -666,7 +691,7 @@ impl SipTransportDriver {
                 .insert(peer_addr, StreamPeer::new(stream, tls_role, false, now));
         }
 
-        // Drive I/O on all active TCP/TLS peers.
+        // Drive I/O on all active TCP/TLS peers and reap timed-out handshakes / idle non-registrar sockets.
         let peer_addrs: Vec<SocketAddr> = self.connections.keys().copied().collect();
         let mut dead_peers = Vec::new();
         for addr in peer_addrs {
@@ -679,6 +704,15 @@ impl SipTransportDriver {
                     warnings.push(format!("peer {addr}: {warn}"));
                 }
                 if out.closed {
+                    dead_peers.push(addr);
+                } else if peer.tls.as_ref().is_some_and(TlsRole::is_handshaking)
+                    && now.saturating_duration_since(peer.connected_at) >= TLS_HANDSHAKE_TIMEOUT
+                {
+                    warnings.push(format!("peer {addr}: TLS handshake timed out"));
+                    dead_peers.push(addr);
+                } else if addr != self.protected_peer
+                    && now.saturating_duration_since(peer.last_activity) >= STREAM_IDLE_TIMEOUT
+                {
                     dead_peers.push(addr);
                 }
             }
@@ -694,6 +728,7 @@ impl SipTransportDriver {
         &self,
         dest: SocketAddr,
         stream: TcpStream,
+        tls_host_hint: Option<&str>,
         now: Instant,
     ) -> Result<StreamPeer, String> {
         stream
@@ -706,9 +741,15 @@ impl SipTransportDriver {
                 .tls_client_cfg
                 .as_ref()
                 .ok_or_else(|| "missing rustls ClientConfig".to_string())?;
-            let server_name =
-                resolve_server_name(self.tls_server_name.as_deref(), &self.default_domain, dest)
-                    .map_err(|e| e.to_string())?;
+            let fallback_domain =
+                (dest == self.protected_peer).then_some(self.default_domain.as_str());
+            let server_name = resolve_server_name(
+                self.tls_server_name.as_deref(),
+                tls_host_hint,
+                fallback_domain,
+                dest,
+            )
+            .map_err(|e| e.to_string())?;
             let conn = ClientConnection::new(Arc::clone(cfg), server_name)
                 .map_err(|err| format!("TLS ClientConnection init failed for {dest}: {err}"))?;
             Some(TlsRole::Client(conn))
@@ -754,7 +795,12 @@ fn bind_transport_sockets(
 
 fn resolve_reachable_ip(bound_ip: IpAddr, remote_probe: SocketAddr) -> Result<IpAddr, EngineError> {
     if bound_ip.is_unspecified() {
-        let probe = UdpSocket::bind("0.0.0.0:0")?;
+        let probe_bind: SocketAddr = if bound_ip.is_ipv6() || remote_probe.is_ipv6() {
+            SocketAddr::from(([0u16; 8], 0))
+        } else {
+            SocketAddr::from(([0, 0, 0, 0], 0))
+        };
+        let probe = UdpSocket::bind(probe_bind)?;
         probe.connect(remote_probe)?;
         Ok(probe.local_addr()?.ip())
     } else {

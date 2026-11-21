@@ -994,20 +994,21 @@ fn answer_without_sdp_sends_488_and_clears_call() {
         "10.0.0.2",
         5062,
     ));
-    let invite_no_sdp = b"INVITE sip:bob@10.0.0.2:5062 SIP/2.0\r\n\
-        Via: SIP/2.0/UDP 10.0.0.1:5060;branch=z9hG4bK-nosdp-1\r\n\
+    let invite_bad_sdp = b"INVITE sip:bob@10.0.0.2:5062 SIP/2.0\r\n\
+        Via: SIP/2.0/UDP 10.0.0.1:5060;branch=z9hG4bK-badsdp-1\r\n\
         From: <sip:alice@pbx.local>;tag=a9\r\n\
         To: <sip:bob@pbx.local>\r\n\
-        Call-ID: nosdp-call-1\r\n\
+        Call-ID: badsdp-call-1\r\n\
         CSeq: 1 INVITE\r\n\
         Contact: <sip:alice@10.0.0.1:5060>\r\n\
-        Content-Length: 0\r\n\r\n";
+        Content-Type: application/sdp\r\n\
+        Content-Length: 10\r\n\r\nnot-an-sdp";
 
-    let _ = bob.receive_datagram(invite_no_sdp, t0);
+    let _ = bob.receive_datagram(invite_bad_sdp, t0);
     let _ = bob.poll_transmit(); // drain 100 Trying
 
-    assert!(bob.answer("nosdp-call-1", 50000, t0).is_err());
-    assert_eq!(bob.call_state("nosdp-call-1"), None);
+    assert!(bob.answer("badsdp-call-1", 50000, t0).is_err());
+    assert_eq!(bob.call_state("badsdp-call-1"), None);
     let out = bob.poll_transmit();
     assert_eq!(out.len(), 1);
     let resp = match SipMessage::parse(&out[0]).unwrap() {
@@ -1015,6 +1016,134 @@ fn answer_without_sdp_sends_488_and_clears_call() {
         SipMessage::Request(_) => panic!("expected 488 response"),
     };
     assert_eq!(resp.status_code, 488);
+
+    // Delayed SDP offer on bodyless initial INVITE + bodyless re-INVITE (RFC 3261 §13.2.1 / §14.1).
+    let invite_no_sdp = b"INVITE sip:bob@10.0.0.2:5062 SIP/2.0\r\n\
+        Via: SIP/2.0/UDP 10.0.0.1:5060;branch=z9hG4bK-nosdp-1\r\n\
+        From: <sip:alice@pbx.local>;tag=a10\r\n\
+        To: <sip:bob@pbx.local>\r\n\
+        Call-ID: delayed-offer-1\r\n\
+        CSeq: 1 INVITE\r\n\
+        Contact: <sip:alice@10.0.0.1:5060>\r\n\
+        Content-Length: 0\r\n\r\n";
+    let _ = bob.receive_datagram(invite_no_sdp, t0);
+    let _ = bob.poll_transmit(); // 100 Trying
+    let _ = bob.drain_events();
+
+    bob.answer("delayed-offer-1", 50000, t0).unwrap();
+    let r200 = match SipMessage::parse(&bob.poll_transmit().remove(0)).unwrap() {
+        SipMessage::Response(r) => r,
+        _ => panic!("expected 200 OK offer"),
+    };
+    assert_eq!(r200.status_code, 200);
+    let offer_sdp = SdpSession::parse(std::str::from_utf8(&r200.body).unwrap()).unwrap();
+    assert_eq!(offer_sdp.audio_port, 50000);
+    // CallEstablished is held until ACK completes offer/answer.
+    assert!(bob.drain_events().is_empty());
+
+    let to_hdr = r200.headers.get("To").unwrap().to_string();
+    let answer_sdp = SdpSession::new("alice", "1", "10.0.0.1", 40000, vec![RtpCodec::pcmu()]);
+    let mut ack = SipRequest::new(Method::Ack, SipUri::parse("sip:bob@10.0.0.2:5062").unwrap())
+        .with_body("application/sdp", answer_sdp.to_string().into_bytes());
+    ack.headers
+        .add("Via", "SIP/2.0/UDP 10.0.0.1:5060;branch=z9hG4bK-ack-1");
+    ack.headers.set("From", "<sip:alice@pbx.local>;tag=a10");
+    ack.headers.set("To", to_hdr.clone());
+    ack.headers.set("Call-ID", "delayed-offer-1");
+    ack.headers.set("CSeq", "1 ACK");
+    let ack_evs = bob.receive_datagram(&ack.to_bytes(), t0 + Duration::from_millis(20));
+    assert!(ack_evs.iter().any(|e| matches!(
+        e,
+        UaEvent::CallEstablished { call_id, remote_sdp, .. }
+            if call_id == "delayed-offer-1" && remote_sdp.audio_port == 40000
+    )));
+
+    // Bodyless re-INVITE -> 200 OK SDP offer -> ACK SDP answer -> CallMediaUpdated.
+    let mut reinv = SipRequest::new(
+        Method::Invite,
+        SipUri::parse("sip:bob@10.0.0.2:5062").unwrap(),
+    );
+    reinv
+        .headers
+        .add("Via", "SIP/2.0/UDP 10.0.0.1:5060;branch=z9hG4bK-reinv-1");
+    reinv.headers.set("From", "<sip:alice@pbx.local>;tag=a10");
+    reinv.headers.set("To", to_hdr.clone());
+    reinv.headers.set("Call-ID", "delayed-offer-1");
+    reinv.headers.set("CSeq", "2 INVITE");
+    let _ = bob.receive_datagram(&reinv.to_bytes(), t0 + Duration::from_millis(40));
+    let re200 = match SipMessage::parse(&bob.poll_transmit().remove(0)).unwrap() {
+        SipMessage::Response(r) => r,
+        _ => panic!("expected 200 OK to bodyless re-INVITE"),
+    };
+    assert_eq!(re200.status_code, 200);
+    assert!(!re200.body.is_empty());
+
+    let mut reack = SipRequest::new(Method::Ack, SipUri::parse("sip:bob@10.0.0.2:5062").unwrap())
+        .with_body(
+            "application/sdp",
+            SdpSession::new("alice", "1", "10.0.0.1", 40002, vec![RtpCodec::pcma()])
+                .to_string()
+                .into_bytes(),
+        );
+    reack
+        .headers
+        .add("Via", "SIP/2.0/UDP 10.0.0.1:5060;branch=z9hG4bK-reack-1");
+    reack.headers.set("From", "<sip:alice@pbx.local>;tag=a10");
+    reack.headers.set("To", to_hdr);
+    reack.headers.set("Call-ID", "delayed-offer-1");
+    reack.headers.set("CSeq", "2 ACK");
+    let re_evs = bob.receive_datagram(&reack.to_bytes(), t0 + Duration::from_millis(60));
+    assert!(re_evs.iter().any(|e| matches!(
+        e,
+        UaEvent::CallMediaUpdated { call_id, remote_sdp, .. }
+            if call_id == "delayed-offer-1" && remote_sdp.audio_port == 40002
+    )));
+
+    // Negative check: delayed-offer ACK missing SDP terminates the call cleanly with BYE Reason 488.
+    let mut bad_inv = SipRequest::new(
+        Method::Invite,
+        SipUri::parse("sip:bob@10.0.0.2:5062").unwrap(),
+    );
+    bad_inv
+        .headers
+        .add("Via", "SIP/2.0/UDP 10.0.0.1:5060;branch=z9hG4bK-delay-bad");
+    bad_inv.headers.set("From", "<sip:alice@pbx.local>;tag=a11");
+    bad_inv.headers.set("To", "<sip:bob@pbx.local>");
+    bad_inv.headers.set("Call-ID", "delayed-offer-bad");
+    bad_inv.headers.set("CSeq", "1 INVITE");
+    let _ = bob.receive_datagram(&bad_inv.to_bytes(), t0 + Duration::from_millis(80));
+    let _ = bob.poll_transmit();
+    bob.answer("delayed-offer-bad", 50004, t0 + Duration::from_millis(90))
+        .unwrap();
+    let bad_ok = match SipMessage::parse(&bob.poll_transmit().remove(0)).unwrap() {
+        SipMessage::Response(r) => r,
+        _ => panic!("expected 200 OK offer on delayed-offer-bad"),
+    };
+    let bad_to = bad_ok.headers.get("To").unwrap().to_string();
+
+    let mut bad_ack = SipRequest::new(Method::Ack, SipUri::parse("sip:bob@10.0.0.2:5062").unwrap());
+    bad_ack
+        .headers
+        .add("Via", "SIP/2.0/UDP 10.0.0.1:5060;branch=z9hG4bK-ack-bad");
+    bad_ack.headers.set("From", "<sip:alice@pbx.local>;tag=a11");
+    bad_ack.headers.set("To", bad_to);
+    bad_ack.headers.set("Call-ID", "delayed-offer-bad");
+    bad_ack.headers.set("CSeq", "1 ACK");
+    let bad_evs = bob.receive_datagram(&bad_ack.to_bytes(), t0 + Duration::from_millis(100));
+    assert!(bad_evs.iter().any(|e| matches!(
+        e,
+        UaEvent::CallTerminated { call_id, status_code: Some(488), .. }
+            if call_id == "delayed-offer-bad"
+    )));
+    let bad_bye = bob.poll_transmit();
+    assert!(bad_bye.iter().any(|b| matches!(
+        SipMessage::parse(b),
+        Ok(SipMessage::Request(r))
+            if r.method == Method::Bye
+                && r.headers
+                    .get("Reason")
+                    .is_some_and(|v| v.contains("488"))
+    )));
 }
 
 fn establish_clean_cluster_call(
@@ -2704,4 +2833,389 @@ fn p1_session_timer_require_uas_fallback_and_isolated_422_config() {
         Some("90;refresher=uas")
     );
     assert!(ans_nosup.headers.get("Require").is_none());
+}
+
+#[test]
+fn p2_100rel_retransmits_rack_cseq_check_single_inflight_and_504_timeout() {
+    let t0 = Instant::now();
+    let reg = SipUri::parse("sip:pbx.local:5060").unwrap();
+    let mut uas = UserAgent::new(UaConfig::new(
+        "bob",
+        "pw",
+        "pbx.local",
+        reg,
+        "10.0.0.2",
+        5062,
+    ));
+
+    let inv = SipRequest::new(
+        Method::Invite,
+        SipUri::parse("sip:bob@10.0.0.2:5062").unwrap(),
+    )
+    .with_body(
+        "application/sdp",
+        SdpSession::new("alice", "1", "10.0.0.1", 40000, vec![RtpCodec::pcmu()])
+            .to_string()
+            .into_bytes(),
+    );
+    let mut inv = inv;
+    inv.headers
+        .add("Via", "SIP/2.0/UDP 10.0.0.1:5060;branch=z9hG4bK-100rel-1");
+    inv.headers.set("From", "<sip:alice@pbx.local>;tag=a1");
+    inv.headers.set("To", "<sip:bob@pbx.local>");
+    inv.headers.set("Call-ID", "rel-call-1");
+    inv.headers.set("CSeq", "42 INVITE");
+
+    let _ = uas.receive_datagram(&inv.to_bytes(), t0);
+    let _ = uas.poll_transmit(); // 100 Trying
+
+    let rseq = uas
+        .ring_reliable("rel-call-1", 183, "Session Progress", None, t0)
+        .unwrap();
+    // Second reliable 1xx must be rejected until PRACK arrives (RFC 3262 §3).
+    assert!(uas
+        .ring_reliable("rel-call-1", 180, "Ringing", None, t0)
+        .is_err());
+
+    let r183 = match SipMessage::parse(&uas.poll_transmit().remove(0)).unwrap() {
+        SipMessage::Response(r) => r,
+        _ => panic!("expected 183"),
+    };
+    let to_hdr = r183.headers.get("To").unwrap().to_string();
+
+    // Retransmit fires at T1 = 500 ms.
+    let _ = uas.handle_timeout(t0 + Duration::from_millis(500));
+    let retx = uas.poll_transmit();
+    assert_eq!(retx.len(), 1);
+    let r183_retx = match SipMessage::parse(&retx[0]).unwrap() {
+        SipMessage::Response(r) => r,
+        _ => panic!("expected 183 retransmission"),
+    };
+    assert_eq!(r183_retx.status_code, 183);
+
+    // Wrong RAck CSeq must return 481 and leave reliable 1xx pending.
+    let mut bad_prack = SipRequest::new(
+        Method::Prack,
+        SipUri::parse("sip:bob@10.0.0.2:5062").unwrap(),
+    );
+    bad_prack
+        .headers
+        .add("Via", "SIP/2.0/UDP 10.0.0.1:5060;branch=z9hG4bK-prack-bad");
+    bad_prack
+        .headers
+        .set("From", "<sip:alice@pbx.local>;tag=a1");
+    bad_prack.headers.set("To", to_hdr.clone());
+    bad_prack.headers.set("Call-ID", "rel-call-1");
+    bad_prack.headers.set("CSeq", "43 PRACK");
+    bad_prack.headers.set("RAck", format!("{rseq} 999 INVITE"));
+    let _ = uas.receive_datagram(&bad_prack.to_bytes(), t0 + Duration::from_millis(600));
+    let bad_resp = match SipMessage::parse(&uas.poll_transmit().remove(0)).unwrap() {
+        SipMessage::Response(r) => r,
+        _ => panic!("expected 481 response to wrong RAck CSeq"),
+    };
+    assert_eq!(bad_resp.status_code, 481);
+
+    // Valid PRACK clears pending reliable 1xx and returns 200 OK.
+    let mut good_prack = SipRequest::new(
+        Method::Prack,
+        SipUri::parse("sip:bob@10.0.0.2:5062").unwrap(),
+    );
+    good_prack
+        .headers
+        .add("Via", "SIP/2.0/UDP 10.0.0.1:5060;branch=z9hG4bK-prack-ok");
+    good_prack
+        .headers
+        .set("From", "<sip:alice@pbx.local>;tag=a1");
+    good_prack.headers.set("To", to_hdr);
+    good_prack.headers.set("Call-ID", "rel-call-1");
+    good_prack.headers.set("CSeq", "44 PRACK");
+    good_prack.headers.set("RAck", format!("{rseq} 42 INVITE"));
+    let _ = uas.receive_datagram(&good_prack.to_bytes(), t0 + Duration::from_millis(700));
+    let ok_resp = match SipMessage::parse(&uas.poll_transmit().remove(0)).unwrap() {
+        SipMessage::Response(r) => r,
+        _ => panic!("expected 200 OK to PRACK"),
+    };
+    assert_eq!(ok_resp.status_code, 200);
+
+    // Next reliable 180 can now be sent, and if left unacked for 64*T1 (32s) -> 504 Server Time-out.
+    let _rseq2 = uas
+        .ring_reliable(
+            "rel-call-1",
+            180,
+            "Ringing",
+            None,
+            t0 + Duration::from_secs(1),
+        )
+        .unwrap();
+    let _ = uas.poll_transmit();
+    let term_evs = uas.handle_timeout(t0 + Duration::from_secs(34));
+    assert!(term_evs.iter().any(|e| matches!(
+        e,
+        UaEvent::CallTerminated {
+            status_code: Some(504),
+            ..
+        }
+    )));
+    let out_fin = uas.poll_transmit();
+    assert!(out_fin.iter().any(|b| matches!(
+        SipMessage::parse(b),
+        Ok(SipMessage::Response(r)) if r.status_code == 504
+    )));
+}
+
+#[test]
+fn p2_reinvite_491_backoff_retry_update_glare_and_replaces_codes() {
+    let t0 = Instant::now();
+    let policy = clean_policy();
+    let mut cluster = MiniSipCluster::new(t0, policy, 7);
+
+    // Distinct hosts on same port with instance_seed=0 still produce unique Call-IDs.
+    let reg = SipUri::parse("sip:pbx.local:5060").unwrap();
+    let mut u1 = UserAgent::new(UaConfig::new(
+        "alice",
+        "pw",
+        "pbx.local",
+        reg.clone(),
+        "10.0.0.10",
+        5060,
+    ));
+    let mut u2 = UserAgent::new(UaConfig::new(
+        "bob",
+        "pw",
+        "pbx.local",
+        reg.clone(),
+        "10.0.0.11",
+        5060,
+    ));
+    let c1 = u1
+        .dial(SipUri::parse("sip:x@10.0.0.2:5060").unwrap(), 40000, t0)
+        .unwrap();
+    let c2 = u2
+        .dial(SipUri::parse("sip:x@10.0.0.2:5060").unwrap(), 40002, t0)
+        .unwrap();
+    assert_ne!(c1, c2);
+
+    // 1. Re-INVITE 491 backoff retry on established call + UPDATE glare 491.
+    let (cid, _, _) = establish_clean_cluster_call(&mut cluster, 40020, 50020);
+    let quiet_until = cluster.now + Duration::from_secs(6);
+    let _ = cluster.step_until(10, Some(quiet_until));
+    cluster.alice.hold(&cid, cluster.now).unwrap();
+    let reinv = cluster
+        .alice
+        .poll_transmit()
+        .into_iter()
+        .find_map(|b| match SipMessage::parse(&b).ok()? {
+            SipMessage::Request(r) if r.method == Method::Invite => Some(r),
+            _ => None,
+        })
+        .unwrap();
+
+    // Inbound UPDATE with SDP while ReInviting MUST get 491 Request Pending.
+    let mut upd_glare = SipRequest::new(Method::Update, reinv.uri.clone()).with_body(
+        "application/sdp",
+        SdpSession::new("bob", "9", "10.0.0.2", 50022, vec![RtpCodec::pcmu()])
+            .to_string()
+            .into_bytes(),
+    );
+    upd_glare
+        .headers
+        .add("Via", "SIP/2.0/UDP 10.0.0.2:5062;branch=z9hG4bK-upd-glare");
+    upd_glare
+        .headers
+        .set("From", reinv.headers.get("To").unwrap());
+    upd_glare
+        .headers
+        .set("To", reinv.headers.get("From").unwrap());
+    upd_glare.headers.set("Call-ID", cid.clone());
+    upd_glare.headers.set("CSeq", "99 UPDATE");
+    let _ = cluster.alice.receive_datagram(
+        &upd_glare.to_bytes(),
+        cluster.now + Duration::from_millis(5),
+    );
+    let upd_resp = match SipMessage::parse(&cluster.alice.poll_transmit().remove(0)).unwrap() {
+        SipMessage::Response(r) => r,
+        _ => panic!("expected 491 to glare UPDATE"),
+    };
+    assert_eq!(upd_resp.status_code, 491);
+
+    // Receive 491 Request Pending for Alice's re-INVITE -> backs off 2.1..4.0s (Call-ID owner) and retries.
+    let mut r491 = reinv.create_response(491, "Request Pending").unwrap();
+    r491.headers.set("To", reinv.headers.get("To").unwrap());
+    let _ = cluster
+        .alice
+        .receive_datagram(&r491.to_bytes(), cluster.now + Duration::from_millis(10));
+    assert_eq!(cluster.alice.call_state(&cid), Some(CallState::Established));
+
+    let dl = cluster
+        .alice
+        .poll_timeout()
+        .expect("expected 491 retry deadline");
+    assert!(dl >= cluster.now + Duration::from_millis(2110));
+    assert!(dl <= cluster.now + Duration::from_millis(4010));
+    cluster.now = dl;
+    let _ = cluster.alice.handle_timeout(cluster.now);
+    let retried_reinv = cluster
+        .alice
+        .poll_transmit()
+        .into_iter()
+        .find_map(|b| match SipMessage::parse(&b).ok()? {
+            SipMessage::Request(r) if r.method == Method::Invite => Some(r),
+            _ => None,
+        })
+        .expect("expected re-INVITE backoff retry");
+    assert_eq!(retried_reinv.method, Method::Invite);
+
+    // Non-owner (Bob Inbound call) receiving 491 backs off 0.1..2.0s before retrying hold re-INVITE.
+    let mut bob_cluster = MiniSipCluster::new(t0, clean_policy(), 11);
+    let (bob_cid, _, _) = establish_clean_cluster_call(&mut bob_cluster, 40030, 50030);
+    let bob_quiet = bob_cluster.now + Duration::from_secs(6);
+    let _ = bob_cluster.step_until(10, Some(bob_quiet));
+    bob_cluster.bob.hold(&bob_cid, bob_cluster.now).unwrap();
+    let bob_reinv = bob_cluster
+        .bob
+        .poll_transmit()
+        .into_iter()
+        .find_map(|b| match SipMessage::parse(&b).ok()? {
+            SipMessage::Request(r) if r.method == Method::Invite => Some(r),
+            _ => None,
+        })
+        .unwrap();
+    let mut bob_491 = bob_reinv.create_response(491, "Request Pending").unwrap();
+    bob_491
+        .headers
+        .set("To", bob_reinv.headers.get("To").unwrap());
+    let _ = bob_cluster.bob.receive_datagram(
+        &bob_491.to_bytes(),
+        bob_cluster.now + Duration::from_millis(10),
+    );
+    let bob_dl = bob_cluster
+        .bob
+        .poll_timeout()
+        .expect("expected non-owner 491 retry deadline");
+    assert!(bob_dl >= bob_cluster.now + Duration::from_millis(110));
+    assert!(bob_dl <= bob_cluster.now + Duration::from_millis(2010));
+    bob_cluster.now = bob_dl;
+    let _ = bob_cluster.bob.handle_timeout(bob_cluster.now);
+    let bob_retried = bob_cluster
+        .bob
+        .poll_transmit()
+        .into_iter()
+        .find_map(|b| match SipMessage::parse(&b).ok()? {
+            SipMessage::Request(r) if r.method == Method::Invite => Some(r),
+            _ => None,
+        })
+        .expect("expected non-owner re-INVITE backoff retry");
+    assert_eq!(bob_retried.method, Method::Invite);
+
+    // 2. Replaces status codes: 481 on inbound early dialog, 486 on confirmed early-only, 603 on terminating.
+    let mut bob = UserAgent::new(UaConfig::new(
+        "bob",
+        "pw",
+        "pbx.local",
+        reg,
+        "10.0.0.2",
+        5062,
+    ));
+    let mut early_in = SipRequest::new(
+        Method::Invite,
+        SipUri::parse("sip:bob@10.0.0.2:5062").unwrap(),
+    )
+    .with_body(
+        "application/sdp",
+        SdpSession::new("alice", "1", "10.0.0.1", 40000, vec![RtpCodec::pcmu()])
+            .to_string()
+            .into_bytes(),
+    );
+    early_in
+        .headers
+        .add("Via", "SIP/2.0/UDP 10.0.0.1:5060;branch=z9hG4bK-rep-1");
+    early_in
+        .headers
+        .set("From", "<sip:alice@pbx.local>;tag=rt1");
+    early_in.headers.set("To", "<sip:bob@pbx.local>");
+    early_in.headers.set("Call-ID", "rep-target-1");
+    early_in.headers.set("CSeq", "1 INVITE");
+    let _ = bob.receive_datagram(&early_in.to_bytes(), t0);
+    let _ = bob.poll_transmit();
+    bob.ring("rep-target-1", t0).unwrap();
+    let r180 = match SipMessage::parse(&bob.poll_transmit().remove(0)).unwrap() {
+        SipMessage::Response(r) => r,
+        _ => panic!("expected 180"),
+    };
+    let bob_tag = r180.to().unwrap().tag.unwrap();
+
+    // UPDATE in Incoming/Ringing with port 0 MUST fail without mutating state.
+    assert!(bob.send_update("rep-target-1", None, None, t0).is_err());
+
+    let rep_val =
+        bmsip_core::sip::ReplacesHeader::new("rep-target-1", bob_tag.clone(), "rt1").to_string();
+    let mut inv_rep = SipRequest::new(
+        Method::Invite,
+        SipUri::parse("sip:bob@10.0.0.2:5062").unwrap(),
+    );
+    inv_rep.headers.add(
+        "Via",
+        "SIP/2.0/UDP 10.0.0.3:5060;branch=z9hG4bK-rep-early-in",
+    );
+    inv_rep.headers.set("From", "<sip:carol@pbx.local>;tag=ct1");
+    inv_rep.headers.set("To", "<sip:bob@pbx.local>");
+    inv_rep.headers.set("Call-ID", "rep-new-1");
+    inv_rep.headers.set("CSeq", "1 INVITE");
+    inv_rep.headers.set("Replaces", rep_val.clone());
+    let _ = bob.receive_datagram(&inv_rep.to_bytes(), t0);
+    let resp_early_in = match SipMessage::parse(&bob.poll_transmit().remove(0)).unwrap() {
+        SipMessage::Response(r) => r,
+        _ => panic!("expected 481 for non-UAC-initiated early dialog"),
+    };
+    assert_eq!(resp_early_in.status_code, 481);
+
+    // Establish rep-target-1 -> early-only Replaces MUST return 486 Busy Here.
+    bob.answer("rep-target-1", 50030, t0).unwrap();
+    let _ = bob.poll_transmit();
+    let mut inv_early_only = SipRequest::new(
+        Method::Invite,
+        SipUri::parse("sip:bob@10.0.0.2:5062").unwrap(),
+    );
+    inv_early_only
+        .headers
+        .add("Via", "SIP/2.0/UDP 10.0.0.3:5060;branch=z9hG4bK-rep-486");
+    inv_early_only
+        .headers
+        .set("From", "<sip:carol@pbx.local>;tag=ct2");
+    inv_early_only.headers.set("To", "<sip:bob@pbx.local>");
+    inv_early_only.headers.set("Call-ID", "rep-new-2");
+    inv_early_only.headers.set("CSeq", "1 INVITE");
+    inv_early_only
+        .headers
+        .set("Replaces", format!("{rep_val};early-only"));
+    let _ = bob.receive_datagram(&inv_early_only.to_bytes(), t0);
+    let resp_486 = match SipMessage::parse(&bob.poll_transmit().remove(0)).unwrap() {
+        SipMessage::Response(r) => r,
+        _ => panic!("expected 486 Busy Here for confirmed dialog + early-only"),
+    };
+    assert_eq!(resp_486.status_code, 486);
+
+    // Hangup moves rep-target-1 to Terminating -> Replaces MUST return 603 Decline.
+    bob.hangup("rep-target-1", t0).unwrap();
+    let _ = bob.poll_transmit();
+    let mut inv_term = SipRequest::new(
+        Method::Invite,
+        SipUri::parse("sip:bob@10.0.0.2:5062").unwrap(),
+    );
+    inv_term
+        .headers
+        .add("Via", "SIP/2.0/UDP 10.0.0.3:5060;branch=z9hG4bK-rep-603");
+    inv_term
+        .headers
+        .set("From", "<sip:carol@pbx.local>;tag=ct3");
+    inv_term.headers.set("To", "<sip:bob@pbx.local>");
+    inv_term.headers.set("Call-ID", "rep-new-3");
+    inv_term.headers.set("CSeq", "1 INVITE");
+    inv_term.headers.set("Replaces", rep_val);
+    let _ = bob.receive_datagram(&inv_term.to_bytes(), t0);
+    let resp_603 = match SipMessage::parse(&bob.poll_transmit().remove(0)).unwrap() {
+        SipMessage::Response(r) => r,
+        _ => panic!("expected 603 Decline for terminating dialog"),
+    };
+    assert_eq!(resp_603.status_code, 603);
 }

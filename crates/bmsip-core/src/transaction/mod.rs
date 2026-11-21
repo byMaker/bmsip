@@ -65,11 +65,36 @@ impl RfcTimers {
     }
 }
 
-/// Unique key identifying a SIP transaction (`Via` branch + CSeq/request method).
+/// Unique key identifying a SIP transaction (`Via` branch + optional server `Via sent-by` + method).
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct TransactionId {
     pub branch: String,
+    pub sent_by: Option<String>,
     pub method: Method,
+}
+
+impl TransactionId {
+    /// Creates a client transaction key matching responses by RFC 3261 §17.1.3 (`branch` + `CSeq` method).
+    pub fn client(branch: impl Into<String>, method: Method) -> Self {
+        Self {
+            branch: branch.into(),
+            sent_by: None,
+            method,
+        }
+    }
+
+    /// Creates a server transaction key matching requests by RFC 3261 §17.2.3 (`branch` + `sent-by` + method).
+    pub fn server(branch: impl Into<String>, sent_by: &str, method: Method) -> Self {
+        Self {
+            branch: branch.into(),
+            sent_by: Some(normalize_sent_by(sent_by)),
+            method,
+        }
+    }
+}
+
+pub(crate) fn normalize_sent_by(sent_by: &str) -> String {
+    sent_by.trim().to_ascii_lowercase()
 }
 
 /// Events emitted by the Sans-I/O [`TransactionManager`].
@@ -742,10 +767,7 @@ impl TransactionManager {
         let _ = request.to()?;
         let _ = request.call_id()?;
 
-        let tx_id = TransactionId {
-            branch,
-            method: request.method.clone(),
-        };
+        let tx_id = TransactionId::client(branch, request.method.clone());
         if self.client_txs.contains_key(&tx_id) {
             return Err(SipError::TransactionError(format!(
                 "duplicate client transaction {:?}",
@@ -816,10 +838,7 @@ impl TransactionManager {
                         return events;
                     }
                 };
-                let tx_id = TransactionId {
-                    branch,
-                    method: cseq.method,
-                };
+                let tx_id = TransactionId::client(branch, cseq.method);
 
                 if let Some(tx) = self.client_txs.get_mut(&tx_id) {
                     match tx {
@@ -843,15 +862,16 @@ impl TransactionManager {
                 }
             }
             SipMessage::Request(req) => {
-                let (branch, reliable) = match req.top_via().and_then(|v| {
+                let (branch, sent_by, reliable) = match req.top_via().and_then(|v| {
                     let rel = is_reliable_via_transport(&v.transport);
+                    let sb = v.sent_by;
                     let b = v
                         .branch
                         .filter(|b| !b.is_empty())
                         .ok_or(SipError::MissingHeader("Via branch"))?;
-                    Ok((b, rel))
+                    Ok((b, sb, rel))
                 }) {
-                    Ok(pair) => pair,
+                    Ok(triple) => triple,
                     Err(err) => {
                         events.push(TransactionEvent::ProtocolWarning(err.to_string()));
                         return events;
@@ -885,10 +905,7 @@ impl TransactionManager {
                 }
 
                 if req.method == Method::Ack {
-                    let invite_id = TransactionId {
-                        branch,
-                        method: Method::Invite,
-                    };
+                    let invite_id = TransactionId::server(branch, &sent_by, Method::Invite);
                     if let Some(ServerTx::Invite(ist)) = self.server_txs.get_mut(&invite_id) {
                         if ist.state == IstState::Accepted {
                             events.push(TransactionEvent::AckFor2xx(req));
@@ -904,10 +921,7 @@ impl TransactionManager {
                     return events;
                 }
 
-                let tx_id = TransactionId {
-                    branch,
-                    method: req.method.clone(),
-                };
+                let tx_id = TransactionId::server(branch, &sent_by, req.method.clone());
                 if let Some(existing) = self.server_txs.get(&tx_id) {
                     match existing {
                         ServerTx::Invite(ist) => ist.on_retransmit(&mut self.outbound),
@@ -1180,5 +1194,35 @@ mod tests {
             .iter()
             .any(|e| matches!(e, TransactionEvent::TransactionTerminated(_))));
         assert_eq!(server.active_server_count(), 0);
+    }
+
+    #[test]
+    fn server_transactions_distinguish_same_branch_by_via_sent_by() {
+        let t0 = Instant::now();
+        let mut server = TransactionManager::default();
+
+        let make_inv = |sent_by: &str, call_id: &str| {
+            let mut req = SipRequest::new(
+                Method::Invite,
+                SipUri::parse("sip:bob@10.0.0.9:5060").unwrap(),
+            );
+            req.headers.add(
+                "Via",
+                format!("SIP/2.0/UDP {sent_by};branch=z9hG4bK-shared"),
+            );
+            req.headers.set("From", "<sip:alice@pbx.local>;tag=a1");
+            req.headers.set("To", "<sip:bob@pbx.local>");
+            req.headers.set("Call-ID", call_id);
+            req.headers.set("CSeq", "1 INVITE");
+            req
+        };
+
+        let evs1 =
+            server.receive_message(SipMessage::Request(make_inv("10.0.0.1:5060", "cid-1")), t0);
+        let evs2 =
+            server.receive_message(SipMessage::Request(make_inv("10.0.0.2:5060", "cid-2")), t0);
+        assert!(matches!(evs1[0], TransactionEvent::ServerRequest { .. }));
+        assert!(matches!(evs2[0], TransactionEvent::ServerRequest { .. }));
+        assert_eq!(server.active_server_count(), 2);
     }
 }

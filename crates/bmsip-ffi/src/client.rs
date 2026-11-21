@@ -257,7 +257,13 @@ impl BmsipClient {
             FfiError::InvalidArgument(format!("invalid bind_ip '{}'", config.bind_ip))
         })?;
 
-        let registrar_uri = SipUri::parse(&format!("sip:{}", config.registrar_addr))
+        let reg_trimmed = config.registrar_addr.trim();
+        let registrar_host_part = if reg_trimmed.parse::<IpAddr>().is_ok_and(|ip| ip.is_ipv6()) {
+            format!("[{reg_trimmed}]")
+        } else {
+            reg_trimmed.to_string()
+        };
+        let registrar_uri = SipUri::parse(&format!("sip:{registrar_host_part}"))
             .map_err(|e| FfiError::InvalidArgument(e.to_string()))?;
 
         let mut ua_cfg = UaConfig::new(
@@ -392,6 +398,10 @@ impl BmsipClient {
         })
     }
 
+    pub fn set_active_call(&self, call_id: String) -> Result<(), FfiError> {
+        self.send(EngineCommand::SetActiveCall { call_id })
+    }
+
     pub fn send_dtmf(&self, call_id: String, digit: String) -> Result<(), FfiError> {
         let ch = digit
             .chars()
@@ -489,10 +499,18 @@ impl BmsipClient {
 }
 
 fn resolve_socket_addr(addr: &str) -> Result<SocketAddr, FfiError> {
-    let target = if addr.contains(':') {
-        addr.to_string()
+    let trimmed = addr.trim();
+    if let Ok(sa) = trimmed.parse::<SocketAddr>() {
+        return Ok(sa);
+    }
+    let stripped = trimmed.trim_matches(['[', ']']);
+    if let Ok(ip) = stripped.parse::<IpAddr>() {
+        return Ok(SocketAddr::new(ip, 5060));
+    }
+    let target = if trimmed.contains(':') {
+        trimmed.to_string()
     } else {
-        format!("{addr}:5060")
+        format!("{trimmed}:5060")
     };
     target
         .to_socket_addrs()

@@ -14,8 +14,8 @@ pub use c_api::{
     bmsip_client_pop_pcm, bmsip_client_push_pcm, bmsip_client_register,
     bmsip_client_request_telemetry, bmsip_client_resume, bmsip_client_resume_call,
     bmsip_client_ring, bmsip_client_ring_early_media, bmsip_client_send_dtmf,
-    bmsip_client_send_info_dtmf, bmsip_client_suspend, bmsip_client_transfer,
-    bmsip_client_unregister, bmsip_string_free, BmsipClientHandle,
+    bmsip_client_send_info_dtmf, bmsip_client_set_active_call, bmsip_client_suspend,
+    bmsip_client_transfer, bmsip_client_unregister, bmsip_string_free, BmsipClientHandle,
 };
 pub use client::{
     BmsipClient, FfiConfig, FfiError, FfiEvent, FfiEventKind, FfiSrtpMode, FfiTransport,

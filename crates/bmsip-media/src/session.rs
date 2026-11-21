@@ -18,7 +18,7 @@ use crate::opus::{
     PCM_FRAME_SAMPLES_48KHZ_20MS, PCM_FRAME_SAMPLES_8KHZ_20MS,
 };
 use crate::plugin::AudioCodecPlugin;
-use crate::rtcp::{RtcpPacket, RtpStreamStats, SdesChunk, SdesItem, SDES_CNAME};
+use crate::rtcp::{RtcpPacket, RtpStreamStats, SdesChunk, SdesItem, SeqStatus, SDES_CNAME};
 use crate::rtp::{RtpPacketRef, RtpPacketizer};
 use crate::srtp::SrtpContext;
 
@@ -89,6 +89,7 @@ pub struct MediaSession {
     dtmf_detector: DtmfDetector,
     cn_generator: ComfortNoiseGenerator,
     remote_ssrc: Option<u32>,
+    probation_ssrc: Option<(u32, u16)>,
     next_audio_marker: bool,
     cname: String,
     srtp_tx: Option<SrtpContext>,
@@ -157,6 +158,7 @@ impl MediaSession {
             dtmf_detector: DtmfDetector::new(),
             cn_generator: ComfortNoiseGenerator::new(),
             remote_ssrc: None,
+            probation_ssrc: None,
             next_audio_marker: false,
             cname: format!("bmsip-{local_ssrc:08x}@local"),
             srtp_tx: None,
@@ -493,26 +495,56 @@ impl MediaSession {
             raw
         };
         let pkt = RtpPacketRef::parse(rtp_bytes)?;
-        // RFC 3550: a mid-call SSRC change (e.g., PBX bridge/transfer) starts a fresh sequence/timestamp domain.
+        // RFC 3550: require 2 sequential packets before switching SSRC on unauthenticated RTP
+        // (authenticated SRTP switches immediately on valid HMAC-SHA1).
         if let Some(prev_ssrc) = self.remote_ssrc {
             if prev_ssrc != pkt.ssrc {
-                self.stats.reset();
-                self.jitter.reset();
-                self.dtmf_detector.reset();
-                self.cn_generator.deactivate();
+                let switch_now = if self.srtp_rx.is_some() {
+                    true
+                } else if let Some((cand_ssrc, next_seq)) = self.probation_ssrc {
+                    cand_ssrc == pkt.ssrc && pkt.sequence_number.wrapping_sub(next_seq) < 16
+                } else {
+                    false
+                };
+                if switch_now {
+                    self.stats.reset();
+                    self.jitter.reset();
+                    self.dtmf_detector.reset();
+                    self.cn_generator.deactivate();
+                    self.probation_ssrc = None;
+                    self.remote_ssrc = Some(pkt.ssrc);
+                } else {
+                    self.probation_ssrc = Some((pkt.ssrc, pkt.sequence_number.wrapping_add(1)));
+                    return Ok(None);
+                }
+            } else {
+                self.probation_ssrc = None;
             }
+        } else {
+            self.remote_ssrc = Some(pkt.ssrc);
         }
-        self.remote_ssrc = Some(pkt.ssrc);
 
         if pkt.payload_type == self.dtmf_payload_type {
-            self.stats.record_non_audio_packet(pkt.sequence_number);
+            let seq_status = self.stats.record_non_audio_packet(pkt.sequence_number);
+            if seq_status == SeqStatus::ProbationRejected {
+                return Ok(None);
+            }
+            if seq_status == SeqStatus::Resynced {
+                self.jitter.reset();
+            }
             let ev = DtmfEventPayload::parse(pkt.payload)?;
             self.jitter.mark_non_audio_seq(pkt.sequence_number);
             return Ok(self.dtmf_detector.feed(pkt.timestamp, ev));
         }
 
         if pkt.payload_type == self.cn_payload_type || pkt.payload_type == CN_PAYLOAD_TYPE {
-            self.stats.record_non_audio_packet(pkt.sequence_number);
+            let seq_status = self.stats.record_non_audio_packet(pkt.sequence_number);
+            if seq_status == SeqStatus::ProbationRejected {
+                return Ok(None);
+            }
+            if seq_status == SeqStatus::Resynced {
+                self.jitter.reset();
+            }
             let cn_pkt = ComfortNoisePacket::parse(pkt.payload)?;
             self.cn_generator.update_from_packet(&cn_pkt);
             let cn_pcm = self.cn_generator.generate_frame(self.frame_samples);
@@ -521,11 +553,17 @@ impl MediaSession {
             return Ok(None);
         }
 
-        self.stats.record_packet(
+        let seq_status = self.stats.record_packet(
             pkt.sequence_number,
             pkt.timestamp,
             arrival_timestamp_samples,
         );
+        if seq_status == SeqStatus::ProbationRejected {
+            return Ok(None);
+        }
+        if seq_status == SeqStatus::Resynced {
+            self.jitter.reset();
+        }
         self.cn_generator.deactivate();
 
         let pcm = if let Some(plugin) = self.custom_plugin.as_mut() {
@@ -968,7 +1006,9 @@ mod tests {
         assert_eq!(rx.remote_ssrc(), Some(0x1111_0001));
         assert!(matches!(rx.pop_playout_frame(), PlayoutFrame::Normal(_)));
 
-        // Mid-call bridge switches to SSRC B at low unrelated sequence numbers (10..15).
+        // Mid-call bridge switches to SSRC B at low unrelated sequence numbers (10..=15).
+        // Under RFC 3550 Appendix A.1 2-packet unencrypted SSRC probation, packet 10 arms
+        // probation and packets 11..=15 (5 frames) are admitted after confirming the SSRC switch.
         let mut pkt_b = RtpPacketizer::new(0x2222_0002, 0, 10, 1_600);
         let tone_b = WavPcm16::generate_sine_wave(8000, 880, 120, 12000);
         for (i, frame) in tone_b.samples.as_chunks::<160>().0.iter().enumerate() {
@@ -976,17 +1016,17 @@ mod tests {
             rx.receive_rtp(&wire, 1000 + i as u32 * 160).unwrap();
         }
         assert_eq!(rx.remote_ssrc(), Some(0x2222_0002));
-        assert_eq!(rx.stats().received_count(), 6);
+        assert_eq!(rx.stats().received_count(), 5);
         assert_eq!(rx.stats().cumulative_lost(), 0);
         assert!(rx.stats().jitter() < 50);
 
         let mut normal_count = 0usize;
-        for _ in 0..6 {
+        for _ in 0..5 {
             if matches!(rx.pop_playout_frame(), PlayoutFrame::Normal(_)) {
                 normal_count += 1;
             }
         }
-        assert_eq!(normal_count, 6);
+        assert_eq!(normal_count, 5);
     }
 
     #[test]
@@ -1194,5 +1234,56 @@ mod tests {
                 }],
             }
         );
+    }
+
+    #[test]
+    fn unencrypted_ssrc_change_requires_two_packet_probation_and_seq_dropout_resyncs_jitter() {
+        let cfg = JitterBufferConfig {
+            min_depth_frames: 1,
+            max_depth_frames: 6,
+            initial_depth_frames: 1,
+            frame_samples: 160,
+        };
+        let mut ssrc_a = MediaSession::new(G711Kind::Pcmu, 101, 0x1111_0001, cfg);
+        let mut ssrc_b = MediaSession::new(G711Kind::Pcmu, 101, 0x2222_0002, cfg);
+        let mut rx = MediaSession::new(G711Kind::Pcmu, 101, 0x9999_0009, cfg);
+
+        let frame = [500i16; 160];
+        let a1 = ssrc_a.encode_pcm_frame(&frame).unwrap();
+        let a2 = ssrc_a.encode_pcm_frame(&frame).unwrap();
+        rx.receive_rtp(&a1, 0).unwrap();
+        rx.receive_rtp(&a2, 160).unwrap();
+        assert_eq!(rx.stats().received_count(), 2);
+
+        // Single stray packet with different SSRC MUST NOT reset stats/jitter.
+        let b_stray = ssrc_b.encode_pcm_frame(&frame).unwrap();
+        assert_eq!(rx.receive_rtp(&b_stray, 320).unwrap(), None);
+        assert_eq!(rx.stats().received_count(), 2);
+        assert_eq!(
+            rx.stats().snapshot_reception_report(0).extended_highest_seq,
+            2
+        );
+
+        // Returning valid packet from SSRC A clears probation.
+        let a3 = ssrc_a.encode_pcm_frame(&frame).unwrap();
+        rx.receive_rtp(&a3, 320).unwrap();
+        assert_eq!(rx.stats().received_count(), 3);
+
+        // Two sequential packets from SSRC B promote SSRC switch cleanly.
+        let b1 = ssrc_b.encode_pcm_frame(&frame).unwrap();
+        let b2 = ssrc_b.encode_pcm_frame(&frame).unwrap();
+        rx.receive_rtp(&b1, 480).unwrap();
+        assert_eq!(rx.stats().received_count(), 3);
+        rx.receive_rtp(&b2, 640).unwrap();
+        assert_eq!(rx.stats().received_count(), 1);
+        assert!(matches!(rx.pop_playout_frame(), PlayoutFrame::Normal(_)));
+
+        // Large seq jump (> MAX_DROPOUT) resets after 2 sequential packets without freezing jitter buffer.
+        let mut ssrc_jump = RtpPacketizer::new(0x2222_0002, 0, 30_000, 48_000);
+        let j1 = ssrc_jump.next_packet_bytes(&[0xd5; 160], 160, false);
+        let j2 = ssrc_jump.next_packet_bytes(&[0xd5; 160], 160, false);
+        rx.receive_rtp(&j1, 800).unwrap();
+        rx.receive_rtp(&j2, 960).unwrap();
+        assert!(matches!(rx.pop_playout_frame(), PlayoutFrame::Normal(_)));
     }
 }

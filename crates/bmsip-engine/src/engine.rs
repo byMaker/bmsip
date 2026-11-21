@@ -30,6 +30,41 @@ const WORKER_ACTIVE_POLL_MS: u64 = 5;
 const WORKER_IDLE_POLL_MS: u64 = 20;
 const RTCP_REPORT_INTERVAL_MS: u64 = 5_000;
 const MAX_TRACKED_SIP_ROUTES: usize = 512;
+const DNS_POSITIVE_TTL: Duration = Duration::from_secs(60);
+const DNS_NEGATIVE_TTL: Duration = Duration::from_secs(5);
+
+#[derive(Clone, Copy)]
+enum DnsCacheEntry {
+    Positive {
+        addr: SocketAddr,
+        expires_at: Instant,
+        seq: u64,
+    },
+    Negative {
+        expires_at: Instant,
+        seq: u64,
+    },
+}
+
+impl DnsCacheEntry {
+    fn expires_at(self) -> Instant {
+        match self {
+            Self::Positive { expires_at, .. } | Self::Negative { expires_at, .. } => expires_at,
+        }
+    }
+
+    fn seq(self) -> u64 {
+        match self {
+            Self::Positive { seq, .. } | Self::Negative { seq, .. } => seq,
+        }
+    }
+
+    fn set_seq(&mut self, new_seq: u64) {
+        match self {
+            Self::Positive { seq, .. } | Self::Negative { seq, .. } => *seq = new_seq,
+        }
+    }
+}
 
 fn generate_csprng_u64() -> Result<u64, EngineError> {
     let rng = SystemRandom::new();
@@ -54,6 +89,7 @@ struct CallMediaRuntime {
     rtcp_socket: Option<UdpSocket>,
     remote_rtp: SocketAddr,
     remote_rtcp: SocketAddr,
+    rtcp_mux: bool,
     latched_rtp_source: Option<SocketAddr>,
     latched_rtcp_source: Option<SocketAddr>,
     session: MediaSession,
@@ -288,10 +324,12 @@ struct WorkerCtx {
     active_media: HashMap<String, CallMediaRuntime>,
     call_order: Vec<String>,
     focused_call_id: Option<String>,
-    inbound_tx_sources: HashMap<(String, String), SocketAddr>,
-    inbound_call_sources: HashMap<String, SocketAddr>,
-    outbound_tx_targets: HashMap<String, SocketAddr>,
-    dns_cache: HashMap<(String, u16), SocketAddr>,
+    inbound_tx_sources: HashMap<(String, String, String), (SocketAddr, u64)>,
+    inbound_call_sources: HashMap<String, (SocketAddr, u64)>,
+    outbound_tx_targets: HashMap<String, (SocketAddr, u64)>,
+    dns_cache: HashMap<(String, u16), DnsCacheEntry>,
+    peer_tls_hosts: HashMap<SocketAddr, (String, u64)>,
+    route_seq: u64,
     suspended: bool,
     was_registered_before_suspend: bool,
     ssrc_counter: u32,
@@ -302,6 +340,11 @@ const MAX_EVENT_QUEUE: usize = 4096;
 const MAX_RTP_PACKETS_PER_TICK: usize = 128;
 
 impl WorkerCtx {
+    fn next_route_seq(&mut self) -> u64 {
+        self.route_seq = self.route_seq.wrapping_add(1);
+        self.route_seq
+    }
+
     fn push_event(&self, ev: EngineEvent) {
         if let Ok(mut guard) = self.shared.events.lock() {
             while guard.0.len() >= MAX_EVENT_QUEUE {
@@ -320,7 +363,7 @@ impl WorkerCtx {
         }
     }
 
-    fn resolve_sip_destination(&mut self, pkt: &[u8]) -> SocketAddr {
+    fn resolve_sip_destination(&mut self, pkt: &[u8], now: Instant) -> SocketAddr {
         let Ok(msg) = SipMessage::parse(pkt) else {
             return self.registrar_addr;
         };
@@ -330,15 +373,27 @@ impl WorkerCtx {
                 // RFC 3581 / RFC 3261 §18.2.2: route server responses back to the exact peer source.
                 if let (Ok(via), Ok(cseq)) = (resp.top_via(), resp.cseq()) {
                     if let Some(branch) = via.branch.as_deref() {
-                        if let Some(&src) = self
-                            .inbound_tx_sources
-                            .get(&(branch.to_string(), cseq.method.as_str().to_string()))
-                        {
+                        let key = (
+                            branch.to_string(),
+                            via.sent_by.trim().to_ascii_lowercase(),
+                            cseq.method.as_str().to_string(),
+                        );
+                        if let Some((src, _)) = self.inbound_tx_sources.get(&key) {
+                            let src = *src;
+                            let seq = self.next_route_seq();
+                            if let Some(entry) = self.inbound_tx_sources.get_mut(&key) {
+                                entry.1 = seq;
+                            }
                             return src;
                         }
                     }
                     if let Ok(cid) = resp.call_id() {
-                        if let Some(&src) = self.inbound_call_sources.get(cid) {
+                        if let Some((src, _)) = self.inbound_call_sources.get(cid) {
+                            let src = *src;
+                            let seq = self.next_route_seq();
+                            if let Some(entry) = self.inbound_call_sources.get_mut(cid) {
+                                entry.1 = seq;
+                            }
                             return src;
                         }
                     }
@@ -358,7 +413,12 @@ impl WorkerCtx {
                 // and MUST go to the exact same next-hop target as that INVITE.
                 if matches!(req.method, Method::Cancel | Method::Ack) {
                     if let Some(branch) = via_branch.as_deref() {
-                        if let Some(&target) = self.outbound_tx_targets.get(branch) {
+                        if let Some((target, _)) = self.outbound_tx_targets.get(branch) {
+                            let target = *target;
+                            let seq = self.next_route_seq();
+                            if let Some(entry) = self.outbound_tx_targets.get_mut(branch) {
+                                entry.1 = seq;
+                            }
                             return target;
                         }
                     }
@@ -369,8 +429,13 @@ impl WorkerCtx {
                 let is_in_dialog = req.to().ok().and_then(|t| t.tag).is_some();
                 if is_in_dialog && self.ua.transport().is_reliable() {
                     if let Ok(cid) = req.call_id() {
-                        if let Some(&src) = self.inbound_call_sources.get(cid) {
+                        if let Some((src, _)) = self.inbound_call_sources.get(cid) {
+                            let src = *src;
                             if self.sip_transport.has_connection(src) {
+                                let seq = self.next_route_seq();
+                                if let Some(entry) = self.inbound_call_sources.get_mut(cid) {
+                                    entry.1 = seq;
+                                }
                                 if req.method == Method::Invite {
                                     self.record_outbound_tx_target(via_branch, src);
                                 }
@@ -385,7 +450,7 @@ impl WorkerCtx {
                     if let Ok(routes) = NameAddr::parse_list(raw_route) {
                         if let Some(first) = routes.first() {
                             if let Some(addr) =
-                                self.resolve_sip_uri_cached(&first.uri, default_port)
+                                self.resolve_sip_uri_cached(&first.uri, default_port, now)
                             {
                                 if req.method == Method::Invite {
                                     self.record_outbound_tx_target(via_branch, addr);
@@ -422,7 +487,34 @@ impl WorkerCtx {
         }
     }
 
-    fn resolve_sip_uri_cached(&mut self, uri: &SipUri, fallback_port: u16) -> Option<SocketAddr> {
+    fn record_peer_tls_host(&mut self, addr: SocketAddr, raw_host: &str) {
+        let host = raw_host.trim().trim_matches(['[', ']']);
+        if host.is_empty() || host.parse::<IpAddr>().is_ok() {
+            return;
+        }
+        let seq = self.next_route_seq();
+        if self.peer_tls_hosts.len() >= MAX_TRACKED_SIP_ROUTES
+            && !self.peer_tls_hosts.contains_key(&addr)
+        {
+            if let Some(evict) = self
+                .peer_tls_hosts
+                .iter()
+                .filter(|(a, _)| **a != self.registrar_addr)
+                .min_by_key(|(_, (_, s))| *s)
+                .map(|(a, _)| *a)
+            {
+                self.peer_tls_hosts.remove(&evict);
+            }
+        }
+        self.peer_tls_hosts.insert(addr, (host.to_string(), seq));
+    }
+
+    fn resolve_sip_uri_cached(
+        &mut self,
+        uri: &SipUri,
+        fallback_port: u16,
+        now: Instant,
+    ) -> Option<SocketAddr> {
         if uri.scheme == bmsip_core::sip::SipScheme::Tel || uri.host.is_empty() {
             return None;
         }
@@ -433,15 +525,62 @@ impl WorkerCtx {
             .port
             .unwrap_or_else(|| default_port_for_uri(uri, fallback_port));
         let key = (uri.host.to_ascii_lowercase(), port);
-        if let Some(&cached) = self.dns_cache.get(&key) {
-            return Some(cached);
+        if let Some(entry) = self.dns_cache.get(&key).copied() {
+            if now < entry.expires_at() {
+                let seq = self.next_route_seq();
+                if let Some(slot) = self.dns_cache.get_mut(&key) {
+                    slot.set_seq(seq);
+                }
+                return match entry {
+                    DnsCacheEntry::Positive { addr, .. } => {
+                        self.record_peer_tls_host(addr, &uri.host);
+                        Some(addr)
+                    }
+                    DnsCacheEntry::Negative { .. } => None,
+                };
+            }
+            self.dns_cache.remove(&key);
         }
-        let resolved = resolve_sip_uri_addr(uri, fallback_port)?;
+
+        let resolved = resolve_sip_uri_addr(uri, fallback_port);
         if self.dns_cache.len() >= MAX_TRACKED_SIP_ROUTES {
-            self.dns_cache.clear();
+            self.dns_cache.retain(|_, v| now < v.expires_at());
+            if self.dns_cache.len() >= MAX_TRACKED_SIP_ROUTES {
+                if let Some(evict) = self
+                    .dns_cache
+                    .iter()
+                    .min_by_key(|(_, v)| v.seq())
+                    .map(|(k, _)| k.clone())
+                {
+                    self.dns_cache.remove(&evict);
+                }
+            }
         }
-        self.dns_cache.insert(key, resolved);
-        Some(resolved)
+        let seq = self.next_route_seq();
+        match resolved {
+            Some(addr) => {
+                self.dns_cache.insert(
+                    key,
+                    DnsCacheEntry::Positive {
+                        addr,
+                        expires_at: now + DNS_POSITIVE_TTL,
+                        seq,
+                    },
+                );
+                self.record_peer_tls_host(addr, &uri.host);
+                Some(addr)
+            }
+            None => {
+                self.dns_cache.insert(
+                    key,
+                    DnsCacheEntry::Negative {
+                        expires_at: now + DNS_NEGATIVE_TTL,
+                        seq,
+                    },
+                );
+                None
+            }
+        }
     }
 
     fn sync_call_srtp(&mut self, call_id: &str, now: Instant) {
@@ -470,10 +609,20 @@ impl WorkerCtx {
 
     fn record_outbound_tx_target(&mut self, branch: Option<String>, target: SocketAddr) {
         if let Some(b) = branch {
-            if self.outbound_tx_targets.len() >= MAX_TRACKED_SIP_ROUTES {
-                self.outbound_tx_targets.clear();
+            let seq = self.next_route_seq();
+            if self.outbound_tx_targets.len() >= MAX_TRACKED_SIP_ROUTES
+                && !self.outbound_tx_targets.contains_key(&b)
+            {
+                if let Some(evict) = self
+                    .outbound_tx_targets
+                    .iter()
+                    .min_by_key(|(_, (_, s))| *s)
+                    .map(|(k, _)| k.clone())
+                {
+                    self.outbound_tx_targets.remove(&evict);
+                }
             }
-            self.outbound_tx_targets.insert(b, target);
+            self.outbound_tx_targets.insert(b, (target, seq));
         }
     }
 
@@ -481,19 +630,54 @@ impl WorkerCtx {
         if let Ok(SipMessage::Request(req)) = SipMessage::parse(raw) {
             if let Ok(via) = req.top_via() {
                 if let Some(branch) = via.branch {
-                    if self.inbound_tx_sources.len() >= MAX_TRACKED_SIP_ROUTES {
-                        self.inbound_tx_sources.clear();
+                    let key = (
+                        branch,
+                        via.sent_by.trim().to_ascii_lowercase(),
+                        req.method.as_str().to_string(),
+                    );
+                    let seq = self.next_route_seq();
+                    if self.inbound_tx_sources.len() >= MAX_TRACKED_SIP_ROUTES
+                        && !self.inbound_tx_sources.contains_key(&key)
+                    {
+                        if let Some(evict) = self
+                            .inbound_tx_sources
+                            .iter()
+                            .min_by_key(|(_, (_, s))| *s)
+                            .map(|(k, _)| k.clone())
+                        {
+                            self.inbound_tx_sources.remove(&evict);
+                        }
                     }
-                    self.inbound_tx_sources
-                        .insert((branch, req.method.as_str().to_string()), src_addr);
+                    self.inbound_tx_sources.insert(key, (src_addr, seq));
                 }
             }
             if req.method == Method::Invite {
                 if let Ok(cid) = req.call_id() {
-                    if self.inbound_call_sources.len() >= MAX_TRACKED_SIP_ROUTES {
-                        self.inbound_call_sources.clear();
+                    let cid_str = cid.to_string();
+                    let seq = self.next_route_seq();
+                    if self.inbound_call_sources.len() >= MAX_TRACKED_SIP_ROUTES
+                        && !self.inbound_call_sources.contains_key(&cid_str)
+                    {
+                        let evict = self
+                            .inbound_call_sources
+                            .iter()
+                            .filter(|(k, _)| {
+                                !self.active_media.contains_key(k.as_str())
+                                    && !self.pending_rtp_sockets.contains_key(k.as_str())
+                            })
+                            .min_by_key(|(_, (_, s))| *s)
+                            .map(|(k, _)| k.clone())
+                            .or_else(|| {
+                                self.inbound_call_sources
+                                    .iter()
+                                    .min_by_key(|(_, (_, s))| *s)
+                                    .map(|(k, _)| k.clone())
+                            });
+                        if let Some(k) = evict {
+                            self.inbound_call_sources.remove(&k);
+                        }
                     }
-                    self.inbound_call_sources.insert(cid.to_string(), src_addr);
+                    self.inbound_call_sources.insert(cid_str, (src_addr, seq));
                 }
             }
         }
@@ -501,7 +685,7 @@ impl WorkerCtx {
 
     fn flush_sip_outbound(&mut self, now: Instant) {
         for pkt in self.ua.poll_transmit() {
-            let dest = self.resolve_sip_destination(&pkt);
+            let dest = self.resolve_sip_destination(&pkt, now);
             if let Some(summary) = summarize_sip_datagram(&pkt) {
                 self.recorder.record(
                     now,
@@ -510,7 +694,11 @@ impl WorkerCtx {
                     summary.1,
                 );
             }
-            if let Err(msg) = self.sip_transport.send(dest, &pkt, now) {
+            let tls_host_hint = self.peer_tls_hosts.get(&dest).map(|(h, _)| h.clone());
+            if let Err(msg) = self
+                .sip_transport
+                .send(dest, &pkt, tls_host_hint.as_deref(), now)
+            {
                 self.recorder
                     .record(now, TelemetryCategory::Warning, None, msg.clone());
                 self.push_event(EngineEvent::Warning(msg));
@@ -607,14 +795,15 @@ impl WorkerCtx {
                 } => {
                     if let Ok(ip) = remote_sdp.connection_ip.parse::<IpAddr>() {
                         let remote_rtp = SocketAddr::new(ip, remote_sdp.audio_port);
+                        let (remote_rtcp, rtcp_mux) = resolve_remote_rtcp_addr(&remote_sdp, ip);
                         let mut updated_codec_label: Option<String> = None;
                         if !negotiated_codecs.is_empty() {
                             let (session_codec, codec_name, custom_plugin, dtmf_pt, dtmf_clock, _) =
                                 self.select_media_codecs(&negotiated_codecs);
                             if let Some(media) = self.active_media.get_mut(&call_id) {
                                 media.remote_rtp = remote_rtp;
-                                media.remote_rtcp =
-                                    SocketAddr::new(ip, remote_sdp.audio_port.saturating_add(1));
+                                media.remote_rtcp = remote_rtcp;
+                                media.rtcp_mux = rtcp_mux;
                                 media.latched_rtp_source = None;
                                 media.latched_rtcp_source = None;
                                 if media.session.codec() != session_codec
@@ -632,8 +821,8 @@ impl WorkerCtx {
                             }
                         } else if let Some(media) = self.active_media.get_mut(&call_id) {
                             media.remote_rtp = remote_rtp;
-                            media.remote_rtcp =
-                                SocketAddr::new(ip, remote_sdp.audio_port.saturating_add(1));
+                            media.remote_rtcp = remote_rtcp;
+                            media.rtcp_mux = rtcp_mux;
                             media.latched_rtp_source = None;
                             media.latched_rtcp_source = None;
                         }
@@ -861,7 +1050,7 @@ impl WorkerCtx {
             }
         };
         let remote_rtp = SocketAddr::new(remote_ip, remote_sdp.audio_port);
-        let remote_rtcp = SocketAddr::new(remote_ip, remote_sdp.audio_port.saturating_add(1));
+        let (remote_rtcp, rtcp_mux) = resolve_remote_rtcp_addr(remote_sdp, remote_ip);
 
         let (session_codec, codec_name, custom_plugin, dtmf_pt, dtmf_clock_rate_hz, cn_pt) =
             self.select_media_codecs(negotiated_codecs);
@@ -871,6 +1060,7 @@ impl WorkerCtx {
         if let Some(media) = self.active_media.get_mut(call_id) {
             media.remote_rtp = remote_rtp;
             media.remote_rtcp = remote_rtcp;
+            media.rtcp_mux = rtcp_mux;
             media.latched_rtp_source = None;
             media.latched_rtcp_source = None;
             media.local_hold = local_hold;
@@ -981,6 +1171,7 @@ impl WorkerCtx {
                 rtcp_socket,
                 remote_rtp,
                 remote_rtcp,
+                rtcp_mux,
                 latched_rtp_source: None,
                 latched_rtcp_source: None,
                 session,
@@ -1397,6 +1588,19 @@ impl WorkerCtx {
                 self.push_event(EngineEvent::TelemetryExported { call_id, json });
             }
             EngineCommand::Shutdown => {
+                // Best-effort graceful BYE/CANCEL for active dialogs and de-REGISTER before closing sockets.
+                for cid in self.ua.active_call_ids() {
+                    let _ = self.ua.hangup(&cid, now);
+                }
+                if matches!(
+                    self.ua.registration_state(),
+                    RegistrationState::Registered { .. } | RegistrationState::Registering
+                ) {
+                    let _ = self.ua.unregister(now);
+                }
+                let immediate = self.ua.drain_events();
+                self.handle_ua_events(immediate, now);
+                self.flush_sip_outbound(now);
                 return false;
             }
         }
@@ -1479,19 +1683,34 @@ impl WorkerCtx {
                             }
                         }
                         let pkt_slice = &rtp_buf[..len];
-                        let samples_per_ms = media.session.clock_rate_hz() / 1000;
-                        let arrival_samples = (elapsed_ms.min(u64::from(u32::MAX)) as u32)
-                            .saturating_mul(samples_per_ms);
-                        if let Ok(opt_digit) = media.session.receive_rtp(pkt_slice, arrival_samples)
-                        {
-                            if !media.session.is_srtp_active()
+                        let is_muxed_rtcp = media.rtcp_mux
+                            && pkt_slice.len() >= 4
+                            && (pkt_slice[0] >> 6) == 2
+                            && matches!(pkt_slice[1], 200..=204);
+                        if is_muxed_rtcp {
+                            if media.session.receive_rtcp_at(pkt_slice, elapsed_ms).is_ok()
+                                && !media.session.is_srtp_active()
                                 && !media.remote_rtp.ip().is_unspecified()
                                 && media.latched_rtp_source.is_none()
                             {
                                 media.latched_rtp_source = Some(src_addr);
                             }
-                            if let Some(digit) = opt_digit {
-                                dtmf_events.push((call_id.clone(), digit));
+                        } else {
+                            let samples_per_ms = media.session.clock_rate_hz() / 1000;
+                            let arrival_samples = (elapsed_ms.min(u64::from(u32::MAX)) as u32)
+                                .saturating_mul(samples_per_ms);
+                            if let Ok(opt_digit) =
+                                media.session.receive_rtp(pkt_slice, arrival_samples)
+                            {
+                                if !media.session.is_srtp_active()
+                                    && !media.remote_rtp.ip().is_unspecified()
+                                    && media.latched_rtp_source.is_none()
+                                {
+                                    media.latched_rtp_source = Some(src_addr);
+                                }
+                                if let Some(digit) = opt_digit {
+                                    dtmf_events.push((call_id.clone(), digit));
+                                }
                             }
                         }
                     }
@@ -1668,12 +1887,19 @@ impl WorkerCtx {
                 let _ = media.session.pop_playout_frame();
             }
 
-            if let Some(rtcp_sock) = media.rtcp_socket.as_ref() {
+            if media.rtcp_mux || media.rtcp_socket.is_some() {
                 let rx_count = media.session.stats().received_count();
                 if rx_count >= 20 && (!media.initial_rtcp_sent || now >= media.next_rtcp_at) {
                     let now_ms = now.saturating_duration_since(media.started_at).as_millis() as u64;
                     let rr = media.session.build_rtcp_receiver_report_at(Some(now_ms));
-                    if rtcp_sock.send_to(&rr, media.remote_rtcp).is_ok() {
+                    let send_ok = if media.rtcp_mux {
+                        media.rtp_socket.send_to(&rr, media.remote_rtp).is_ok()
+                    } else if let Some(rtcp_sock) = media.rtcp_socket.as_ref() {
+                        rtcp_sock.send_to(&rr, media.remote_rtcp).is_ok()
+                    } else {
+                        false
+                    };
+                    if send_ok {
                         media.initial_rtcp_sent = true;
                         media.next_rtcp_at = now + Duration::from_millis(RTCP_REPORT_INTERVAL_MS);
                         rtcp_sent_calls.push(call_id.clone());
@@ -1715,6 +1941,7 @@ fn run_worker(
     shared: Arc<SharedState>,
 ) {
     let now = Instant::now();
+    let reg_host_hint = config.ua_config.registrar_uri.host.clone();
     let mut ctx = WorkerCtx {
         registrar_addr: config.registrar_addr,
         bind_ip: config.bind_ip,
@@ -1733,11 +1960,14 @@ fn run_worker(
         inbound_call_sources: HashMap::new(),
         outbound_tx_targets: HashMap::new(),
         dns_cache: HashMap::new(),
+        peer_tls_hosts: HashMap::new(),
+        route_seq: 0,
         suspended: false,
         was_registered_before_suspend: false,
         ssrc_counter: 0x2000_0000u32.wrapping_add(u32::from(local_sip_addr.port())),
         shared,
     };
+    ctx.record_peer_tls_host(config.registrar_addr, &reg_host_hint);
 
     let mut next_media_tick = now + Duration::from_millis(MEDIA_TICK_MS);
     let mut running = true;
@@ -1757,6 +1987,14 @@ fn run_worker(
         }
         if !running {
             break;
+        }
+
+        if ctx.suspended {
+            if let Ok(guard) = ctx.shared.commands.lock() {
+                let wait_res = ctx.shared.cmd_cv.wait_while(guard, |cmds| cmds.is_empty());
+                drop(wait_res);
+            }
+            continue;
         }
 
         let now = Instant::now();
@@ -1851,6 +2089,28 @@ fn bind_rtp_socket(
         .and_then(|rtcp_port| UdpSocket::bind((target_ip, rtcp_port)).ok())
         .and_then(|sock| sock.set_nonblocking(true).ok().map(|()| sock));
     Ok((rtp_sock, rtcp_sock, port))
+}
+
+fn resolve_remote_rtcp_addr(
+    remote_sdp: &bmsip_core::sdp::SdpSession,
+    remote_ip: IpAddr,
+) -> (SocketAddr, bool) {
+    if remote_sdp.rtcp_mux {
+        return (SocketAddr::new(remote_ip, remote_sdp.audio_port), true);
+    }
+    if let Some(port) = remote_sdp.rtcp_port {
+        let ip = remote_sdp
+            .rtcp_ip
+            .as_deref()
+            .and_then(|s| s.parse::<IpAddr>().ok())
+            .filter(|ip| !ip.is_unspecified())
+            .unwrap_or(remote_ip);
+        return (SocketAddr::new(ip, port), false);
+    }
+    (
+        SocketAddr::new(remote_ip, remote_sdp.audio_port.saturating_add(1)),
+        false,
+    )
 }
 
 fn default_port_for_uri(uri: &SipUri, fallback_port: u16) -> u16 {

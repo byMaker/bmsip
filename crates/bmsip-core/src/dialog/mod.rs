@@ -23,6 +23,7 @@ const ALLOW_METHODS: &str = "INVITE, ACK, CANCEL, BYE, OPTIONS, UPDATE, PRACK, I
 const SUPPORTED_EXTENSIONS: &str = "timer, 100rel, replaces";
 const MAX_STALE_AUTH_RETRIES: u8 = 3;
 const MAX_SESSION_TIMER_RETRIES: u8 = 3;
+const MAX_GLARE_RETRIES: u8 = 3;
 
 /// SIP account registration lifecycle state (RFC 3261 Section 10).
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -385,6 +386,31 @@ struct Pending2xxAck {
 }
 
 #[derive(Debug, Clone)]
+struct PendingReliable1xx {
+    response: SipResponse,
+    rseq: u32,
+    invite_cseq: u32,
+    next_send_at: Instant,
+    interval: Duration,
+    deadline: Instant,
+}
+
+#[derive(Debug, Clone)]
+struct PendingGlareRetry {
+    due_at: Instant,
+    ip: String,
+    rtp_port: u16,
+    desired_local_hold: bool,
+    attempts: u8,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum PendingAckSdpKind {
+    InitialInvite,
+    ReInvite,
+}
+
+#[derive(Debug, Clone)]
 enum CallTxKind {
     Invite,
     ReInvite,
@@ -421,7 +447,7 @@ struct CallSession {
     local_hold: bool,
     remote_hold: bool,
     local_rseq: u32,
-    pending_reliable_rseq: Option<u32>,
+    pending_reliable_1xx: Option<PendingReliable1xx>,
     last_remote_rseq: Option<u32>,
     session_expires_secs: Option<u32>,
     min_se_secs: u32,
@@ -431,6 +457,8 @@ struct CallSession {
     session_timer_retries: u8,
     cancel_deadline: Option<Instant>,
     pending_reinvite_rollback: Option<PendingReInviteRollback>,
+    pending_glare_retry: Option<PendingGlareRetry>,
+    glare_attempts: u8,
     replaces_header: Option<ReplacesHeader>,
     active_invite_tx: Option<TransactionId>,
     active_invite_req: Option<SipRequest>,
@@ -452,6 +480,7 @@ struct CallSession {
     info_auth: AuthRetryState,
     last_ack_for_2xx: Option<SipRequest>,
     awaiting_ack: Option<Pending2xxAck>,
+    awaiting_ack_sdp: Option<PendingAckSdpKind>,
 }
 
 impl CallSession {
@@ -502,11 +531,8 @@ impl Drop for UserAgent {
 impl UserAgent {
     /// Creates a new [`UserAgent`] initialized in [`RegistrationState::Unregistered`].
     pub fn new(config: UaConfig) -> Self {
-        let seed_part = if config.instance_seed == 0 {
-            String::new()
-        } else {
-            format!("-{:08x}", (config.instance_seed & 0xffff_ffff) as u32)
-        };
+        let eff = effective_instance_seed(&config);
+        let seed_part = format!("-{:08x}", (eff & 0xffff_ffff) as u32);
         let reg_call_id = format!(
             "bm-reg-{}{seed_part}@{}",
             config.local_sip_port, config.local_host
@@ -546,6 +572,17 @@ impl UserAgent {
     /// Returns the current SIP registration state.
     pub fn registration_state(&self) -> &RegistrationState {
         &self.reg_state
+    }
+
+    /// Returns the currently non-terminated call IDs tracked by this User Agent.
+    pub fn active_call_ids(&self) -> Vec<String> {
+        self.calls
+            .iter()
+            .filter(|(_, call)| {
+                !matches!(call.state, CallState::Terminating | CallState::Terminated)
+            })
+            .map(|(cid, _)| cid.clone())
+            .collect()
     }
 
     /// Returns the FSM state of a tracked call, if present.
@@ -644,6 +681,9 @@ impl UserAgent {
             codecs,
             ptime: Some(20),
             crypto,
+            rtcp_port: None,
+            rtcp_ip: None,
+            rtcp_mux: false,
         }
     }
 
@@ -758,7 +798,7 @@ impl UserAgent {
             local_hold: false,
             remote_hold: false,
             local_rseq: 0,
-            pending_reliable_rseq: None,
+            pending_reliable_1xx: None,
             last_remote_rseq: None,
             session_expires_secs: init_se,
             min_se_secs: self.config.min_se_secs.max(1),
@@ -768,6 +808,8 @@ impl UserAgent {
             session_timer_retries: 0,
             cancel_deadline: None,
             pending_reinvite_rollback: None,
+            pending_glare_retry: None,
+            glare_attempts: 0,
             replaces_header: replaces,
             active_invite_tx: None,
             active_invite_req: None,
@@ -789,6 +831,7 @@ impl UserAgent {
             info_auth: AuthRetryState::default(),
             last_ack_for_2xx: None,
             awaiting_ack: None,
+            awaiting_ack_sdp: None,
         };
 
         let branch = self.next_branch();
@@ -865,7 +908,7 @@ impl UserAgent {
             )));
         }
 
-        let (tx_id, mut resp, rseq) = {
+        let (tx_id, mut resp, rseq, invite_cseq) = {
             let call = self
                 .calls
                 .get_mut(call_id)
@@ -878,21 +921,26 @@ impl UserAgent {
                     call.state
                 )));
             }
+            if call.pending_reliable_1xx.is_some() {
+                return Err(SipError::TransactionError(format!(
+                    "previous reliable 1xx response on call {call_id} is still awaiting PRACK"
+                )));
+            }
             let tx_id = call.inbound_invite_tx.clone().ok_or_else(|| {
                 SipError::TransactionError("missing inbound INVITE tx".to_string())
             })?;
             let req = call.inbound_invite_req.as_ref().ok_or_else(|| {
                 SipError::TransactionError("missing inbound INVITE req".to_string())
             })?;
+            let invite_cseq = req.cseq()?.seq;
             call.local_rseq = call.local_rseq.saturating_add(1).max(1);
             let rseq = call.local_rseq;
-            call.pending_reliable_rseq = Some(rseq);
             let mut resp = req.create_response(status_code, reason)?;
             if let Some(sdp) = early_sdp {
                 call.local_sdp = Some(sdp.clone());
                 resp = resp.with_body("application/sdp", sdp.to_string().into_bytes());
             }
-            (tx_id, resp, rseq)
+            (tx_id, resp, rseq, invite_cseq)
         };
 
         let contact = NameAddr::new(self.config.contact_uri()).to_string();
@@ -910,10 +958,25 @@ impl UserAgent {
         resp.headers.set("Allow", ALLOW_METHODS);
         resp.headers.set("Supported", SUPPORTED_EXTENSIONS);
 
-        let tx_events = self.transactions.send_server_response(&tx_id, resp, now)?;
+        let tx_events = self
+            .transactions
+            .send_server_response(&tx_id, resp.clone(), now)?;
         self.process_transaction_events(tx_events, now);
 
+        let t1 = self
+            .config
+            .timers
+            .t1
+            .clamp(Duration::from_millis(1), Duration::from_secs(60));
         if let Some(call) = self.calls.get_mut(call_id) {
+            call.pending_reliable_1xx = Some(PendingReliable1xx {
+                response: resp,
+                rseq,
+                invite_cseq,
+                next_send_at: now + t1,
+                interval: t1,
+                deadline: now + t1.saturating_mul(64),
+            });
             if call.state == CallState::Incoming {
                 call.state = CallState::Ringing;
             }
@@ -1081,10 +1144,86 @@ impl UserAgent {
         };
 
         let Some(remote_sdp) = remote_sdp_opt else {
-            self.reject_inbound_invite_488(call_id, &tx_id, &req, &local_tag, now);
-            return Err(SipError::InvalidSdp(
-                "inbound INVITE lacked SDP offer".to_string(),
-            ));
+            if !req.body.is_empty() || effective_rtp_port == 0 {
+                self.reject_inbound_invite_488(call_id, &tx_id, &req, &local_tag, now);
+                return Err(SipError::InvalidSdp(
+                    "inbound INVITE lacked usable SDP offer".to_string(),
+                ));
+            }
+            // RFC 3261 §13.2.1: delayed SDP offer — return local offer in 200 OK and await answer in ACK.
+            let srtp_mode = match self.config.effective_srtp_mode() {
+                Ok(mode) => mode,
+                Err(err) => {
+                    self.reject_inbound_invite_488(call_id, &tx_id, &req, &local_tag, now);
+                    return Err(err);
+                }
+            };
+            let local_candidates = match self.calls.get(call_id) {
+                Some(c) if !c.local_crypto.is_empty() => c.local_crypto.clone(),
+                _ if matches!(srtp_mode, SrtpMode::SdesOptional | SrtpMode::SdesRequired) => {
+                    self.generate_sdes_candidates(call_id)
+                }
+                _ => Vec::new(),
+            };
+            let dir = if local_hold {
+                Direction::SendOnly
+            } else {
+                Direction::SendRecv
+            };
+            let offer_sdp = self.build_local_offer_sdp(
+                srtp_mode,
+                &sdp_sid,
+                1,
+                &self.config.local_host,
+                effective_rtp_port,
+                dir,
+                self.config.supported_codecs.clone(),
+                &local_candidates,
+            );
+
+            let mut resp = req
+                .create_response(200, "OK")?
+                .with_body("application/sdp", offer_sdp.to_string().into_bytes());
+            let mut to = resp.to()?;
+            to.tag = Some(local_tag);
+            resp.headers.set("To", to.to_string());
+            resp.headers.set(
+                "Contact",
+                NameAddr::new(self.config.contact_uri()).to_string(),
+            );
+            resp.headers.set("Allow", ALLOW_METHODS);
+            resp.headers.set("Supported", SUPPORTED_EXTENSIONS);
+            self.apply_uas_session_timer_to_response(call_id, &req, &mut resp, now);
+
+            let tx_events = self
+                .transactions
+                .send_server_response(&tx_id, resp.clone(), now)?;
+            self.process_transaction_events(tx_events, now);
+
+            let t1 = self
+                .config
+                .timers
+                .t1
+                .clamp(Duration::from_millis(1), Duration::from_secs(60));
+            if let Some(call) = self.calls.get_mut(call_id) {
+                call.state = CallState::Established;
+                call.local_rtp_port = effective_rtp_port;
+                call.local_sdp = Some(offer_sdp.clone());
+                if !offer_sdp.crypto.is_empty() {
+                    call.local_crypto = offer_sdp.crypto;
+                }
+                call.inbound_invite_tx = None;
+                call.inbound_invite_req = None;
+                call.pending_reliable_1xx = None;
+                call.awaiting_ack_sdp = Some(PendingAckSdpKind::InitialInvite);
+                call.awaiting_ack = Some(Pending2xxAck {
+                    response: resp,
+                    next_send_at: now + t1,
+                    interval: t1,
+                    deadline: now + t1.saturating_mul(64),
+                });
+            }
+            return Ok(());
         };
 
         let srtp_mode = match self.config.effective_srtp_mode() {
@@ -1153,6 +1292,8 @@ impl UserAgent {
             call.negotiated_codecs = negotiated.clone();
             call.inbound_invite_tx = None;
             call.inbound_invite_req = None;
+            call.pending_reliable_1xx = None;
+            call.awaiting_ack_sdp = None;
             call.awaiting_ack = Some(Pending2xxAck {
                 response: resp,
                 next_send_at: now + t1,
@@ -1225,6 +1366,9 @@ impl UserAgent {
                 Ok(())
             }
             (CallDirection::Inbound, CallState::Incoming | CallState::Ringing) => {
+                if let Some(call) = self.calls.get_mut(call_id) {
+                    call.pending_reliable_1xx = None;
+                }
                 if let (Some(tx_id), Some(req)) = (inbound_tx, inbound_req) {
                     let mut resp = req.create_response(486, "Busy Here")?;
                     let mut to = resp.to()?;
@@ -1264,7 +1408,7 @@ impl UserAgent {
         let (local_ip, local_rtp_port, prev_local_hold, remote_hold, target_dir) = {
             let call = self
                 .calls
-                .get(call_id)
+                .get_mut(call_id)
                 .ok_or_else(|| SipError::TransactionError(format!("unknown call {call_id}")))?;
             if call.state != CallState::Established {
                 return Err(SipError::TransactionError(format!(
@@ -1272,6 +1416,8 @@ impl UserAgent {
                     call.state
                 )));
             }
+            call.pending_glare_retry = None;
+            call.glare_attempts = 0;
             let dir = if call.remote_hold {
                 Direction::Inactive
             } else {
@@ -1309,7 +1455,7 @@ impl UserAgent {
         let (local_ip, local_rtp_port, prev_local_hold, remote_hold) = {
             let call = self
                 .calls
-                .get(call_id)
+                .get_mut(call_id)
                 .ok_or_else(|| SipError::TransactionError(format!("unknown call {call_id}")))?;
             if call.state != CallState::Established {
                 return Err(SipError::TransactionError(format!(
@@ -1317,6 +1463,8 @@ impl UserAgent {
                     call.state
                 )));
             }
+            call.pending_glare_retry = None;
+            call.glare_attempts = 0;
             (
                 self.config.local_host.clone(),
                 call.local_rtp_port,
@@ -1351,10 +1499,19 @@ impl UserAgent {
         new_local_rtp_port: u16,
         now: Instant,
     ) -> Result<(), SipError> {
-        let dir = match self.calls.get(call_id) {
-            Some(c) if c.local_hold && c.remote_hold => Direction::Inactive,
-            Some(c) if c.local_hold => Direction::SendOnly,
-            _ => Direction::SendRecv,
+        let dir = match self.calls.get_mut(call_id) {
+            Some(c) => {
+                c.pending_glare_retry = None;
+                c.glare_attempts = 0;
+                if c.local_hold && c.remote_hold {
+                    Direction::Inactive
+                } else if c.local_hold {
+                    Direction::SendOnly
+                } else {
+                    Direction::SendRecv
+                }
+            }
+            None => Direction::SendRecv,
         };
         self.send_reinvite_with_direction(call_id, new_local_ip, new_local_rtp_port, dir, None, now)
     }
@@ -1473,6 +1630,28 @@ impl UserAgent {
     ) -> Result<(), SipError> {
         let srtp_mode = self.config.effective_srtp_mode()?;
         let branch = self.next_branch();
+        {
+            let call = self
+                .calls
+                .get(call_id)
+                .ok_or_else(|| SipError::TransactionError(format!("unknown call {call_id}")))?;
+            if !matches!(
+                call.state,
+                CallState::Incoming | CallState::Ringing | CallState::Established
+            ) || call.remote_tag.is_none()
+            {
+                return Err(SipError::TransactionError(format!(
+                    "cannot send UPDATE for call {call_id} in state {:?}",
+                    call.state
+                )));
+            }
+            let effective_port = new_local_rtp_port.unwrap_or(call.local_rtp_port);
+            if effective_port == 0 {
+                return Err(SipError::TransactionError(format!(
+                    "cannot send SDP UPDATE for call {call_id} with local RTP port 0"
+                )));
+            }
+        }
         if self
             .calls
             .get(call_id)
@@ -1489,16 +1668,6 @@ impl UserAgent {
                 .calls
                 .get_mut(call_id)
                 .ok_or_else(|| SipError::TransactionError(format!("unknown call {call_id}")))?;
-            if !matches!(
-                call.state,
-                CallState::Incoming | CallState::Ringing | CallState::Established
-            ) || call.remote_tag.is_none()
-            {
-                return Err(SipError::TransactionError(format!(
-                    "cannot send UPDATE for call {call_id} in state {:?}",
-                    call.state
-                )));
-            }
             call.local_cseq += 1;
             call.update_auth.reset();
             if let Some(p) = new_local_rtp_port {
@@ -1926,9 +2095,11 @@ impl UserAgent {
 
         let established_calls: Vec<(String, u16)> = self
             .calls
-            .iter()
+            .iter_mut()
             .filter(|(_, call)| call.state == CallState::Established)
             .map(|(id, call)| {
+                call.pending_glare_retry = None;
+                call.glare_attempts = 0;
                 let port = rebound_rtp_ports
                     .get(id)
                     .copied()
@@ -1987,10 +2158,27 @@ impl UserAgent {
             .min();
         let cancel_dl = self.calls.values().filter_map(|c| c.cancel_deadline).min();
 
+        let rel1xx_dl = self
+            .calls
+            .values()
+            .filter_map(|c| {
+                c.pending_reliable_1xx
+                    .as_ref()
+                    .map(|p| p.next_send_at.min(p.deadline))
+            })
+            .min();
+        let glare_dl = self
+            .calls
+            .values()
+            .filter_map(|c| c.pending_glare_retry.as_ref().map(|g| g.due_at))
+            .min();
+
         [
             tx_dl,
             reg_dl,
             ack_dl,
+            rel1xx_dl,
+            glare_dl,
             se_refresh_dl,
             se_expire_dl,
             cancel_dl,
@@ -2063,6 +2251,138 @@ impl UserAgent {
                 );
             } else if let Some(resp) = resend_resp {
                 self.transactions.send_stateless_response(resp);
+            }
+        }
+
+        // RFC 3262 §3: retransmit unacknowledged reliable 1xx responses at T1 doubling up to 64*T1,
+        // or reject the INVITE with 504 Server Time-out if PRACK never arrives.
+        let due_reliable_1xx: Vec<String> = self
+            .calls
+            .iter()
+            .filter_map(|(id, call)| {
+                call.pending_reliable_1xx
+                    .as_ref()
+                    .filter(|p| now >= p.next_send_at || now >= p.deadline)
+                    .map(|_| id.clone())
+            })
+            .collect();
+        for call_id in due_reliable_1xx {
+            let mut timed_out = false;
+            let mut resend_resp: Option<SipResponse> = None;
+            let mut inv_tx_opt: Option<TransactionId> = None;
+
+            if let Some(call) = self.calls.get_mut(&call_id) {
+                if let Some(pending) = call.pending_reliable_1xx.as_mut() {
+                    if now >= pending.deadline {
+                        timed_out = true;
+                    } else {
+                        resend_resp = Some(pending.response.clone());
+                        inv_tx_opt = call.inbound_invite_tx.clone();
+                        pending.interval = pending.interval.saturating_mul(2);
+                        pending.next_send_at = now + pending.interval;
+                    }
+                }
+            }
+
+            if timed_out {
+                let (inv_tx, inv_req, ltag) = match self.calls.get_mut(&call_id) {
+                    Some(call) => {
+                        call.pending_reliable_1xx = None;
+                        (
+                            call.inbound_invite_tx.take(),
+                            call.inbound_invite_req.take(),
+                            call.local_tag.clone(),
+                        )
+                    }
+                    None => (None, None, String::new()),
+                };
+                if let (Some(tx_id), Some(req)) = (inv_tx, inv_req) {
+                    if let Ok(resp) = req.create_response(504, "Server Time-out") {
+                        self.send_uas_response(&tx_id, resp, Some(&ltag), now);
+                    }
+                }
+                let reason_hdr = ReasonHeader::sip(504, "Server Time-out");
+                self.terminate_call_with_reason(
+                    &call_id,
+                    Some(504),
+                    "100rel PRACK timeout (RFC 3262 §3)".to_string(),
+                    Some(reason_hdr),
+                );
+            } else if let Some(resp) = resend_resp {
+                if let Some(inv_tx) = inv_tx_opt {
+                    if self
+                        .transactions
+                        .send_server_response(&inv_tx, resp.clone(), now)
+                        .is_err()
+                    {
+                        self.transactions.send_stateless_response(resp);
+                    }
+                } else {
+                    self.transactions.send_stateless_response(resp);
+                }
+            }
+        }
+
+        // RFC 3261 §14.1: retry outbound re-INVITE after 491 Request Pending backoff.
+        let due_glare_retries: Vec<String> = self
+            .calls
+            .iter()
+            .filter_map(|(id, call)| {
+                if call.state == CallState::Established
+                    && call.active_invite_tx.is_none()
+                    && call.active_update_tx.is_none()
+                    && call
+                        .pending_glare_retry
+                        .as_ref()
+                        .is_some_and(|g| now >= g.due_at)
+                {
+                    Some(id.clone())
+                } else {
+                    None
+                }
+            })
+            .collect();
+        for call_id in due_glare_retries {
+            let Some(retry) = self
+                .calls
+                .get_mut(&call_id)
+                .and_then(|c| c.pending_glare_retry.take())
+            else {
+                continue;
+            };
+            let Some((dir, remote_hold)) = self.calls.get(&call_id).map(|c| {
+                let d = if retry.desired_local_hold && c.remote_hold {
+                    Direction::Inactive
+                } else if retry.desired_local_hold {
+                    Direction::SendOnly
+                } else {
+                    Direction::SendRecv
+                };
+                (d, c.remote_hold)
+            }) else {
+                continue;
+            };
+            if let Some(c) = self.calls.get_mut(&call_id) {
+                c.glare_attempts = retry.attempts;
+            }
+            let prev_hold = self.calls.get(&call_id).is_some_and(|c| c.local_hold);
+            if self
+                .send_reinvite_with_direction(
+                    &call_id,
+                    &retry.ip,
+                    retry.rtp_port,
+                    dir,
+                    Some(retry.desired_local_hold),
+                    now,
+                )
+                .is_err()
+                && prev_hold != retry.desired_local_hold
+            {
+                self.pending_events.push_back(UaEvent::CallHoldChanged {
+                    call_id,
+                    local_hold: prev_hold,
+                    remote_hold,
+                });
             }
         }
 
@@ -2160,25 +2480,14 @@ impl UserAgent {
     }
 
     fn seed_suffix(&self) -> String {
-        if self.config.instance_seed == 0 {
-            String::new()
-        } else {
-            format!("-{:08x}", (self.config.instance_seed & 0xffff_ffff) as u32)
-        }
+        let eff = effective_instance_seed(&self.config);
+        format!("-{:08x}", (eff & 0xffff_ffff) as u32)
     }
 
     fn next_numeric_id(&mut self) -> String {
         let seq = self.next_seq();
-        if self.config.instance_seed == 0 {
-            format!("{}{}", self.config.local_sip_port, seq)
-        } else {
-            format!(
-                "{}{}{}",
-                (self.config.instance_seed % 1_000_000),
-                self.config.local_sip_port,
-                seq
-            )
-        }
+        let eff = effective_instance_seed(&self.config);
+        format!("{}{}{}", (eff % 1_000_000), self.config.local_sip_port, seq)
     }
 
     fn next_call_id(&mut self) -> String {
@@ -2204,16 +2513,13 @@ impl UserAgent {
 
     fn next_cnonce(&mut self) -> String {
         let seq = self.next_seq();
-        if self.config.instance_seed == 0 {
-            format!("bmcnonce{:04x}{:08x}", self.config.local_sip_port, seq)
-        } else {
-            format!(
-                "bmcnonce{:08x}{:04x}{:08x}",
-                (self.config.instance_seed & 0xffff_ffff) as u32,
-                self.config.local_sip_port,
-                seq
-            )
-        }
+        let eff = effective_instance_seed(&self.config);
+        format!(
+            "bmcnonce{:08x}{:04x}{:08x}",
+            (eff & 0xffff_ffff) as u32,
+            self.config.local_sip_port,
+            seq
+        )
     }
 
     fn reject_inbound_invite_488(
@@ -2224,6 +2530,9 @@ impl UserAgent {
         local_tag: &str,
         now: Instant,
     ) {
+        if let Some(call) = self.calls.get_mut(call_id) {
+            call.pending_reliable_1xx = None;
+        }
         if let Ok(mut resp) = req.create_response(488, "Not Acceptable Here") {
             if let Ok(mut to) = resp.to() {
                 to.tag = Some(local_tag.to_string());
@@ -2573,6 +2882,10 @@ impl UserAgent {
             call.session_refresh_at = None;
             call.session_expire_at = None;
             call.cancel_deadline = None;
+            call.pending_reliable_1xx = None;
+            call.pending_glare_retry = None;
+            call.awaiting_ack = None;
+            call.awaiting_ack_sdp = None;
             match auth_retry {
                 Some((code, hdr_val)) => call.bye_auth.record_retry(code, hdr_val),
                 None => call.bye_auth.reset(),
@@ -2625,7 +2938,7 @@ impl UserAgent {
                     self.on_server_request(tx_id, request, now);
                 }
                 TransactionEvent::AckFor2xx(ack) => {
-                    self.on_ack_for_2xx(ack);
+                    self.on_ack_for_2xx(ack, now);
                 }
                 TransactionEvent::ServerAckReceived(_) => {}
                 TransactionEvent::ClientProvisional { tx_id, response } => {
@@ -2843,32 +3156,53 @@ impl UserAgent {
                 }
                 return;
             };
-            let matched_old_cid = self
+            let matches: Vec<(String, CallDirection, CallState)> = self
                 .calls
                 .iter()
-                .find(|(_, existing)| {
+                .filter(|(_, existing)| {
                     existing.call_id == rep.call_id
                         && existing.local_tag == rep.to_tag
                         && existing.remote_tag.as_deref() == Some(rep.from_tag.as_str())
                 })
-                .and_then(|(cid, existing)| {
-                    if rep.early_only
-                        && !matches!(
-                            existing.state,
-                            CallState::Calling | CallState::Incoming | CallState::Ringing
-                        )
-                    {
-                        None
-                    } else {
-                        Some(cid.clone())
-                    }
-                });
-            let Some(old_cid) = matched_old_cid else {
+                .map(|(cid, existing)| (cid.clone(), existing.direction, existing.state))
+                .collect();
+
+            if matches.len() != 1 {
                 if let Ok(resp) = request.create_response(481, "Call/Transaction Does Not Exist") {
                     self.send_uas_response(&tx_id, resp, None, now);
                 }
                 return;
-            };
+            }
+            let (old_cid, existing_dir, existing_state) = &matches[0];
+            match existing_state {
+                CallState::Terminating | CallState::Cancelling | CallState::Terminated => {
+                    if let Ok(resp) = request.create_response(603, "Decline") {
+                        self.send_uas_response(&tx_id, resp, None, now);
+                    }
+                    return;
+                }
+                CallState::Calling | CallState::Incoming | CallState::Ringing => {
+                    // RFC 3891 §3: an early dialog NOT initiated by this UA MUST be rejected with 481.
+                    if *existing_dir != CallDirection::Outbound {
+                        if let Ok(resp) =
+                            request.create_response(481, "Call/Transaction Does Not Exist")
+                        {
+                            self.send_uas_response(&tx_id, resp, None, now);
+                        }
+                        return;
+                    }
+                }
+                CallState::Established | CallState::ReInviting => {
+                    // RFC 3891 §3: confirmed dialog with `early-only` MUST be rejected with 486 Busy Here.
+                    if rep.early_only {
+                        if let Ok(resp) = request.create_response(486, "Busy Here") {
+                            self.send_uas_response(&tx_id, resp, None, now);
+                        }
+                        return;
+                    }
+                }
+            }
+            let old_cid = old_cid.clone();
             let _ = self.hangup_with_reason(
                 &old_cid,
                 Some(ReasonHeader::sip(200, "Call replaced")),
@@ -2934,7 +3268,7 @@ impl UserAgent {
                 .as_ref()
                 .is_some_and(|s| is_remote_hold(s.direction)),
             local_rseq: 0,
-            pending_reliable_rseq: None,
+            pending_reliable_1xx: None,
             last_remote_rseq: None,
             session_expires_secs: None,
             min_se_secs: self.config.min_se_secs.max(1),
@@ -2944,6 +3278,8 @@ impl UserAgent {
             session_timer_retries: 0,
             cancel_deadline: None,
             pending_reinvite_rollback: None,
+            pending_glare_retry: None,
+            glare_attempts: 0,
             replaces_header: None,
             active_invite_tx: None,
             active_invite_req: None,
@@ -2965,6 +3301,7 @@ impl UserAgent {
             info_auth: AuthRetryState::default(),
             last_ack_for_2xx: None,
             awaiting_ack: None,
+            awaiting_ack_sdp: None,
         };
         self.calls.insert(call_id.clone(), call);
 
@@ -3001,8 +3338,111 @@ impl UserAgent {
         }
 
         let Some(remote_sdp) = parse_optional_sdp(&request.body) else {
-            if let Ok(resp) = request.create_response(488, "Not Acceptable Here") {
-                self.send_uas_response(&tx_id, resp, local_tag.as_deref(), now);
+            if !request.body.is_empty() {
+                if let Ok(resp) = request.create_response(488, "Not Acceptable Here") {
+                    self.send_uas_response(&tx_id, resp, local_tag.as_deref(), now);
+                }
+                return;
+            }
+            // RFC 3261 §14.1: delayed offer re-INVITE — send current local SDP offer in 200 OK,
+            // then apply remote SDP answer upon ACK.
+            let Ok(srtp_mode) = self.config.effective_srtp_mode() else {
+                if let Ok(resp) = request.create_response(488, "Not Acceptable Here") {
+                    self.send_uas_response(&tx_id, resp, local_tag.as_deref(), now);
+                }
+                return;
+            };
+            if self
+                .calls
+                .get(call_id)
+                .is_some_and(|c| c.local_crypto.is_empty())
+                && matches!(srtp_mode, SrtpMode::SdesOptional | SrtpMode::SdesRequired)
+            {
+                let cands = self.generate_sdes_candidates(call_id);
+                if let Some(c) = self.calls.get_mut(call_id) {
+                    c.local_crypto = cands;
+                }
+            }
+            let Some((local_rtp_port, sdp_sid, sdp_version, dir, codecs, local_crypto)) =
+                self.calls.get_mut(call_id).map(|c| {
+                    c.sdp_version += 1;
+                    let dir = if c.local_hold && c.remote_hold {
+                        Direction::Inactive
+                    } else if c.local_hold {
+                        Direction::SendOnly
+                    } else {
+                        Direction::SendRecv
+                    };
+                    // RFC 3261 §14.1 / RFC 3264 §8: advertise full local codec capabilities in a delayed re-INVITE offer.
+                    let codecs = self.config.supported_codecs.clone();
+                    (
+                        c.local_rtp_port,
+                        c.sdp_session_id.clone(),
+                        c.sdp_version,
+                        dir,
+                        codecs,
+                        c.local_crypto.clone(),
+                    )
+                })
+            else {
+                return;
+            };
+            if local_rtp_port == 0 {
+                if let Ok(resp) = request.create_response(488, "Not Acceptable Here") {
+                    self.send_uas_response(&tx_id, resp, local_tag.as_deref(), now);
+                }
+                return;
+            }
+            let offer_sdp = self.build_local_offer_sdp(
+                srtp_mode,
+                &sdp_sid,
+                sdp_version,
+                &self.config.local_host,
+                local_rtp_port,
+                dir,
+                codecs,
+                &local_crypto,
+            );
+            let Ok(mut resp) = request.create_response(200, "OK") else {
+                return;
+            };
+            resp = resp.with_body("application/sdp", offer_sdp.to_string().into_bytes());
+            resp.headers.set(
+                "Contact",
+                NameAddr::new(self.config.contact_uri()).to_string(),
+            );
+            resp.headers.set("Allow", ALLOW_METHODS);
+            resp.headers.set("Supported", SUPPORTED_EXTENSIONS);
+            self.apply_uas_session_timer_to_response(call_id, &request, &mut resp, now);
+            self.ensure_response_to_tag(&mut resp, local_tag.as_deref());
+
+            if let Ok(events) = self
+                .transactions
+                .send_server_response(&tx_id, resp.clone(), now)
+            {
+                self.process_transaction_events(events, now);
+            }
+
+            let t1 = self
+                .config
+                .timers
+                .t1
+                .clamp(Duration::from_millis(1), Duration::from_secs(60));
+            if let Some(call) = self.calls.get_mut(call_id) {
+                call.local_sdp = Some(offer_sdp.clone());
+                if !offer_sdp.crypto.is_empty() {
+                    call.local_crypto = offer_sdp.crypto;
+                }
+                if let Ok(Some(c)) = request.contact() {
+                    call.remote_target = c.uri;
+                }
+                call.awaiting_ack_sdp = Some(PendingAckSdpKind::ReInvite);
+                call.awaiting_ack = Some(Pending2xxAck {
+                    response: resp,
+                    next_send_at: now + t1,
+                    interval: t1,
+                    deadline: now + t1.saturating_mul(64),
+                });
             }
             return;
         };
@@ -3091,6 +3531,7 @@ impl UserAgent {
             if let Ok(Some(c)) = request.contact() {
                 call.remote_target = c.uri;
             }
+            call.awaiting_ack_sdp = None;
             call.awaiting_ack = Some(Pending2xxAck {
                 response: resp,
                 next_send_at: now + t1,
@@ -3116,14 +3557,23 @@ impl UserAgent {
     }
 
     fn on_inbound_cancel(&mut self, tx_id: TransactionId, request: SipRequest, now: Instant) {
-        let cancel_branch = request.top_via().ok().and_then(|v| v.branch);
+        let top_via = request.top_via().ok();
+        let cancel_branch = top_via.as_ref().and_then(|v| v.branch.clone());
+        let cancel_sent_by = top_via
+            .as_ref()
+            .map(|v| crate::transaction::normalize_sent_by(&v.sent_by));
         let call_id = request.call_id().ok().map(str::to_string);
 
         let matching_call = call_id.and_then(|cid| {
             let call = self.calls.get(&cid)?;
+            let inv_sent_by = call
+                .inbound_invite_tx
+                .as_ref()
+                .and_then(|t| t.sent_by.as_deref());
             if call.direction == CallDirection::Inbound
                 && matches!(call.state, CallState::Incoming | CallState::Ringing)
                 && call.inbound_invite_branch.as_deref() == cancel_branch.as_deref()
+                && inv_sent_by == cancel_sent_by.as_deref()
             {
                 Some((cid, call.local_tag.clone()))
             } else {
@@ -3141,7 +3591,8 @@ impl UserAgent {
         }
 
         if let Some((cid, local_tag)) = matching_call {
-            if let Some(call) = self.calls.get(&cid) {
+            if let Some(call) = self.calls.get_mut(&cid) {
+                call.pending_reliable_1xx = None;
                 if let (Some(inv_tx), Some(inv_req)) =
                     (&call.inbound_invite_tx, &call.inbound_invite_req)
                 {
@@ -3214,6 +3665,8 @@ impl UserAgent {
                     self.send_uas_response(&tx_id, resp, Some(&local_tag), now);
                 }
                 if let Some(call) = self.calls.get_mut(&cid) {
+                    call.pending_reliable_1xx = None;
+                    call.pending_glare_retry = None;
                     if call.direction == CallDirection::Inbound
                         && matches!(call.state, CallState::Incoming | CallState::Ringing)
                     {
@@ -3355,6 +3808,24 @@ impl UserAgent {
             return;
         }
 
+        // RFC 3311 §5.2 / RFC 6337: reject UPDATE carrying SDP with 491 if an offer/answer is already pending.
+        let sdp_glare = self.calls.get(&call_id).is_some_and(|c| {
+            c.state == CallState::ReInviting
+                || c.active_update_req
+                    .as_ref()
+                    .is_some_and(|r| !r.body.is_empty())
+                || c.pending_reliable_1xx
+                    .as_ref()
+                    .is_some_and(|p| !p.response.body.is_empty())
+                || (c.direction == CallDirection::Outbound
+                    && c.state == CallState::Calling
+                    && c.remote_sdp.is_none())
+        });
+        if sdp_glare {
+            self.send_simple_server_response(&tx_id, &request, 491, "Request Pending", now);
+            return;
+        }
+
         let Some(remote_sdp) = parse_optional_sdp(&request.body) else {
             self.send_simple_server_response(&tx_id, &request, 488, "Not Acceptable Here", now);
             return;
@@ -3477,11 +3948,28 @@ impl UserAgent {
         };
 
         let valid_rack = self.calls.get_mut(&call_id).is_some_and(|c| {
-            let matches_pending = c.pending_reliable_rseq == Some(rack.rseq)
+            let matches_rseq = c
+                .pending_reliable_1xx
+                .as_ref()
+                .is_some_and(|p| p.rseq == rack.rseq)
                 || (c.local_rseq > 0 && rack.rseq <= c.local_rseq);
-            if matches_pending && rack.method == Method::Invite {
-                if c.pending_reliable_rseq == Some(rack.rseq) {
-                    c.pending_reliable_rseq = None;
+            let expected_inv_cseq = c
+                .pending_reliable_1xx
+                .as_ref()
+                .map(|p| p.invite_cseq)
+                .or_else(|| {
+                    c.inbound_invite_req
+                        .as_ref()
+                        .and_then(|r| r.cseq().ok())
+                        .map(|cs| cs.seq)
+                });
+            if matches_rseq && rack.method == Method::Invite && expected_inv_cseq == Some(rack.cseq)
+            {
+                if c.pending_reliable_1xx
+                    .as_ref()
+                    .is_some_and(|p| p.rseq == rack.rseq)
+                {
+                    c.pending_reliable_1xx = None;
                 }
                 if let Ok(Some(contact)) = request.contact() {
                     c.remote_target = contact.uri;
@@ -3680,13 +4168,13 @@ impl UserAgent {
         });
     }
 
-    fn on_ack_for_2xx(&mut self, ack: SipRequest) {
-        let Ok(cid) = ack.call_id() else {
+    fn on_ack_for_2xx(&mut self, ack: SipRequest, now: Instant) {
+        let Ok(cid) = ack.call_id().map(str::to_string) else {
             return;
         };
         let ack_cseq = ack.cseq().ok().map(|c| c.seq);
         let ack_to_tag = ack.to().ok().and_then(|t| t.tag);
-        if let Some(call) = self.calls.get_mut(cid) {
+        let completed_kind = if let Some(call) = self.calls.get_mut(&cid) {
             let expected_cseq = call
                 .awaiting_ack
                 .as_ref()
@@ -3694,6 +4182,135 @@ impl UserAgent {
             let to_ok = ack_to_tag.as_deref() == Some(call.local_tag.as_str());
             if to_ok && expected_cseq.is_some() && ack_cseq == expected_cseq {
                 call.awaiting_ack = None;
+                call.awaiting_ack_sdp.take()
+            } else {
+                None
+            }
+        } else {
+            None
+        };
+
+        let Some(ack_kind) = completed_kind else {
+            return;
+        };
+
+        struct DelayedAckSdpOutcome {
+            local_sdp: SdpSession,
+            remote_sdp: SdpSession,
+            negotiated_codecs: Vec<RtpCodec>,
+            prev_remote_hold: bool,
+            new_remote_hold: bool,
+            local_hold: bool,
+        }
+
+        // Complete RFC 3261 §13.2.1 delayed offer negotiation using the SDP answer in ACK.
+        let sdp_result: Result<DelayedAckSdpOutcome, ()> = (|| {
+            let remote_sdp = parse_optional_sdp(&ack.body).ok_or(())?;
+            if remote_sdp.audio_port == 0 {
+                return Err(());
+            }
+            let local_sdp = self
+                .calls
+                .get(&cid)
+                .and_then(|c| c.local_sdp.clone())
+                .ok_or(())?;
+            let effective_srtp = self
+                .config
+                .effective_srtp_mode()
+                .unwrap_or(SrtpMode::Disabled);
+            let srtp = resolve_outbound_answer_srtp(&local_sdp, &remote_sdp, effective_srtp)
+                .map_err(|_| ())?;
+            let has_common_audio = remote_sdp.codecs.iter().any(|ac| {
+                !ac.is_comfort_noise()
+                    && !ac.encoding_name.eq_ignore_ascii_case("telephone-event")
+                    && local_sdp.codecs.iter().any(|lc| {
+                        lc.encoding_name.eq_ignore_ascii_case(&ac.encoding_name)
+                            && lc.clock_rate == ac.clock_rate
+                    })
+            });
+            if !has_common_audio {
+                return Err(());
+            }
+            let negotiated = intersect_answer_codecs(&local_sdp, &remote_sdp);
+            let Some(call) = self.calls.get_mut(&cid) else {
+                return Err(());
+            };
+            if let Some(NegotiatedSrtp::Sdes {
+                suite,
+                local_key_salt,
+                ..
+            }) = &srtp
+            {
+                if let Some(ans_c) = remote_sdp.crypto.first() {
+                    call.local_crypto =
+                        vec![SdesCryptoAttr::new(ans_c.tag, *suite, *local_key_salt)];
+                }
+            }
+            let prev_remote_hold = call.remote_hold;
+            let new_remote_hold = is_remote_hold(remote_sdp.direction);
+            call.negotiated_srtp = srtp;
+            call.remote_sdp = Some(remote_sdp.clone());
+            call.remote_hold = new_remote_hold;
+            call.negotiated_codecs = negotiated.clone();
+            Ok(DelayedAckSdpOutcome {
+                local_sdp,
+                remote_sdp,
+                negotiated_codecs: negotiated,
+                prev_remote_hold,
+                new_remote_hold,
+                local_hold: call.local_hold,
+            })
+        })();
+
+        match sdp_result {
+            Ok(DelayedAckSdpOutcome {
+                local_sdp,
+                remote_sdp,
+                negotiated_codecs,
+                prev_remote_hold,
+                new_remote_hold,
+                local_hold,
+            }) => match ack_kind {
+                PendingAckSdpKind::InitialInvite => {
+                    self.pending_events.push_back(UaEvent::CallEstablished {
+                        call_id: cid.clone(),
+                        local_sdp,
+                        remote_sdp,
+                        negotiated_codecs,
+                    });
+                    if new_remote_hold {
+                        self.pending_events.push_back(UaEvent::CallHoldChanged {
+                            call_id: cid,
+                            local_hold,
+                            remote_hold: new_remote_hold,
+                        });
+                    }
+                }
+                PendingAckSdpKind::ReInvite => {
+                    self.pending_events.push_back(UaEvent::CallMediaUpdated {
+                        call_id: cid.clone(),
+                        local_sdp,
+                        remote_sdp,
+                        negotiated_codecs,
+                    });
+                    if new_remote_hold != prev_remote_hold {
+                        self.pending_events.push_back(UaEvent::CallHoldChanged {
+                            call_id: cid,
+                            local_hold,
+                            remote_hold: new_remote_hold,
+                        });
+                    }
+                }
+            },
+            Err(()) => {
+                let reason = ReasonHeader::sip(488, "Not Acceptable Here");
+                let _ = self.send_bye_for_call_with_reason(&cid, None, Some(reason.clone()), now);
+                self.terminate_call_with_reason(
+                    &cid,
+                    Some(488),
+                    "Invalid or missing SDP answer in ACK".to_string(),
+                    Some(reason),
+                );
             }
         }
     }
@@ -4032,6 +4649,8 @@ impl UserAgent {
                 call.pending_cancel_reason = None;
                 call.cancel_deadline = None;
                 call.pending_reinvite_rollback = None;
+                call.pending_glare_retry = None;
+                call.glare_attempts = 0;
                 call.session_timer_retries = 0;
 
                 if let Ok(to) = response.to() {
@@ -4297,8 +4916,64 @@ impl UserAgent {
             }
         }
 
+        if is_reinvite && code == 491 {
+            // RFC 3261 §14.1: retry re-INVITE after backoff (2.1-4.0s Call-ID owner, 0.1-2.0s non-owner).
+            let seq_seed = self.id_counter;
+            let eff_seed = effective_instance_seed(&self.config);
+            let scheduled = if let Some(call) = self.calls.get_mut(call_id) {
+                if call.glare_attempts < MAX_GLARE_RETRIES && !call.pending_cancel {
+                    let desired_local_hold = call.local_hold;
+                    let ip = call.local_sdp.as_ref().map_or_else(
+                        || self.config.local_host.clone(),
+                        |s| s.connection_ip.clone(),
+                    );
+                    let rtp_port = call.local_rtp_port;
+                    let cseq_val = u64::from(call.local_cseq);
+                    call.active_invite_tx = None;
+                    call.active_invite_req = None;
+                    call.state = CallState::Established;
+                    if let Some(rb) = call.pending_reinvite_rollback.take() {
+                        call.local_sdp = rb.prev_local_sdp;
+                        call.sdp_version = rb.prev_sdp_version;
+                        call.local_hold = rb.prev_local_hold;
+                        call.local_rtp_port = rb.prev_local_rtp_port;
+                    }
+                    let h = splitmix64(
+                        eff_seed
+                            ^ seq_seed.wrapping_mul(0x9e37_79b9_7f4a_7c15)
+                            ^ cseq_val.wrapping_mul(0xbf58_476d_1ce4_e5b9),
+                    );
+                    let delay_ms = if call.direction == CallDirection::Outbound {
+                        2100 + (h % 1901)
+                    } else {
+                        100 + (h % 1901)
+                    };
+                    call.glare_attempts = call.glare_attempts.saturating_add(1);
+                    call.pending_glare_retry = Some(PendingGlareRetry {
+                        due_at: now + Duration::from_millis(delay_ms),
+                        ip,
+                        rtp_port,
+                        desired_local_hold,
+                        attempts: call.glare_attempts,
+                    });
+                    true
+                } else {
+                    false
+                }
+            } else {
+                false
+            };
+            if scheduled {
+                return;
+            }
+        }
+
         if is_reinvite {
             // Re-INVITE rejection does not tear down an established dialog (RFC 3261 §14.1).
+            if let Some(call) = self.calls.get_mut(call_id) {
+                call.pending_glare_retry = None;
+                call.glare_attempts = 0;
+            }
             self.rollback_reinvite(call_id);
             self.pending_events
                 .push_back(UaEvent::ProtocolWarning(format!(
@@ -5024,6 +5699,37 @@ impl UserAgent {
         }
         Err(last_err.unwrap_or(SipError::MissingHeader(missing_hdr)))
     }
+}
+
+fn fallback_instance_tag(config: &UaConfig) -> u32 {
+    let mut hash: u32 = 0x811c_9dc5;
+    for b in config
+        .local_host
+        .as_bytes()
+        .iter()
+        .chain(b"|")
+        .chain(config.username.as_bytes())
+        .chain(&config.local_sip_port.to_le_bytes())
+    {
+        hash ^= u32::from(*b);
+        hash = hash.wrapping_mul(0x0100_0193);
+    }
+    hash.max(1)
+}
+
+fn effective_instance_seed(config: &UaConfig) -> u64 {
+    if config.instance_seed == 0 {
+        u64::from(fallback_instance_tag(config))
+    } else {
+        config.instance_seed
+    }
+}
+
+fn splitmix64(mut x: u64) -> u64 {
+    x = x.wrapping_add(0x9e37_79b9_7f4a_7c15);
+    x = (x ^ (x >> 30)).wrapping_mul(0xbf58_476d_1ce4_e5b9);
+    x = (x ^ (x >> 27)).wrapping_mul(0x94d0_49bb_1331_11eb);
+    x ^ (x >> 31)
 }
 
 fn has_header_token(headers: &crate::sip::Headers, name: &str, token: &str) -> bool {

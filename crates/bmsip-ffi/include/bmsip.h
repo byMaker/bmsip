@@ -80,6 +80,10 @@ int32_t bmsip_client_attended_transfer(
     const char *call_id,
     const char *target_call_id
 );
+int32_t bmsip_client_set_active_call(
+    const BmsipClientHandle *client,
+    const char *call_id
+);
 int32_t bmsip_client_send_dtmf(
     const BmsipClientHandle *client,
     const char *call_id,

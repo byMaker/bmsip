@@ -3068,3 +3068,169 @@ fn p2_worker_panic_is_caught_emits_stopped_and_closes_command_channel() {
     let _ = uac.shutdown();
     uas.shutdown().unwrap();
 }
+
+#[test]
+fn p2_shutdown_flushes_bye_unregister_and_suspend_pauses_timers() {
+    let mock_srv = UdpSocket::bind("127.0.0.1:0").unwrap();
+    mock_srv
+        .set_read_timeout(Some(Duration::from_millis(50)))
+        .unwrap();
+    let srv_addr = mock_srv.local_addr().unwrap();
+
+    // 1. Verify Suspend pauses active TransactionManager retransmits until Resume.
+    let mut cfg = UaConfig::new(
+        "alice",
+        "pw",
+        "127.0.0.1",
+        SipUri::parse(&format!("sip:{srv_addr}")).unwrap(),
+        "127.0.0.1",
+        0,
+    );
+    cfg.session_expires_secs = None;
+    let (port, _) = WavAudioPort::new(WavPcm16::new(8_000, vec![0i16; 1_600]), true);
+    let eng = SipEngine::spawn(
+        EngineConfig::new(cfg, srv_addr, IpAddr::V4(Ipv4Addr::LOCALHOST), 0),
+        Box::new(port),
+    )
+    .unwrap();
+
+    let recv_request = |sock: &UdpSocket,
+                        buf: &mut [u8],
+                        expected: bmsip_core::sip::Method,
+                        timeout: Duration|
+     -> (bmsip_core::sip::SipRequest, SocketAddr) {
+        let dl = Instant::now() + timeout;
+        loop {
+            match sock.recv_from(buf) {
+                Ok((len, src)) => {
+                    if let Ok(bmsip_core::sip::SipMessage::Request(req)) =
+                        bmsip_core::sip::SipMessage::parse(&buf[..len])
+                    {
+                        if req.method == expected {
+                            return (req, src);
+                        }
+                    }
+                }
+                Err(err)
+                    if matches!(
+                        err.kind(),
+                        std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut
+                    ) && Instant::now() < dl =>
+                {
+                    continue;
+                }
+                Err(err) => panic!("mock_srv recv_from failed within {timeout:?}: {err}"),
+            }
+            assert!(
+                Instant::now() < dl,
+                "timed out waiting for {expected} on mock_srv"
+            );
+        }
+    };
+
+    eng.send_command(EngineCommand::Register).unwrap();
+    let mut buf = [0u8; 4096];
+    let (_reg_req, from_addr) = recv_request(
+        &mock_srv,
+        &mut buf,
+        bmsip_core::sip::Method::Register,
+        Duration::from_secs(2),
+    );
+
+    // Suspend BEFORE answering REGISTER so UDP NICT Timer E would fire at 500 ms if awake.
+    eng.send_command(EngineCommand::Suspend).unwrap();
+    assert!(wait_for_engine_event(&eng, Duration::from_secs(2), |e| {
+        matches!(e, EngineEvent::Suspended)
+    })
+    .is_some());
+
+    // Drain any single in-flight retransmit, then assert silence for 700 ms while suspended.
+    thread::sleep(Duration::from_millis(100));
+    while mock_srv.recv_from(&mut buf).is_ok() {}
+    thread::sleep(Duration::from_millis(700));
+    assert!(
+        mock_srv.recv_from(&mut buf).is_err(),
+        "suspended engine should not emit timer retransmissions"
+    );
+
+    // Resume and answer REGISTER 200 OK.
+    eng.send_command(EngineCommand::Resume).unwrap();
+    assert!(wait_for_engine_event(&eng, Duration::from_secs(2), |e| {
+        matches!(e, EngineEvent::Resumed { .. })
+    })
+    .is_some());
+    let (reg2, _) = recv_request(
+        &mock_srv,
+        &mut buf,
+        bmsip_core::sip::Method::Register,
+        Duration::from_secs(2),
+    );
+    let mut r200 = reg2.create_response(200, "OK").unwrap();
+    r200.headers.set("Expires", "300");
+    r200.headers.set("To", "<sip:alice@127.0.0.1>;tag=srv-r1");
+    mock_srv.send_to(&r200.to_bytes(), from_addr).unwrap();
+    assert!(wait_for_engine_event(&eng, Duration::from_secs(2), |e| {
+        matches!(
+            e,
+            EngineEvent::RegistrationChanged(RegistrationState::Registered { .. })
+        )
+    })
+    .is_some());
+
+    // Dial an outbound call and establish it so Shutdown has an active call + registration to clean up.
+    eng.send_command(EngineCommand::Dial {
+        target_uri: SipUri::parse(&format!("sip:bob@{srv_addr}")).unwrap(),
+    })
+    .unwrap();
+    let (inv, inv_from) = recv_request(
+        &mock_srv,
+        &mut buf,
+        bmsip_core::sip::Method::Invite,
+        Duration::from_secs(2),
+    );
+    let mut inv200 = inv.create_response(200, "OK").unwrap().with_body(
+        "application/sdp",
+        bmsip_core::sdp::SdpSession::new("bob", "1", "127.0.0.1", 49000, vec![RtpCodec::pcmu()])
+            .to_string()
+            .into_bytes(),
+    );
+    inv200.headers.set("To", "<sip:bob@127.0.0.1>;tag=bob-t1");
+    inv200
+        .headers
+        .set("Contact", format!("<sip:bob@{srv_addr}>"));
+    mock_srv.send_to(&inv200.to_bytes(), inv_from).unwrap();
+    assert!(wait_for_engine_event(&eng, Duration::from_secs(2), |e| {
+        matches!(e, EngineEvent::CallEstablished { .. })
+    })
+    .is_some());
+
+    // Drain ACK.
+    while mock_srv.recv_from(&mut buf).is_ok() {}
+
+    // 2. Shutdown MUST flush both BYE for the active call and REGISTER Expires: 0.
+    eng.shutdown().unwrap();
+
+    let mut saw_bye = false;
+    let mut saw_unreg = false;
+    let dl = Instant::now() + Duration::from_secs(2);
+    while Instant::now() < dl && !(saw_bye && saw_unreg) {
+        if let Ok((n, _)) = mock_srv.recv_from(&mut buf) {
+            if let Ok(bmsip_core::sip::SipMessage::Request(req)) =
+                bmsip_core::sip::SipMessage::parse(&buf[..n])
+            {
+                if req.method == bmsip_core::sip::Method::Bye {
+                    saw_bye = true;
+                } else if req.method == bmsip_core::sip::Method::Register
+                    && req.headers.get("Expires") == Some("0")
+                {
+                    saw_unreg = true;
+                }
+            }
+        }
+    }
+    assert!(saw_bye, "expected graceful Shutdown to flush BYE");
+    assert!(
+        saw_unreg,
+        "expected graceful Shutdown to flush REGISTER Expires: 0"
+    );
+}

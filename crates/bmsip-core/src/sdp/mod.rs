@@ -570,6 +570,9 @@ pub struct SdpSession {
     pub codecs: Vec<RtpCodec>,
     pub ptime: Option<u32>,
     pub crypto: Vec<SdesCryptoAttr>,
+    pub rtcp_port: Option<u16>,
+    pub rtcp_ip: Option<String>,
+    pub rtcp_mux: bool,
 }
 
 impl SdpSession {
@@ -593,6 +596,9 @@ impl SdpSession {
             codecs,
             ptime: Some(20),
             crypto: Vec::new(),
+            rtcp_port: None,
+            rtcp_ip: None,
+            rtcp_mux: false,
         }
     }
 
@@ -615,6 +621,9 @@ impl SdpSession {
         let mut rtpmaps: Vec<(u8, String, u32, Option<u8>)> = Vec::new();
         let mut fmtps: Vec<(u8, String)> = Vec::new();
         let mut crypto: Vec<SdesCryptoAttr> = Vec::new();
+        let mut rtcp_port: Option<u16> = None;
+        let mut rtcp_ip: Option<String> = None;
+        let mut rtcp_mux = false;
 
         for raw_line in text.lines() {
             let line = raw_line.trim();
@@ -715,6 +724,26 @@ impl SdpSession {
                             if let Ok(c) = SdesCryptoAttr::parse(rest) {
                                 crypto.push(c);
                             }
+                        } else if attr.eq_ignore_ascii_case("rtcp-mux") {
+                            rtcp_mux = true;
+                        } else if let Some(rest) = strip_prefix_ci(attr, "rtcp:") {
+                            let parts: Vec<&str> = rest.split_whitespace().collect();
+                            if let Some(port) = parts.first().and_then(|p| p.parse::<u16>().ok()) {
+                                if port > 0 {
+                                    rtcp_port = Some(port);
+                                    if parts.len() >= 4
+                                        && parts[1].eq_ignore_ascii_case("IN")
+                                        && (parts[2].eq_ignore_ascii_case("IP4")
+                                            || parts[2].eq_ignore_ascii_case("IP6"))
+                                    {
+                                        if let Some(ip) =
+                                            parts[3].split('/').next().filter(|s| !s.is_empty())
+                                        {
+                                            rtcp_ip = Some(ip.to_string());
+                                        }
+                                    }
+                                }
+                            }
                         }
                     }
                 }
@@ -769,6 +798,9 @@ impl SdpSession {
             codecs,
             ptime,
             crypto,
+            rtcp_port,
+            rtcp_ip,
+            rtcp_mux,
         })
     }
 }
@@ -817,6 +849,18 @@ impl fmt::Display for SdpSession {
 
         for c in &self.crypto {
             write!(f, "a=crypto:{c}\r\n")?;
+        }
+
+        if let Some(rp) = self.rtcp_port {
+            if let Some(rip) = &self.rtcp_ip {
+                let rtcp_addr_type = if rip.contains(':') { "IP6" } else { "IP4" };
+                write!(f, "a=rtcp:{rp} IN {rtcp_addr_type} {rip}\r\n")?;
+            } else {
+                write!(f, "a=rtcp:{rp}\r\n")?;
+            }
+        }
+        if self.rtcp_mux {
+            write!(f, "a=rtcp-mux\r\n")?;
         }
 
         if let Some(ptime) = self.ptime {
@@ -971,6 +1015,9 @@ pub fn negotiate_offer_answer_with_srtp(
         codecs: negotiated.clone(),
         ptime: offer.ptime.or(Some(20)),
         crypto: answer_crypto,
+        rtcp_port: None,
+        rtcp_ip: None,
+        rtcp_mux: offer.rtcp_mux,
     };
 
     Ok((answer, negotiated, negotiated_srtp))
@@ -1469,5 +1516,41 @@ mod tests {
             )
             .is_err());
         }
+    }
+
+    #[test]
+    fn parses_serializes_and_negotiates_rtcp_port_and_rtcp_mux() {
+        let raw = "\
+            v=0\r\n\
+            o=alice 10 10 IN IP4 192.0.2.10\r\n\
+            s=Call\r\n\
+            c=IN IP4 192.0.2.10\r\n\
+            t=0 0\r\n\
+            m=audio 4004 RTP/AVP 0\r\n\
+            a=rtpmap:0 PCMU/8000\r\n\
+            a=rtcp:4009 IN IP4 192.0.2.11\r\n\
+            a=rtcp-mux\r\n";
+        let offer = SdpSession::parse(raw).unwrap();
+        assert_eq!(offer.rtcp_port, Some(4009));
+        assert_eq!(offer.rtcp_ip.as_deref(), Some("192.0.2.11"));
+        assert!(offer.rtcp_mux);
+
+        let serialized = offer.to_string();
+        let reparsed = SdpSession::parse(&serialized).unwrap();
+        assert_eq!(reparsed.rtcp_port, Some(4009));
+        assert_eq!(reparsed.rtcp_ip.as_deref(), Some("192.0.2.11"));
+        assert!(reparsed.rtcp_mux);
+
+        let (ans, _, _) = negotiate_offer_answer_with_srtp(
+            &reparsed,
+            &[RtpCodec::pcmu()],
+            "10.0.0.2",
+            50000,
+            SrtpMode::Disabled,
+            &[],
+        )
+        .unwrap();
+        assert!(ans.rtcp_mux);
+        assert_eq!(ans.rtcp_port, None);
     }
 }

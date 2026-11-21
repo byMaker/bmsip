@@ -488,6 +488,29 @@ pub unsafe extern "C" fn bmsip_client_attended_transfer(
     })
 }
 
+/// Switches primary audio focus (`AudioPort` capture/playout) to `call_id` (`0` on success, `-1` on error).
+///
+/// # Safety
+/// `client` and `call_id` must be valid non-null pointers.
+#[no_mangle]
+pub unsafe extern "C" fn bmsip_client_set_active_call(
+    client: *const BmsipClientHandle,
+    call_id: *const c_char,
+) -> i32 {
+    ffi_guard_i32(|| {
+        let (Some(c), Some(cid)) = (unsafe { client_ref(client) }, unsafe {
+            cstr_to_string(call_id)
+        }) else {
+            return -1;
+        };
+        if c.set_active_call(cid).is_ok() {
+            0
+        } else {
+            -1
+        }
+    })
+}
+
 /// Transmits an RFC 4733 DTMF digit (`'0'..'9'`, `'*'`, `'#'`, `'A'..'D'`).
 ///
 /// # Safety

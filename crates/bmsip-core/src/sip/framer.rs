@@ -337,11 +337,24 @@ fn parse_stream_content_length(header_bytes: &[u8]) -> Result<usize, SipError> {
         };
         let key = name.trim();
         if key.eq_ignore_ascii_case("Content-Length") || key.eq_ignore_ascii_case("l") {
-            let parsed = value.trim().parse::<usize>().map_err(|_| {
-                SipError::ParseError(format!("invalid stream Content-Length '{}'", value.trim()))
+            let trimmed = value.trim();
+            if trimmed.is_empty() || !trimmed.bytes().all(|b| b.is_ascii_digit()) {
+                return Err(SipError::ParseError(format!(
+                    "invalid stream Content-Length '{trimmed}'"
+                )));
+            }
+            let parsed = trimmed.parse::<usize>().map_err(|_| {
+                SipError::ParseError(format!("invalid stream Content-Length '{trimmed}'"))
             })?;
-            found = Some(parsed);
-            break;
+            if let Some(prev) = found {
+                if prev != parsed {
+                    return Err(SipError::ParseError(format!(
+                        "conflicting duplicate Content-Length headers ({prev} vs {parsed})"
+                    )));
+                }
+            } else {
+                found = Some(parsed);
+            }
         }
     }
 
@@ -461,5 +474,26 @@ mod tests {
         assert!(matches!(first, StreamFrame::Message(_)));
         assert!(framer.next_frame().is_err());
         assert_eq!(framer.buffered_len(), 0);
+
+        // Reject signed Content-Length and conflicting duplicate headers; accept identical duplicates.
+        let plus_cl = b"OPTIONS sip:bob@10.0.0.2 SIP/2.0\r\n\
+            Content-Length: +5\r\n\r\nhello";
+        framer.push(plus_cl).unwrap();
+        assert!(framer.next_frame().is_err());
+
+        let conflict_cl = b"OPTIONS sip:bob@10.0.0.2 SIP/2.0\r\n\
+            Content-Length: 5\r\n\
+            l: 0\r\n\r\nhello";
+        framer.push(conflict_cl).unwrap();
+        assert!(framer.next_frame().is_err());
+
+        let matching_dup = b"OPTIONS sip:bob@10.0.0.2 SIP/2.0\r\n\
+            Content-Length: 2\r\n\
+            l: 2\r\n\r\nhi";
+        framer.push(matching_dup).unwrap();
+        assert!(matches!(
+            framer.next_frame().unwrap(),
+            Some(StreamFrame::Message(m)) if m == matching_dup
+        ));
     }
 }

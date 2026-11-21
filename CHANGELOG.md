@@ -5,6 +5,36 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.16.0] - 2026-11-21
+
+### Added
+- **SDP RTCP Attributes & Multiplexing (`bmsip-core`, `bmsip-engine`):**
+  - Added `SdpSession::rtcp_port`, `SdpSession::rtcp_ip`, and `SdpSession::rtcp_mux` supporting RFC 3605 `a=rtcp:<port> [IN IP4/IP6 <addr>]` and RFC 5761 `a=rtcp-mux` parsing, formatting, and offer/answer propagation.
+  - Wired `resolve_remote_rtcp_addr` and multiplexed RTP/RTCP socket receive demultiplexing into [`engine.rs`](crates/bmsip-engine/src/engine.rs).
+- **Delayed SDP Offer Support (`bmsip-core`):**
+  - Supported bodyless inbound `INVITE` (RFC 3261 §13.2.1) and bodyless inbound `re-INVITE` (RFC 3261 §14.1): UAS includes the local SDP offer (advertising full `supported_codecs` on `re-INVITE`) in `200 OK` and completes media/SRTP negotiation from the `ACK` SDP answer (terminating cleanly with `BYE` and `Reason: SIP ;cause=488` if the `ACK` lacks a compatible SDP answer).
+- **Transaction Keying, Probation & FFI Focus Parity (`bmsip-core`, `bmsip-media`, `bmsip-ffi`):**
+  - Added `TransactionId::sent_by` (`TransactionId::client` / `TransactionId::server`, RFC 3261 §17.2.3) and `UserAgent::active_call_ids()`.
+  - Added `SeqStatus` (`Accepted`, `Resynced`, `ProbationRejected`) in `bmsip-media` and exported `BmsipClient::set_active_call` ([`bmsip.udl`](crates/bmsip-ffi/src/bmsip.udl)) plus `bmsip_client_set_active_call` ([`bmsip.h`](crates/bmsip-ffi/include/bmsip.h)).
+
+### Fixed
+- **Strict `Content-Length`, Deterministic Seed Fallback & Transaction Matching (`bmsip-core`):**
+  - Enforced strict RFC 3261 `1*DIGIT` `Content-Length` validation (rejecting leading `+` signs and conflicting duplicate headers while handling unfolded continuations consistently) across both [`framer.rs`](crates/bmsip-core/src/sip/framer.rs) and [`message.rs`](crates/bmsip-core/src/sip/message.rs).
+  - Normalized `TransactionId::server` `Via sent-by` and included `sent_by` matching in inbound `CANCEL` handling ([`transaction/mod.rs`](crates/bmsip-core/src/transaction/mod.rs), [`dialog/mod.rs`](crates/bmsip-core/src/dialog/mod.rs)).
+  - Added deterministic FNV-1a host/username fallback seeding (`effective_instance_seed`) so distinct `UserAgent` instances on the same port with `instance_seed == 0` generate distinct `Call-ID`, tag, branch, and `cnonce` values.
+- **`100rel`, Glare Backoff Retry, `UPDATE` & `Replaces` Edge Cases (`bmsip-core`):**
+  - Added RFC 3262 reliable `1xx` retransmissions starting at `T1` up to `64 * T1` (`504 Server Time-out` on PRACK timeout), blocked sending a second reliable `1xx` while one awaits `PRACK`, and validated `RAck` `CSeq` numbers in `on_inbound_prack`.
+  - Implemented RFC 3261 §14.1 automatic `491 Request Pending` backoff retry (`2.1–4.0 s` Call-ID owner, `0.1–2.0 s` non-owner, up to `MAX_GLARE_RETRIES = 3`) on outbound `re-INVITE`, returned `491` on inbound `UPDATE` during pending SDP offers, and guarded `send_update` against `local_rtp_port == 0`.
+  - Enforced RFC 3891 §3 `Replaces` status codes (`481` for missing/ambiguous or non-UAC-initiated early dialogs, `486 Busy Here` for confirmed dialogs with `;early-only`, and `603 Decline` for terminating/cancelling/terminated dialogs).
+- **RFC 3550 Appendix A.1 Sequence & Unencrypted SSRC Probation (`bmsip-media`):**
+  - Enforced `MAX_DROPOUT = 3000` / `MAX_MISORDER = 100` 2-packet `bad_seq` resynchronization (resetting `AdaptiveJitterBuffer` on `SeqStatus::Resynced`) in [`rtcp.rs`](crates/bmsip-media/src/rtcp.rs) and required 2 sequential packets before switching SSRC on unencrypted RTP streams in [`session.rs`](crates/bmsip-media/src/session.rs) (authenticated SRTP continues immediate verified SSRC switching).
+- **TLS SNI, Timeouts, LRU Maps, IPv6, `Suspend` Sleep & Graceful `Shutdown` (`bmsip-engine`, `bmsip-ffi`):**
+  - Fixed RFC 5922 §7.2 per-target TLS SNI/hostname resolution (`peer_tls_hosts`) and bracketed/bare IPv6 `IpAddr` handling in [`tls.rs`](crates/bmsip-engine/src/tls.rs) and [`bmsip-ffi`](crates/bmsip-ffi/src/client.rs).
+  - Added `TLS_HANDSHAKE_TIMEOUT` (`10 s`), non-registrar `STREAM_IDLE_TIMEOUT` (`180 s`), `UDP_WARN_MIN_INTERVAL` (`5 s`) warning rate limiting, IPv6 socket probing in [`transport.rs`](crates/bmsip-engine/src/transport.rs), LRU eviction on engine routing/DNS tables (`60 s` positive / `5 s` negative DNS TTL), best-effort `BYE`/`CANCEL` + `REGISTER Expires: 0` flush on `EngineCommand::Shutdown`, and full `Condvar::wait_while` worker sleep while `Suspended`.
+
+### Documentation
+- Synchronized `Cargo.toml`, `CHANGELOG.md`, `README.md`, `ARCHITECTURE.md`, `docs/SDK_GUIDE.md`, `docs/CODECS_AND_AUDIO.md`, and `docs/CLI_AND_TESTING.md` to `0.16.0`.
+
 ## [0.15.1] - 2026-11-21
 
 ### Fixed

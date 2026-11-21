@@ -120,6 +120,9 @@ interface BmsipClient {
     void attended_transfer(string call_id, string target_call_id);
 
     [Throws=FfiError]
+    void set_active_call(string call_id);
+
+    [Throws=FfiError]
     void send_dtmf(string call_id, string digit);
 
     [Throws=FfiError]

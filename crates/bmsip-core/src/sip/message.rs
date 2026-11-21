@@ -296,11 +296,8 @@ impl SipMessage {
             headers.add(trimmed_name, value);
         }
 
-        let body = match headers.get("Content-Length") {
-            Some(len_str) => {
-                let expected = len_str.trim().parse::<usize>().map_err(|_| {
-                    SipError::ParseError(format!("invalid Content-Length '{len_str}'"))
-                })?;
+        let body = match parse_message_content_length(&headers)? {
+            Some(expected) => {
                 if body_slice.len() < expected {
                     return Err(SipError::ParseError(format!(
                         "truncated SIP body: expected {expected} bytes, got {}",
@@ -444,6 +441,33 @@ fn split_head_and_body(raw: &[u8]) -> Result<(&[u8], &[u8]), SipError> {
     ))
 }
 
+fn parse_message_content_length(headers: &Headers) -> Result<Option<usize>, SipError> {
+    let mut found: Option<usize> = None;
+    for h in headers.iter() {
+        if h.name.eq_ignore_ascii_case("Content-Length") || h.name.eq_ignore_ascii_case("l") {
+            let trimmed = h.value.trim();
+            if trimmed.is_empty() || !trimmed.bytes().all(|b| b.is_ascii_digit()) {
+                return Err(SipError::ParseError(format!(
+                    "invalid Content-Length '{trimmed}'"
+                )));
+            }
+            let parsed = trimmed
+                .parse::<usize>()
+                .map_err(|_| SipError::ParseError(format!("invalid Content-Length '{trimmed}'")))?;
+            if let Some(prev) = found {
+                if prev != parsed {
+                    return Err(SipError::ParseError(format!(
+                        "conflicting duplicate Content-Length headers ({prev} vs {parsed})"
+                    )));
+                }
+            } else {
+                found = Some(parsed);
+            }
+        }
+    }
+    Ok(found)
+}
+
 fn serialize_sip_message(start_line: &str, headers: &Headers, body: &[u8]) -> Vec<u8> {
     let mut out = String::new();
     out.push_str(start_line);
@@ -451,7 +475,7 @@ fn serialize_sip_message(start_line: &str, headers: &Headers, body: &[u8]) -> Ve
 
     let mut wrote_content_length = false;
     for h in headers.iter() {
-        if h.name.eq_ignore_ascii_case("Content-Length") {
+        if h.name.eq_ignore_ascii_case("Content-Length") || h.name.eq_ignore_ascii_case("l") {
             if !wrote_content_length {
                 out.push_str(&format!("Content-Length: {}\r\n", body.len()));
                 wrote_content_length = true;
@@ -569,6 +593,10 @@ mod tests {
     fn rejects_truncated_body_and_garbage() {
         let truncated = b"INVITE sip:a@b SIP/2.0\r\nContent-Length: 50\r\n\r\nhi";
         assert!(SipMessage::parse(truncated).is_err());
+        let signed = b"INVITE sip:a@b SIP/2.0\r\nContent-Length: +2\r\n\r\nhi";
+        assert!(SipMessage::parse(signed).is_err());
+        let conflicting = b"INVITE sip:a@b SIP/2.0\r\nContent-Length: 2\r\nl: 5\r\n\r\nhello";
+        assert!(SipMessage::parse(conflicting).is_err());
         assert!(SipMessage::parse(b"").is_err());
         assert!(SipMessage::parse(b"\xff\xfe\xfd").is_err());
     }

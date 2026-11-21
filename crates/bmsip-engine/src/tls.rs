@@ -5,7 +5,7 @@
 #![forbid(unsafe_code)]
 
 use std::io::Cursor;
-use std::net::SocketAddr;
+use std::net::{IpAddr, SocketAddr};
 use std::sync::Arc;
 
 use rustls::client::danger::{HandshakeSignatureValid, ServerCertVerified, ServerCertVerifier};
@@ -179,36 +179,48 @@ pub(crate) fn build_server_config(
     Ok(Some(Arc::new(server_cfg)))
 }
 
-/// Resolves the RFC 5922 TLS `ServerName` from explicit override, SIP domain, or peer IP.
+/// Resolves the RFC 5922 TLS `ServerName` from explicit override, target URI host hint, registrar fallback domain, or peer IP.
 pub(crate) fn resolve_server_name(
     override_name: Option<&str>,
-    fallback_domain: &str,
+    peer_host_hint: Option<&str>,
+    fallback_domain: Option<&str>,
     dest: SocketAddr,
 ) -> Result<ServerName<'static>, EngineError> {
-    let candidate = override_name
-        .map(str::trim)
-        .filter(|s| !s.is_empty())
-        .or_else(|| {
-            let trimmed = fallback_domain.trim();
-            if trimmed.is_empty() {
-                None
-            } else {
-                Some(trimmed)
-            }
-        });
-
-    if let Some(name) = candidate {
-        let host_only = name
-            .trim_matches(['[', ']'])
-            .split(':')
-            .next()
-            .unwrap_or(name);
+    let candidates = [override_name, peer_host_hint, fallback_domain];
+    for raw in candidates.into_iter().flatten() {
+        let trimmed = raw.trim();
+        if trimmed.is_empty() {
+            continue;
+        }
+        let host_only = extract_host_only(trimmed);
+        if host_only.is_empty() {
+            continue;
+        }
+        if let Ok(ip) = host_only.parse::<IpAddr>() {
+            return Ok(ServerName::from(ip));
+        }
         if let Ok(sn) = ServerName::try_from(host_only.to_string()) {
             return Ok(sn);
         }
     }
 
     Ok(ServerName::from(dest.ip()))
+}
+
+fn extract_host_only(raw: &str) -> &str {
+    let trimmed = raw.trim();
+    if let Some(rest) = trimmed.strip_prefix('[') {
+        if let Some((bracketed_host, _)) = rest.split_once(']') {
+            return bracketed_host;
+        }
+    }
+    if trimmed.parse::<IpAddr>().is_ok() {
+        return trimmed;
+    }
+    if trimmed.matches(':').count() == 1 {
+        return trimmed.rsplit_once(':').map_or(trimmed, |(h, _)| h);
+    }
+    trimmed
 }
 
 fn parse_pem_certs(pem: &str) -> Result<Vec<CertificateDer<'static>>, EngineError> {
@@ -292,5 +304,42 @@ impl ServerCertVerifier for AcceptAnyCertVerifier {
         self.provider
             .signature_verification_algorithms
             .supported_schemes()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn resolves_ipv6_literals_peer_host_hints_and_overrides() {
+        let v4_dest: SocketAddr = "10.0.0.10:5061".parse().unwrap();
+        let v6_dest: SocketAddr = "[2001:db8::1]:5061".parse().unwrap();
+
+        assert_eq!(
+            resolve_server_name(
+                Some("override.example.com:5061"),
+                Some("route.example.com"),
+                Some("domain.example.com"),
+                v4_dest,
+            )
+            .unwrap(),
+            ServerName::try_from("override.example.com".to_string()).unwrap()
+        );
+
+        assert_eq!(
+            resolve_server_name(None, Some("proxy2.example.com:5061"), None, v4_dest).unwrap(),
+            ServerName::try_from("proxy2.example.com".to_string()).unwrap()
+        );
+
+        assert_eq!(
+            resolve_server_name(None, None, Some("[2001:db8::2]:5061"), v6_dest).unwrap(),
+            ServerName::from("2001:db8::2".parse::<IpAddr>().unwrap())
+        );
+
+        assert_eq!(
+            resolve_server_name(None, Some("2001:db8::3"), None, v6_dest).unwrap(),
+            ServerName::from("2001:db8::3".parse::<IpAddr>().unwrap())
+        );
     }
 }
