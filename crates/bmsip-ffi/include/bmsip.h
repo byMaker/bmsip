@@ -30,6 +30,20 @@ BmsipClientHandle *bmsip_client_new_ex(
     uint32_t sample_rate_hz
 );
 
+BmsipClientHandle *bmsip_client_new_transport(
+    const char *username,
+    const char *password,
+    const char *domain,
+    const char *registrar_addr,
+    const char *bind_ip,
+    uint16_t sip_port,
+    int32_t enable_opus,
+    uint32_t sample_rate_hz,
+    const char *transport,
+    const char *tls_ca_pem,
+    int32_t tls_insecure
+);
+
 uint32_t bmsip_client_audio_sample_rate_hz(const BmsipClientHandle *client);
 
 int32_t bmsip_client_register(const BmsipClientHandle *client);

@@ -11,10 +11,11 @@ use std::time::Duration;
 
 use bmsip_engine::bmsip_core::dialog::{RegistrationState, UaConfig};
 use bmsip_engine::bmsip_core::sdp::RtpCodec;
-use bmsip_engine::bmsip_core::sip::SipUri;
+use bmsip_engine::bmsip_core::sip::{SipTransport, SipUri};
 use bmsip_engine::bmsip_media::DtmfDigit;
 use bmsip_engine::{
     EngineCommand, EngineConfig, EngineEvent, PcmAudioHandle, PcmQueueAudioPort, SipEngine,
+    TlsConfig,
 };
 
 /// Cross-platform FFI error surfaced to Swift, Kotlin, and C callers.
@@ -36,6 +37,34 @@ impl fmt::Display for FfiError {
 }
 
 impl std::error::Error for FfiError {}
+
+/// Signaling transport selection matching `FfiTransport` in `bmsip.udl`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FfiTransport {
+    Udp,
+    Tcp,
+    Tls,
+}
+
+impl FfiTransport {
+    /// Parses a case-insensitive transport string (`"udp"`, `"tcp"`, `"tls"`).
+    pub fn parse_str(raw: &str) -> Option<Self> {
+        match raw.trim().to_ascii_lowercase().as_str() {
+            "udp" => Some(Self::Udp),
+            "tcp" => Some(Self::Tcp),
+            "tls" => Some(Self::Tls),
+            _ => None,
+        }
+    }
+
+    fn to_sip_transport(self) -> SipTransport {
+        match self {
+            Self::Udp => SipTransport::Udp,
+            Self::Tcp => SipTransport::Tcp,
+            Self::Tls => SipTransport::Tls,
+        }
+    }
+}
 
 /// Startup configuration matching `FfiConfig` in `bmsip.udl`.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -141,6 +170,18 @@ impl BmsipClient {
 
     /// Creates and starts a new [`BmsipClient`] with an explicit PCM bridge rate (`8000`, `16000`, or `48000` Hz).
     pub fn new_with_sample_rate(config: FfiConfig, sample_rate_hz: u32) -> Result<Self, FfiError> {
+        Self::new_with_transport(config, sample_rate_hz, FfiTransport::Udp, None, false)
+    }
+
+    /// Creates and starts a new [`BmsipClient`] with explicit PCM bridge rate, SIP transport (`Udp`/`Tcp`/`Tls`),
+    /// optional PEM CA trust bundle, and optional insecure TLS bypass flag (for lab/self-signed servers only).
+    pub fn new_with_transport(
+        config: FfiConfig,
+        sample_rate_hz: u32,
+        transport: FfiTransport,
+        tls_ca_pem: Option<String>,
+        tls_insecure: bool,
+    ) -> Result<Self, FfiError> {
         if !matches!(sample_rate_hz, 8_000 | 16_000 | 48_000) {
             return Err(FfiError::InvalidArgument(format!(
                 "unsupported audio sample_rate_hz {sample_rate_hz} (expected 8000, 16000, or 48000)"
@@ -161,7 +202,8 @@ impl BmsipClient {
             registrar_uri,
             config.bind_ip,
             config.sip_port,
-        );
+        )
+        .with_transport(transport.to_sip_transport());
         if config.enable_opus {
             ua_cfg.supported_codecs = vec![
                 RtpCodec::opus(),
@@ -182,7 +224,13 @@ impl BmsipClient {
             ];
         }
 
-        let eng_cfg = EngineConfig::new(ua_cfg, registrar_addr, bind_ip, config.sip_port);
+        let tls_cfg = TlsConfig {
+            ca_cert_pem: tls_ca_pem,
+            accept_invalid_certs: tls_insecure,
+            ..TlsConfig::default()
+        };
+        let eng_cfg = EngineConfig::new(ua_cfg, registrar_addr, bind_ip, config.sip_port)
+            .with_tls_config(tls_cfg);
         let (audio_port, audio_handle) =
             PcmQueueAudioPort::new_with_sample_rate(sample_rate_hz, 64);
         let engine = SipEngine::spawn(eng_cfg, Box::new(audio_port))

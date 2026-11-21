@@ -1688,3 +1688,71 @@ fn sip_info_dtmf_relay_and_raw_dtmf_roundtrip_and_invalid_rejection() {
     };
     assert_eq!(rej_resp.status_code, 415);
 }
+
+#[test]
+fn tcp_and_tls_transport_sets_via_contact_and_skips_udp_retransmits() {
+    use bmsip_core::sip::SipTransport;
+
+    for (transport, expected_via, expected_param) in [
+        (SipTransport::Tcp, "TCP", "tcp"),
+        (SipTransport::Tls, "TLS", "tls"),
+    ] {
+        let t0 = Instant::now();
+        let mut ua = UserAgent::new(
+            UaConfig::new(
+                "alice",
+                "secret",
+                "pbx.local",
+                SipUri::parse("sip:pbx.local:5061").unwrap(),
+                "10.0.0.1",
+                5061,
+            )
+            .with_transport(transport),
+        );
+        assert_eq!(ua.transport(), transport);
+
+        ua.register(t0).unwrap();
+        let out = ua.poll_transmit();
+        assert_eq!(out.len(), 1);
+        let SipMessage::Request(reg) = SipMessage::parse(&out[0]).unwrap() else {
+            panic!("expected REGISTER");
+        };
+        assert_eq!(reg.top_via().unwrap().transport, expected_via);
+        assert!(
+            reg.headers
+                .get("Contact")
+                .unwrap()
+                .contains(&format!("transport={expected_param}")),
+            "Contact missing transport={expected_param}: {:?}",
+            reg.headers.get("Contact")
+        );
+
+        // Advance well past T1 (500 ms -> 2 s): reliable transports MUST NOT retransmit via Timer E.
+        let _ = ua.handle_timeout(t0 + Duration::from_secs(2));
+        assert!(
+            ua.poll_transmit().is_empty(),
+            "reliable transport {transport} must not emit Timer E retransmissions"
+        );
+
+        // Verify INVITE also uses the configured Via/Contact transport and skips Timer A retransmits.
+        let _cid = ua
+            .dial(SipUri::parse("sip:bob@pbx.local:5061").unwrap(), 40000, t0)
+            .unwrap();
+        let inv_out = ua.poll_transmit();
+        assert_eq!(inv_out.len(), 1);
+        let SipMessage::Request(inv) = SipMessage::parse(&inv_out[0]).unwrap() else {
+            panic!("expected INVITE");
+        };
+        assert_eq!(inv.top_via().unwrap().transport, expected_via);
+        assert!(inv
+            .headers
+            .get("Contact")
+            .unwrap()
+            .contains(&format!("transport={expected_param}")));
+        let _ = ua.handle_timeout(t0 + Duration::from_secs(2));
+        assert!(
+            ua.poll_transmit().is_empty(),
+            "reliable transport {transport} must not emit Timer A retransmissions"
+        );
+    }
+}

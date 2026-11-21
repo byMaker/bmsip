@@ -9,6 +9,8 @@ use bmsip_core::dialog::{RegistrationState, UaConfig};
 use bmsip_core::sip::SipUri;
 use bmsip_media::{AudioCodecFactory, CodecRegistry, DtmfDigit};
 
+use crate::tls::TlsConfig;
+
 /// Startup configuration for [`crate::SipEngine`].
 #[derive(Debug, Clone)]
 pub struct EngineConfig {
@@ -18,6 +20,7 @@ pub struct EngineConfig {
     pub sip_port: u16,
     pub telemetry_capacity: usize,
     pub codec_registry: CodecRegistry,
+    pub tls_config: TlsConfig,
 }
 
 impl EngineConfig {
@@ -35,7 +38,14 @@ impl EngineConfig {
             sip_port,
             telemetry_capacity: 256,
             codec_registry: CodecRegistry::with_builtin_codecs(),
+            tls_config: TlsConfig::default(),
         }
+    }
+
+    /// Configures TLS 1.2–1.3 (`rustls`) certificate verification and optional client/server identities.
+    pub fn with_tls_config(mut self, tls_config: TlsConfig) -> Self {
+        self.tls_config = tls_config;
+        self
     }
 
     /// Registers an [`AudioCodecFactory`] in `codec_registry` without changing the advertised SDP order.

@@ -1,6 +1,6 @@
-//! MODULE_CONTRACT: Multi-instance [`SipEngine`] runtime driving `bmsip_core::dialog::UserAgent` and `bmsip_media::MediaSession` over UDP sockets and monotonic timers.
+//! MODULE_CONTRACT: Multi-instance [`SipEngine`] runtime driving `bmsip_core::dialog::UserAgent` and `bmsip_media::MediaSession` over UDP/TCP/TLS (`rustls`) sockets and monotonic timers.
 //! INVARIANTS: `#![forbid(unsafe_code)]`; zero global state or `static mut`; zero callbacks invoked under held locks; thread-safe `Send + Sync` queues; deterministic cleanup on `Shutdown` or `Drop`.
-//! RFC_REFS: RFC 3261, RFC 3550, RFC 4733.
+//! RFC_REFS: RFC 3261, RFC 3550, RFC 4733, RFC 5626, RFC 5922, RFC 5923.
 
 use std::collections::{HashMap, VecDeque};
 use std::net::{IpAddr, SocketAddr, ToSocketAddrs, UdpSocket};
@@ -11,7 +11,7 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use bmsip_core::dialog::{CallState, RegistrationState, UaEvent, UserAgent};
 use bmsip_core::sdp::RtpCodec;
-use bmsip_core::sip::{Method, NameAddr, SipMessage, SipUri};
+use bmsip_core::sip::{Method, NameAddr, SipMessage, SipTransport, SipUri};
 use bmsip_media::{
     AudioCodecPlugin, BuiltInOpusCodec, CodecRegistry, G711Kind, JitterBufferConfig, MediaSession,
     OpusCodecBackend, SessionCodec, CN_PAYLOAD_TYPE, G722_PAYLOAD_TYPE,
@@ -23,6 +23,7 @@ use crate::command::{EngineCommand, EngineConfig, EngineEvent};
 use crate::error::EngineError;
 use crate::opus_native::LibOpusCodec;
 use crate::telemetry::{FlightRecorder, TelemetryCategory};
+use crate::transport::SipTransportDriver;
 
 const MEDIA_TICK_MS: u64 = 20;
 const WORKER_ACTIVE_POLL_MS: u64 = 5;
@@ -86,10 +87,17 @@ impl SipEngine {
         mut config: EngineConfig,
         audio_port: Box<dyn AudioPort>,
     ) -> Result<Self, EngineError> {
-        let (sip_socket, reachable_ip) =
-            bind_sip_socket(config.bind_ip, config.sip_port, config.registrar_addr)?;
-        let actual_port = sip_socket.local_addr()?.port();
-        let advertised_addr = SocketAddr::new(reachable_ip, actual_port);
+        let sip_transport = SipTransportDriver::new(
+            config.ua_config.transport,
+            config.bind_ip,
+            config.sip_port,
+            config.registrar_addr,
+            config.ua_config.domain.clone(),
+            &config.tls_config,
+        )?;
+        let advertised_addr = sip_transport.local_addr();
+        let reachable_ip = advertised_addr.ip();
+        let actual_port = advertised_addr.port();
 
         config.ua_config.local_host = reachable_ip.to_string();
         config.ua_config.local_sip_port = actual_port;
@@ -111,7 +119,7 @@ impl SipEngine {
             .spawn(move || {
                 run_worker(
                     config,
-                    sip_socket,
+                    sip_transport,
                     advertised_addr,
                     audio_port,
                     worker_shared,
@@ -186,7 +194,7 @@ struct WorkerCtx {
     registrar_addr: SocketAddr,
     bind_ip: IpAddr,
     local_sip_addr: SocketAddr,
-    sip_socket: UdpSocket,
+    sip_transport: SipTransportDriver,
     ua: UserAgent,
     codec_registry: CodecRegistry,
     audio_port: Box<dyn AudioPort>,
@@ -215,9 +223,10 @@ impl WorkerCtx {
         let Ok(msg) = SipMessage::parse(pkt) else {
             return self.registrar_addr;
         };
+        let default_port = self.ua.transport().default_port();
         match msg {
             SipMessage::Response(resp) => {
-                // RFC 3581 / RFC 3261 §18.2.2: route server responses back to the exact UDP source.
+                // RFC 3581 / RFC 3261 §18.2.2: route server responses back to the exact peer source.
                 if let (Ok(via), Ok(cseq)) = (resp.top_via(), resp.cseq()) {
                     if let Some(branch) = via.branch.as_deref() {
                         if let Some(&src) = self
@@ -232,7 +241,7 @@ impl WorkerCtx {
                             return src;
                         }
                     }
-                    if let Some(addr) = resolve_via_response_addr(&via) {
+                    if let Some(addr) = resolve_via_response_addr(&via, default_port) {
                         return addr;
                     }
                 }
@@ -254,11 +263,27 @@ impl WorkerCtx {
                     }
                 }
 
+                // RFC 5923 / RFC 5626: for reliable stream transports (TCP/TLS), reuse the active
+                // inbound peer connection for in-dialog requests (NAT-safe & pure-client friendly).
+                let is_in_dialog = req.to().ok().and_then(|t| t.tag).is_some();
+                if is_in_dialog && self.ua.transport().is_reliable() {
+                    if let Ok(cid) = req.call_id() {
+                        if let Some(&src) = self.inbound_call_sources.get(cid) {
+                            if self.sip_transport.has_connection(src) {
+                                if req.method == Method::Invite {
+                                    self.record_outbound_tx_target(via_branch, src);
+                                }
+                                return src;
+                            }
+                        }
+                    }
+                }
+
                 // RFC 3261 §12.2.1.1: if a Route header is present, forward to the topmost Route URI.
                 if let Some(raw_route) = req.headers.get("Route") {
                     if let Ok(routes) = NameAddr::parse_list(raw_route) {
                         if let Some(first) = routes.first() {
-                            if let Some(addr) = resolve_sip_uri_addr(&first.uri) {
+                            if let Some(addr) = resolve_sip_uri_addr(&first.uri, default_port) {
                                 if req.method == Method::Invite {
                                     self.record_outbound_tx_target(via_branch, addr);
                                 }
@@ -270,9 +295,8 @@ impl WorkerCtx {
 
                 // In-dialog requests without a Route set (To tag present: 2xx ACK, BYE, re-INVITE)
                 // route directly to the remote Contact (Request-URI) when it carries a concrete IP.
-                let is_in_dialog = req.to().ok().and_then(|t| t.tag).is_some();
                 if is_in_dialog {
-                    if let Some(addr) = resolve_sip_uri_literal_ip(&req.uri) {
+                    if let Some(addr) = resolve_sip_uri_literal_ip(&req.uri, default_port) {
                         if req.method == Method::Invite {
                             self.record_outbound_tx_target(via_branch, addr);
                         }
@@ -330,8 +354,7 @@ impl WorkerCtx {
                     summary.1,
                 );
             }
-            if let Err(err) = self.sip_socket.send_to(&pkt, dest) {
-                let msg = format!("SIP UDP send to {dest} failed: {err}");
+            if let Err(msg) = self.sip_transport.send(dest, &pkt, now) {
                 self.recorder
                     .record(now, TelemetryCategory::Warning, None, msg.clone());
                 self.push_event(EngineEvent::Warning(msg));
@@ -1030,18 +1053,15 @@ impl WorkerCtx {
             EngineCommand::NetworkChanged {
                 new_bind_ip,
                 new_sip_port,
-            } => match bind_sip_socket(new_bind_ip, new_sip_port, self.registrar_addr) {
-                Ok((new_sock, reachable_ip)) => {
-                    let actual_port = match new_sock.local_addr() {
-                        Ok(addr) => addr.port(),
-                        Err(err) => {
-                            self.push_event(EngineEvent::Warning(err.to_string()));
-                            return true;
-                        }
-                    };
+            } => match self
+                .sip_transport
+                .rebind(new_bind_ip, new_sip_port, self.registrar_addr)
+            {
+                Ok(new_local_addr) => {
+                    let reachable_ip = new_local_addr.ip();
+                    let actual_port = new_local_addr.port();
                     self.bind_ip = new_bind_ip;
-                    self.sip_socket = new_sock;
-                    self.local_sip_addr = SocketAddr::new(reachable_ip, actual_port);
+                    self.local_sip_addr = new_local_addr;
                     if let Ok(mut g) = self.shared.local_sip_addr.lock() {
                         *g = self.local_sip_addr;
                     }
@@ -1137,38 +1157,24 @@ impl WorkerCtx {
     }
 
     fn pump_sip_rx(&mut self, now: Instant) {
-        let mut buf = [0u8; 8192];
-        loop {
-            match self.sip_socket.recv_from(&mut buf) {
-                Ok((len, src_addr)) => {
-                    self.record_inbound_source(&buf[..len], src_addr);
-                    if let Some(summary) = summarize_sip_datagram(&buf[..len]) {
-                        self.recorder.record(
-                            now,
-                            TelemetryCategory::SipRx,
-                            summary.0.as_deref(),
-                            summary.1,
-                        );
-                    }
-                    let events = self.ua.receive_datagram(&buf[..len], now);
-                    self.handle_ua_events(events, now);
-                }
-                Err(e)
-                    if matches!(
-                        e.kind(),
-                        std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut
-                    ) =>
-                {
-                    break;
-                }
-                Err(err) => {
-                    let msg = format!("SIP UDP recv error: {err}");
-                    self.recorder
-                        .record(now, TelemetryCategory::Warning, None, msg.clone());
-                    self.push_event(EngineEvent::Warning(msg));
-                    break;
-                }
+        let (messages, warnings) = self.sip_transport.poll_rx(now);
+        for msg in warnings {
+            self.recorder
+                .record(now, TelemetryCategory::Warning, None, msg.clone());
+            self.push_event(EngineEvent::Warning(msg));
+        }
+        for (src_addr, raw) in messages {
+            self.record_inbound_source(&raw, src_addr);
+            if let Some(summary) = summarize_sip_datagram(&raw) {
+                self.recorder.record(
+                    now,
+                    TelemetryCategory::SipRx,
+                    summary.0.as_deref(),
+                    summary.1,
+                );
             }
+            let events = self.ua.receive_datagram(&raw, now);
+            self.handle_ua_events(events, now);
         }
         self.flush_sip_outbound(now);
     }
@@ -1368,7 +1374,7 @@ impl WorkerCtx {
 
 fn run_worker(
     config: EngineConfig,
-    sip_socket: UdpSocket,
+    sip_transport: SipTransportDriver,
     local_sip_addr: SocketAddr,
     audio_port: Box<dyn AudioPort>,
     shared: Arc<SharedState>,
@@ -1378,7 +1384,7 @@ fn run_worker(
         registrar_addr: config.registrar_addr,
         bind_ip: config.bind_ip,
         local_sip_addr,
-        sip_socket,
+        sip_transport,
         ua: UserAgent::new(config.ua_config),
         codec_registry: config.codec_registry,
         audio_port,
@@ -1436,7 +1442,9 @@ fn run_worker(
             }
         }
 
-        let has_active_work = !ctx.active_media.is_empty() || !ctx.pending_rtp_sockets.is_empty();
+        let has_active_work = !ctx.active_media.is_empty()
+            || !ctx.pending_rtp_sockets.is_empty()
+            || ctx.sip_transport.has_pending_io();
         let poll_ms = if has_active_work {
             WORKER_ACTIVE_POLL_MS
         } else {
@@ -1473,24 +1481,6 @@ fn run_worker(
     };
 }
 
-fn bind_sip_socket(
-    bind_ip: IpAddr,
-    sip_port: u16,
-    remote_probe: SocketAddr,
-) -> Result<(UdpSocket, IpAddr), EngineError> {
-    let sock = UdpSocket::bind((bind_ip, sip_port))?;
-    sock.set_nonblocking(true)?;
-    let bound_ip = sock.local_addr()?.ip();
-    let reachable_ip = if bound_ip.is_unspecified() {
-        let probe = UdpSocket::bind("0.0.0.0:0")?;
-        probe.connect(remote_probe)?;
-        probe.local_addr()?.ip()
-    } else {
-        bound_ip
-    };
-    Ok((sock, reachable_ip))
-}
-
 fn bind_rtp_socket(
     bind_ip: IpAddr,
     advertised_ip: IpAddr,
@@ -1510,46 +1500,57 @@ fn bind_rtp_socket(
     Ok((rtp_sock, rtcp_sock, port))
 }
 
-fn resolve_sip_uri_literal_ip(uri: &SipUri) -> Option<SocketAddr> {
+fn default_port_for_uri(uri: &SipUri, fallback_port: u16) -> u16 {
+    SipTransport::from_uri(uri)
+        .map(SipTransport::default_port)
+        .unwrap_or(fallback_port)
+}
+
+fn resolve_sip_uri_literal_ip(uri: &SipUri, fallback_port: u16) -> Option<SocketAddr> {
     let host = uri.host.trim_matches(['[', ']']);
     let ip = host.parse::<IpAddr>().ok()?;
     if ip.is_unspecified() {
         return None;
     }
-    Some(SocketAddr::new(ip, uri.port.unwrap_or(5060)))
+    let port = uri
+        .port
+        .unwrap_or_else(|| default_port_for_uri(uri, fallback_port));
+    Some(SocketAddr::new(ip, port))
 }
 
-fn resolve_sip_uri_addr(uri: &SipUri) -> Option<SocketAddr> {
-    if let Some(addr) = resolve_sip_uri_literal_ip(uri) {
+fn resolve_sip_uri_addr(uri: &SipUri, fallback_port: u16) -> Option<SocketAddr> {
+    if let Some(addr) = resolve_sip_uri_literal_ip(uri, fallback_port) {
         return Some(addr);
     }
-    let port = uri.port.unwrap_or(5060);
+    let port = uri
+        .port
+        .unwrap_or_else(|| default_port_for_uri(uri, fallback_port));
     (uri.host.as_str(), port)
         .to_socket_addrs()
         .ok()?
         .find(|addr| !addr.ip().is_unspecified())
 }
 
-fn resolve_via_response_addr(via: &bmsip_core::sip::Via) -> Option<SocketAddr> {
+fn resolve_via_response_addr(via: &bmsip_core::sip::Via, fallback_port: u16) -> Option<SocketAddr> {
     let sent_host_port = via.sent_by.trim();
     let (sent_host, sent_port) = if let Some(rest) = sent_host_port.strip_prefix('[') {
         if let Some((ip_part, tail)) = rest.split_once(']') {
             let port = tail
                 .strip_prefix(':')
                 .and_then(|p| p.parse::<u16>().ok())
-                .unwrap_or(5060);
+                .unwrap_or(fallback_port);
             (ip_part, port)
         } else {
-            (sent_host_port, 5060)
+            (sent_host_port, fallback_port)
         }
     } else if let Some((h, p)) = sent_host_port.rsplit_once(':') {
         if let Ok(port) = p.parse::<u16>() {
             (h, port)
         } else {
-            (sent_host_port, 5060)
+            (sent_host_port, fallback_port)
         }
     } else {
-        (sent_host_port, 5060)
+        (sent_host_port, fallback_port)
     };
 
     let ip_str = via.received.as_deref().unwrap_or(sent_host);

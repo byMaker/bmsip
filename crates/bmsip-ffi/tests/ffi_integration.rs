@@ -9,10 +9,11 @@ use bmsip_ffi::bmsip_engine::bmsip_media::WavPcm16;
 use bmsip_ffi::{
     bmsip_client_attended_transfer, bmsip_client_audio_sample_rate_hz, bmsip_client_dial,
     bmsip_client_free, bmsip_client_hangup, bmsip_client_hold, bmsip_client_new,
-    bmsip_client_new_ex, bmsip_client_poll_event_json, bmsip_client_pop_pcm, bmsip_client_push_pcm,
-    bmsip_client_register, bmsip_client_resume_call, bmsip_client_ring_early_media,
-    bmsip_client_send_info_dtmf, bmsip_client_transfer, bmsip_client_unregister, bmsip_string_free,
-    BmsipClient, FfiConfig, FfiEvent, FfiEventKind,
+    bmsip_client_new_ex, bmsip_client_new_transport, bmsip_client_poll_event_json,
+    bmsip_client_pop_pcm, bmsip_client_push_pcm, bmsip_client_register, bmsip_client_resume_call,
+    bmsip_client_ring_early_media, bmsip_client_send_info_dtmf, bmsip_client_transfer,
+    bmsip_client_unregister, bmsip_string_free, BmsipClient, FfiConfig, FfiEvent, FfiEventKind,
+    FfiTransport,
 };
 
 #[test]
@@ -21,11 +22,13 @@ fn udl_schema_matches_rust_sdk_surface() {
     for required in [
         "namespace bmsip",
         "enum FfiError",
+        "enum FfiTransport",
         "dictionary FfiConfig",
         "enum FfiEventKind",
         "dictionary FfiEvent",
         "interface BmsipClient",
         "with_sample_rate",
+        "with_transport",
         "audio_sample_rate_hz()",
         "register_account()",
         "unregister_account()",
@@ -537,6 +540,171 @@ fn ffi_and_c_api_wideband_48khz_opus_live_asterisk_call() {
             bmsip_client_push_pcm(handle, frame_16k.as_ptr(), frame_16k.len()),
             0
         );
+        bmsip_client_free(handle);
+    }
+}
+
+#[test]
+fn ffi_and_c_api_tls_transport_live_asterisk_call() {
+    // 1. Safe Rust / UniFFI BmsipClient over TLS against Asterisk 5061/tls.
+    let client = BmsipClient::new_with_transport(
+        FfiConfig {
+            username: "1003".to_string(),
+            password: "secret1003".to_string(),
+            domain: "asterisk".to_string(),
+            registrar_addr: "asterisk:5061".to_string(),
+            bind_ip: "0.0.0.0".to_string(),
+            sip_port: 0,
+            enable_opus: true,
+        },
+        8_000,
+        FfiTransport::Tls,
+        None,
+        true,
+    )
+    .unwrap();
+
+    client.register_account().unwrap();
+    let mut registered = false;
+    let reg_dl = Instant::now() + Duration::from_secs(10);
+    while Instant::now() < reg_dl {
+        if let Some(ev) = client.poll_event(50) {
+            if ev.kind == FfiEventKind::RegistrationChanged
+                && ev
+                    .detail
+                    .as_deref()
+                    .is_some_and(|d| d.starts_with("Registered"))
+            {
+                registered = true;
+                break;
+            }
+        }
+    }
+    assert!(registered, "TLS BmsipClient 1003 failed to register");
+
+    client
+        .dial("sip:601@asterisk:5061;transport=tls".to_string())
+        .unwrap();
+    let mut call_id: Option<String> = None;
+    let mut established = false;
+    let call_dl = Instant::now() + Duration::from_secs(10);
+    while Instant::now() < call_dl {
+        if let Some(ev) = client.poll_event(50) {
+            match ev.kind {
+                FfiEventKind::OutboundCallStarted => call_id = ev.call_id,
+                FfiEventKind::CallEstablished => {
+                    established = true;
+                    break;
+                }
+                _ => {}
+            }
+        }
+    }
+    assert!(established, "TLS BmsipClient call to 601 did not establish");
+
+    let tone = WavPcm16::generate_sine_wave(8_000, 440, 400, 12_000);
+    for frame in tone.samples.as_chunks::<160>().0 {
+        client.push_captured_pcm(frame.to_vec()).unwrap();
+        thread::sleep(Duration::from_millis(18));
+    }
+    thread::sleep(Duration::from_millis(120));
+
+    let mut rx_pcm = Vec::new();
+    while let Some(frame) = client.pop_playout_pcm() {
+        rx_pcm.extend_from_slice(&frame);
+    }
+    assert!(
+        WavPcm16::new(8_000, rx_pcm).rms_energy() > 1000,
+        "expected echoed TLS FFI PCM RMS > 1000"
+    );
+
+    client.hangup(call_id.unwrap()).unwrap();
+    let bye_dl = Instant::now() + Duration::from_secs(6);
+    while Instant::now() < bye_dl {
+        if let Some(ev) = client.poll_event(50) {
+            if ev.kind == FfiEventKind::CallTerminated {
+                break;
+            }
+        }
+    }
+    client.unregister_account().unwrap();
+    let unreg_dl = Instant::now() + Duration::from_secs(4);
+    while Instant::now() < unreg_dl {
+        if let Some(ev) = client.poll_event(50) {
+            if ev.kind == FfiEventKind::RegistrationChanged
+                && ev.detail.as_deref() == Some("Unregistered")
+            {
+                break;
+            }
+        }
+    }
+    client.shutdown();
+
+    // 2. C99 ABI `bmsip_client_new_transport` rejects unknown transport and accepts `"tcp"` / `"tls"`.
+    unsafe {
+        let u = CString::new("1003").unwrap();
+        let p = CString::new("secret1003").unwrap();
+        let d = CString::new("asterisk").unwrap();
+        let r_tcp = CString::new("asterisk:5060").unwrap();
+        let b = CString::new("0.0.0.0").unwrap();
+        let bad_t = CString::new("sctp").unwrap();
+        assert!(bmsip_client_new_transport(
+            u.as_ptr(),
+            p.as_ptr(),
+            d.as_ptr(),
+            r_tcp.as_ptr(),
+            b.as_ptr(),
+            0,
+            1,
+            8_000,
+            bad_t.as_ptr(),
+            ptr::null(),
+            0,
+        )
+        .is_null());
+
+        let tcp_t = CString::new("tcp").unwrap();
+        let handle = bmsip_client_new_transport(
+            u.as_ptr(),
+            p.as_ptr(),
+            d.as_ptr(),
+            r_tcp.as_ptr(),
+            b.as_ptr(),
+            0,
+            1,
+            8_000,
+            tcp_t.as_ptr(),
+            ptr::null(),
+            0,
+        );
+        assert!(!handle.is_null());
+        assert_eq!(bmsip_client_register(handle), 0);
+        let mut reg_ok = false;
+        let dl = Instant::now() + Duration::from_secs(10);
+        while Instant::now() < dl {
+            let json_ptr = bmsip_client_poll_event_json(handle, 50);
+            if !json_ptr.is_null() {
+                let json = CStr::from_ptr(json_ptr).to_string_lossy().into_owned();
+                bmsip_string_free(json_ptr);
+                if json.contains("\"RegistrationChanged\"") && json.contains("Registered") {
+                    reg_ok = true;
+                    break;
+                }
+            }
+        }
+        assert!(reg_ok, "C-API TCP registration failed");
+        assert_eq!(bmsip_client_unregister(handle), 0);
+        let udl = Instant::now() + Duration::from_secs(4);
+        while Instant::now() < udl {
+            let json_ptr = bmsip_client_poll_event_json(handle, 50);
+            if !json_ptr.is_null() {
+                let json = CStr::from_ptr(json_ptr).to_string_lossy().into_owned();
+                bmsip_string_free(json_ptr);
+                if json.contains("\"RegistrationChanged\"") && json.contains("Unregistered") {
+                    break;
+                }
+            }
+        }
         bmsip_client_free(handle);
     }
 }

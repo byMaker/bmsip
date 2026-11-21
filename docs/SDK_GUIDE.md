@@ -8,7 +8,7 @@ This guide covers embedding `bmsip` across **Rust**, **C99/C++**, **iOS (Swift)*
 
 | Target Environment | Recommended Crate / Boundary | Transport & Audio Ownership |
 |---|---|---|
-| Native Rust apps & services | `bmsip-engine` | Managed UDP/timer loop; pluggable `AudioPort` trait (`8`/`16`/`48` kHz) |
+| Native Rust apps & services | `bmsip-engine` | Managed UDP/TCP/TLS (`rustls`) & timer loop; pluggable `AudioPort` trait (`8`/`16`/`48` kHz) |
 | Custom event loops / simulators / async hosts | `bmsip-core` + `bmsip-media` | 100% Sans-I/O; host injects `Instant` and UDP datagrams directly |
 | C / C++ / Go / Python | `bmsip-ffi` via [`bmsip.h`](../crates/bmsip-ffi/include/bmsip.h) | Non-blocking `BmsipClientHandle`, 20 ms PCM queue, JSON event polling |
 | iOS (`Swift`) & Android (`Kotlin`) | `bmsip-ffi` via UniFFI [`bmsip.udl`](../crates/bmsip-ffi/src/bmsip.udl) | Typed `BmsipClient` + `FfiConfig`/`FfiEvent`; pairs with native AEC |
@@ -57,15 +57,24 @@ let mut engine_cfg = EngineConfig::new(
 engine_cfg.telemetry_capacity = 512; // Bounded global ring size (minimum 16)
 ```
 
-Optional RFC 4028 Session-Timers and RFC 3323/3325 Caller-ID builders on `UaConfig`:
+Optional transport (`UDP`/`TCP`/`TLS`), RFC 4028 Session-Timers, and RFC 3323/3325 Caller-ID builders on `UaConfig` and `EngineConfig`:
 
 ```rust
+use bmsip_engine::bmsip_core::sip::SipTransport;
+use bmsip_engine::TlsConfig;
+
 let ua_cfg = ua_cfg
+    .with_transport(SipTransport::Tls) // SipTransport::Udp (default), Tcp, or Tls
     .with_session_timers(Some(1800), 90) // Session-Expires (s), Min-SE (s); pass None to disable
     .with_caller_identity(
         Some(NameAddr::parse("\"Alice\" <sip:+15550100@pbx.example.com>")?),
         Some("none".to_string()),
     );
+
+let tls_cfg = TlsConfig::new()
+    .with_server_name("pbx.example.com")
+    .with_ca_cert_pem(custom_ca_pem); // Optional: add private CA; also supports .with_client_identity(...) for mTLS
+let engine_cfg = engine_cfg.with_tls_config(tls_cfg);
 ```
 
 ### 2.2 Non-Blocking Commands & Events (`SipEngine`)
@@ -135,7 +144,7 @@ Defined in [`crates/bmsip-ffi/src/bmsip.udl`](../crates/bmsip-ffi/src/bmsip.udl)
 
 - **Configuration (`FfiConfig`):** `username`, `password`, `domain`, `registrar_addr`, `bind_ip`, `sip_port`, `enable_opus`.
   When `enable_opus` is `true`, `BmsipClient` offers `[Opus, G722, PCMU, PCMA, CN, telephone-event/48000, telephone-event/8000]`; when `false`, it offers `[G722, PCMU, PCMA, CN, telephone-event/8000]`.
-- **Sample Rate Selection:** Default `BmsipClient(config)` uses an `8000` Hz (`160` samples/20 ms) bridge; use `BmsipClient.with_sample_rate(config, 16000 | 48000)` for native wideband G.722 (`320` samples) or fullband Opus (`960` samples) without downsampling, and inspect the active rate via `audio_sample_rate_hz()`.
+- **Sample Rate & Transport Selection:** Default `BmsipClient(config)` uses UDP with an `8000` Hz (`160` samples/20 ms) bridge; use `BmsipClient.with_sample_rate(config, 16000 | 48000)` for wideband/fullband PCM or `BmsipClient.with_transport(config, sample_rate_hz, FfiTransport.Tls, tls_ca_pem, tls_insecure)` to enable TCP or TLS 1.2–1.3 signaling (`Udp`/`Tcp`/`Tls`), and inspect the active rate via `audio_sample_rate_hz()`.
 - **Audio Exchange:**
   - `push_captured_pcm(samples)` — pushes one 20 ms (`160` @ 8 kHz, `320` @ 16 kHz, or `960` @ 48 kHz) mono PCM frame captured from OS audio.
   - `pop_playout_pcm() -> sequence<i16>?` — pops the next decoded 20 ms frame sized for `audio_sample_rate_hz()`.
@@ -163,7 +172,7 @@ Defined in [`crates/bmsip-ffi/src/bmsip.udl`](../crates/bmsip-ffi/src/bmsip.udl)
 
 [`crates/bmsip-ffi/include/bmsip.h`](../crates/bmsip-ffi/include/bmsip.h) provides an opaque pointer ABI (`BmsipClientHandle *`):
 
-- **Constructors:** `bmsip_client_new(...)` creates an 8 kHz client (G.722/PCMU/PCMA); `bmsip_client_new_ex(..., enable_opus, sample_rate_hz)` enables Opus (`enable_opus != 0`) and selects `8000`, `16000`, or `48000` Hz PCM framing (queryable via `bmsip_client_audio_sample_rate_hz`).
+- **Constructors:** `bmsip_client_new(...)` creates an 8 kHz UDP client (G.722/PCMU/PCMA); `bmsip_client_new_ex(..., enable_opus, sample_rate_hz)` enables Opus (`enable_opus != 0`) and selects `8000`, `16000`, or `48000` Hz PCM framing (queryable via `bmsip_client_audio_sample_rate_hz`); `bmsip_client_new_transport(..., transport, tls_ca_pem, tls_insecure)` additionally selects `"udp"`, `"tcp"`, or `"tls"` with optional PEM CA trust bundle.
 - **Return Convention:** Action functions (`bmsip_client_register`, `bmsip_client_dial`, `bmsip_client_ring_early_media`, `bmsip_client_answer`, `bmsip_client_hangup`, `bmsip_client_hold`, `bmsip_client_resume_call`, `bmsip_client_transfer`, `bmsip_client_attended_transfer`, `bmsip_client_send_dtmf`, `bmsip_client_send_info_dtmf`, etc.) return `0` on success or `-1` on error.
 - **PCM Functions:**
   - `bmsip_client_push_pcm(client, samples, len)` returns `0` on success (`-1` if `len` does not match the 20 ms frame length for the configured sample rate: `160`, `320`, or `960`).
@@ -180,7 +189,7 @@ Defined in [`crates/bmsip-ffi/src/bmsip.udl`](../crates/bmsip-ffi/src/bmsip.udl)
 When the device moves between networks (e.g., Wi-Fi to LTE):
 
 1. Application issues `EngineCommand::NetworkChanged { new_bind_ip, new_sip_port }` (or `BmsipClient::notify_network_changed`).
-2. `SipEngine` rebinds the UDP SIP socket and probes the updated reachable local IP.
+2. `SipEngine` rebinds the SIP transport socket (dropping any stale TCP/TLS connections immediately) and probes the updated reachable local IP.
 3. `UserAgent::notify_network_changed` updates advertised `Contact` / SDP IP, triggers an immediate `REGISTER` refresh if registered, and sends an in-dialog `re-INVITE` on active `Established` calls with the updated SDP.
 
 ### 4.2 Background Suspend & Push Wakeup (`Suspend` / `Resume`)

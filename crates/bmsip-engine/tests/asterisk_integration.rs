@@ -5,8 +5,8 @@ use std::time::{Duration, Instant};
 
 use bmsip_core::dialog::{CallState, RegistrationState, UaConfig, UaEvent, UserAgent};
 use bmsip_core::sdp::RtpCodec;
-use bmsip_core::sip::SipUri;
-use bmsip_engine::{EngineCommand, EngineConfig, EngineEvent, SipEngine, WavAudioPort};
+use bmsip_core::sip::{SipTransport, SipUri};
+use bmsip_engine::{EngineCommand, EngineConfig, EngineEvent, SipEngine, TlsConfig, WavAudioPort};
 use bmsip_media::{
     AudioCodecDescriptor, AudioCodecPlugin, DtmfDigit, FnCodecFactory, G711Kind,
     JitterBufferConfig, MediaError, MediaSession, PlayoutFrame, WavPcm16,
@@ -1858,6 +1858,308 @@ fn live_early_media_183_audio_and_sip_info_dtmf_exchange() {
         .is_some()
     );
 
+    eng_alice.shutdown().unwrap();
+    eng_bob.shutdown().unwrap();
+}
+
+#[test]
+fn live_sip_over_tcp_and_tls_asterisk_and_freeswitch_echo_calls() {
+    let _guard = ASTERISK_TEST_MUTEX
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
+
+    let scenarios = [
+        (
+            "Asterisk-TCP",
+            "asterisk",
+            5060u16,
+            SipTransport::Tcp,
+            TlsConfig::default(),
+            "sip:601@asterisk:5060;transport=tcp",
+        ),
+        (
+            "Asterisk-TLS",
+            "asterisk",
+            5061u16,
+            SipTransport::Tls,
+            TlsConfig::new()
+                .with_server_name("asterisk")
+                .with_accept_invalid_certs(true),
+            "sip:601@asterisk:5061;transport=tls",
+        ),
+        (
+            "FreeSWITCH-TCP",
+            "freeswitch",
+            5060u16,
+            SipTransport::Tcp,
+            TlsConfig::default(),
+            "sip:601@freeswitch:5060;transport=tcp",
+        ),
+    ];
+
+    for (label, host, port, transport, tls_cfg, target_str) in scenarios {
+        let server_addr = (host, port)
+            .to_socket_addrs()
+            .expect("resolve SIP server")
+            .next()
+            .expect("resolved socket addr");
+        let registrar_uri =
+            SipUri::parse(&format!("sip:{host}:{port};transport={transport}")).unwrap();
+
+        let tone = WavPcm16::generate_sine_wave(8_000, 440, 1_200, 12_000);
+        let (audio_port, handle) = WavAudioPort::new(tone, true);
+        let ua_cfg = UaConfig::new("1001", "secret1001", host, registrar_uri, "0.0.0.0", 0)
+            .with_transport(transport);
+        let eng_cfg = EngineConfig::new(ua_cfg, server_addr, IpAddr::V4(Ipv4Addr::UNSPECIFIED), 0)
+            .with_tls_config(tls_cfg);
+        let engine = SipEngine::spawn(eng_cfg, Box::new(audio_port)).unwrap();
+
+        engine.send_command(EngineCommand::Register).unwrap();
+        assert!(
+            wait_for_engine_event(&engine, Duration::from_secs(10), |e| matches!(
+                e,
+                EngineEvent::RegistrationChanged(RegistrationState::Registered { .. })
+            ))
+            .is_some(),
+            "{label}: REGISTER did not succeed"
+        );
+
+        engine
+            .send_command(EngineCommand::Dial {
+                target_uri: SipUri::parse(target_str).unwrap(),
+            })
+            .unwrap();
+        let mut call_id: Option<String> = None;
+        let mut established = false;
+        let dl = Instant::now() + Duration::from_secs(10);
+        while Instant::now() < dl {
+            if let Some(ev) = engine.recv_event_timeout(Duration::from_millis(50)) {
+                match ev {
+                    EngineEvent::OutboundCallStarted { call_id: cid } => call_id = Some(cid),
+                    EngineEvent::CallEstablished { .. } => {
+                        established = true;
+                        break;
+                    }
+                    EngineEvent::CallTerminated { reason, .. } => {
+                        panic!("{label}: call terminated prematurely: {reason}");
+                    }
+                    _ => {}
+                }
+            }
+        }
+        assert!(established, "{label}: INVITE echo call did not establish");
+
+        thread::sleep(Duration::from_millis(450));
+
+        engine
+            .send_command(EngineCommand::Hangup {
+                call_id: call_id.expect("call_id"),
+            })
+            .unwrap();
+        assert!(
+            wait_for_engine_event(&engine, Duration::from_secs(6), |e| matches!(
+                e,
+                EngineEvent::CallTerminated { .. }
+            ))
+            .is_some(),
+            "{label}: call did not terminate cleanly after BYE"
+        );
+
+        engine.send_command(EngineCommand::Unregister).unwrap();
+        assert!(
+            wait_for_engine_event(&engine, Duration::from_secs(4), |e| matches!(
+                e,
+                EngineEvent::RegistrationChanged(RegistrationState::Unregistered)
+            ))
+            .is_some(),
+            "{label}: clean Unregister did not complete"
+        );
+
+        engine.shutdown().unwrap();
+
+        let recorded = handle.recorded_wav();
+        assert!(
+            recorded.rms_energy() > 1000,
+            "{label}: expected echoed RTP RMS > 1000, got {}",
+            recorded.rms_energy()
+        );
+    }
+}
+
+#[test]
+fn live_p2p_tls_verified_ca_mtls_and_untrusted_rejection() {
+    // Generate a private root CA, server certificate, client mTLS certificate, and an unrelated untrusted CA.
+    let mut ca_params = rcgen::CertificateParams::new(Vec::new()).unwrap();
+    ca_params.is_ca = rcgen::IsCa::Ca(rcgen::BasicConstraints::Unconstrained);
+    let ca_key = rcgen::KeyPair::generate().unwrap();
+    let ca_cert = ca_params.self_signed(&ca_key).unwrap();
+    let ca_pem = ca_cert.pem();
+
+    let srv_params =
+        rcgen::CertificateParams::new(vec!["localhost".to_string(), "127.0.0.1".to_string()])
+            .unwrap();
+    let srv_key = rcgen::KeyPair::generate().unwrap();
+    let srv_cert = srv_params.signed_by(&srv_key, &ca_cert, &ca_key).unwrap();
+
+    let cli_params = rcgen::CertificateParams::new(vec!["alice.local".to_string()]).unwrap();
+    let cli_key = rcgen::KeyPair::generate().unwrap();
+    let cli_cert = cli_params.signed_by(&cli_key, &ca_cert, &ca_key).unwrap();
+
+    let mut other_ca_params = rcgen::CertificateParams::new(Vec::new()).unwrap();
+    other_ca_params.is_ca = rcgen::IsCa::Ca(rcgen::BasicConstraints::Unconstrained);
+    let other_ca_key = rcgen::KeyPair::generate().unwrap();
+    let other_ca_cert = other_ca_params.self_signed(&other_ca_key).unwrap();
+
+    let dummy_registrar = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 1);
+
+    // 1. Spawn Bob as a strict mTLS TLS-server peer.
+    let bob_tls = TlsConfig::new()
+        .with_ca_cert_pem(ca_pem.clone())
+        .with_server_identity(srv_cert.pem(), srv_key.serialize_pem());
+    let bob_ua = UaConfig::new(
+        "bob",
+        "pw",
+        "localhost",
+        SipUri::parse("sip:127.0.0.1:1;transport=tls").unwrap(),
+        "127.0.0.1",
+        0,
+    )
+    .with_transport(SipTransport::Tls);
+    let (bob_port, bob_handle) = WavAudioPort::new(WavPcm16::new(8_000, vec![0; 160]), true);
+    let eng_bob = SipEngine::spawn(
+        EngineConfig::new(bob_ua, dummy_registrar, IpAddr::V4(Ipv4Addr::LOCALHOST), 0)
+            .with_tls_config(bob_tls),
+        Box::new(bob_port),
+    )
+    .unwrap();
+    let bob_addr = eng_bob.local_sip_addr();
+
+    // 2. Spawn Alice as a pure TLS client (no server cert) with verified CA + mTLS client identity.
+    let alice_tls = TlsConfig::new()
+        .with_server_name("localhost")
+        .with_ca_cert_pem(ca_pem)
+        .with_client_identity(cli_cert.pem(), cli_key.serialize_pem());
+    let alice_ua = UaConfig::new(
+        "alice",
+        "pw",
+        "localhost",
+        SipUri::parse(&format!("sip:{bob_addr};transport=tls")).unwrap(),
+        "127.0.0.1",
+        0,
+    )
+    .with_transport(SipTransport::Tls);
+    let tone = WavPcm16::generate_sine_wave(8_000, 600, 1_000, 12_000);
+    let (alice_port, _) = WavAudioPort::new(tone, true);
+    let eng_alice = SipEngine::spawn(
+        EngineConfig::new(alice_ua, bob_addr, IpAddr::V4(Ipv4Addr::LOCALHOST), 0)
+            .with_tls_config(alice_tls),
+        Box::new(alice_port),
+    )
+    .unwrap();
+
+    eng_alice
+        .send_command(EngineCommand::Dial {
+            target_uri: SipUri::parse(&format!("sip:bob@{bob_addr};transport=tls")).unwrap(),
+        })
+        .unwrap();
+
+    let call_bob = match wait_for_engine_event(&eng_bob, Duration::from_secs(6), |e| {
+        matches!(e, EngineEvent::IncomingCall { .. })
+    })
+    .expect("IncomingCall over mTLS on bob")
+    {
+        EngineEvent::IncomingCall { call_id, .. } => call_id,
+        _ => unreachable!(),
+    };
+    eng_bob
+        .send_command(EngineCommand::Answer {
+            call_id: call_bob.clone(),
+        })
+        .unwrap();
+
+    assert!(
+        wait_for_engine_event(&eng_alice, Duration::from_secs(6), |e| matches!(
+            e,
+            EngineEvent::CallEstablished { .. }
+        ))
+        .is_some(),
+        "expected mTLS CallEstablished on alice"
+    );
+    assert!(
+        wait_for_engine_event(&eng_bob, Duration::from_secs(6), |e| matches!(
+            e,
+            EngineEvent::CallEstablished { .. }
+        ))
+        .is_some(),
+        "expected mTLS CallEstablished on bob"
+    );
+
+    thread::sleep(Duration::from_millis(350));
+
+    // Bob (server) hangs up -> must reuse Alice's inbound TLS connection (RFC 5923) even though Alice has no server cert.
+    eng_bob
+        .send_command(EngineCommand::Hangup { call_id: call_bob })
+        .unwrap();
+    assert!(
+        wait_for_engine_event(&eng_alice, Duration::from_secs(6), |e| matches!(
+            e,
+            EngineEvent::CallTerminated { .. }
+        ))
+        .is_some(),
+        "expected BYE over reused TLS connection on alice"
+    );
+    assert!(
+        wait_for_engine_event(&eng_bob, Duration::from_secs(6), |e| matches!(
+            e,
+            EngineEvent::CallTerminated { .. }
+        ))
+        .is_some()
+    );
+
+    assert!(
+        bob_handle.recorded_wav().rms_energy() > 1000,
+        "expected mTLS RTP RMS > 1000 on bob, got {}",
+        bob_handle.recorded_wav().rms_energy()
+    );
+
+    // 3. Spawn an untrusted client (different CA, strict verification) and confirm TLS handshake is rejected.
+    let bad_tls = TlsConfig::new()
+        .with_server_name("localhost")
+        .with_ca_cert_pem(other_ca_cert.pem());
+    let bad_ua = UaConfig::new(
+        "mallory",
+        "pw",
+        "localhost",
+        SipUri::parse(&format!("sip:{bob_addr};transport=tls")).unwrap(),
+        "127.0.0.1",
+        0,
+    )
+    .with_transport(SipTransport::Tls);
+    let (bad_port, _) = WavAudioPort::new(WavPcm16::new(8_000, vec![0; 160]), true);
+    let eng_bad = SipEngine::spawn(
+        EngineConfig::new(bad_ua, bob_addr, IpAddr::V4(Ipv4Addr::LOCALHOST), 0)
+            .with_tls_config(bad_tls),
+        Box::new(bad_port),
+    )
+    .unwrap();
+
+    eng_bad
+        .send_command(EngineCommand::Dial {
+            target_uri: SipUri::parse(&format!("sip:bob@{bob_addr};transport=tls")).unwrap(),
+        })
+        .unwrap();
+
+    let got_tls_warning = wait_for_engine_event(
+        &eng_bad,
+        Duration::from_secs(5),
+        |e| matches!(e, EngineEvent::Warning(msg) if msg.contains("TLS")),
+    );
+    assert!(
+        got_tls_warning.is_some(),
+        "expected strict rustls TLS verification warning against untrusted CA"
+    );
+
+    eng_bad.shutdown().unwrap();
     eng_alice.shutdown().unwrap();
     eng_bob.shutdown().unwrap();
 }

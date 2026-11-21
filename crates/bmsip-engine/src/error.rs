@@ -15,6 +15,7 @@ pub enum EngineError {
     Io(String),
     ChannelClosed,
     InvalidState(String),
+    InvalidConfig(String),
 }
 
 impl fmt::Display for EngineError {
@@ -25,6 +26,7 @@ impl fmt::Display for EngineError {
             Self::Io(msg) => write!(f, "engine I/O error: {msg}"),
             Self::ChannelClosed => write!(f, "engine command or event channel closed"),
             Self::InvalidState(msg) => write!(f, "invalid engine state: {msg}"),
+            Self::InvalidConfig(msg) => write!(f, "invalid engine configuration: {msg}"),
         }
     }
 }

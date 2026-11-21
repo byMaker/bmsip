@@ -110,6 +110,7 @@ enum NictState {
 #[derive(Debug, Clone)]
 struct ClientNonInviteTransaction {
     state: NictState,
+    reliable: bool,
     request_bytes: Vec<u8>,
     timer_e: Option<Instant>,
     timer_e_interval: Duration,
@@ -118,12 +119,14 @@ struct ClientNonInviteTransaction {
 }
 
 impl ClientNonInviteTransaction {
-    fn new(request_bytes: Vec<u8>, now: Instant, timers: RfcTimers) -> Self {
+    fn new(request_bytes: Vec<u8>, reliable: bool, now: Instant, timers: RfcTimers) -> Self {
         let t1 = timers.safe_t1();
         Self {
             state: NictState::Trying,
+            reliable,
             request_bytes,
-            timer_e: Some(now + t1),
+            // RFC 3261 §17.1.2.2: Timer E is only used on unreliable transports (UDP).
+            timer_e: if reliable { None } else { Some(now + t1) },
             timer_e_interval: t1,
             timer_f: Some(now + timers.timer_f()),
             timer_k: None,
@@ -148,9 +151,11 @@ impl ClientNonInviteTransaction {
                 if (100..200).contains(&code) {
                     if self.state == NictState::Trying {
                         self.state = NictState::Proceeding;
-                        let t2 = timers.safe_t2();
-                        self.timer_e_interval = t2;
-                        self.timer_e = Some(now + t2);
+                        if !self.reliable {
+                            let t2 = timers.safe_t2();
+                            self.timer_e_interval = t2;
+                            self.timer_e = Some(now + t2);
+                        }
                     }
                     events.push(TransactionEvent::ClientProvisional {
                         tx_id: tx_id.clone(),
@@ -163,7 +168,8 @@ impl ClientNonInviteTransaction {
                         tx_id: tx_id.clone(),
                         response: resp,
                     });
-                    if timers.t4.is_zero() {
+                    // RFC 3261 §17.1.2.2: Timer K = 0 s for reliable transports.
+                    if self.reliable || timers.t4.is_zero() {
                         self.state = NictState::Terminated;
                         events.push(TransactionEvent::TransactionTerminated(tx_id.clone()));
                     } else {
@@ -228,6 +234,7 @@ enum IctState {
 #[derive(Debug, Clone)]
 struct ClientInviteTransaction {
     state: IctState,
+    reliable: bool,
     original_request: SipRequest,
     request_bytes: Vec<u8>,
     ack_bytes: Option<Vec<u8>>,
@@ -241,16 +248,19 @@ impl ClientInviteTransaction {
     fn new(
         original_request: SipRequest,
         request_bytes: Vec<u8>,
+        reliable: bool,
         now: Instant,
         timers: RfcTimers,
     ) -> Self {
         let t1 = timers.safe_t1();
         Self {
             state: IctState::Calling,
+            reliable,
             original_request,
             request_bytes,
             ack_bytes: None,
-            timer_a: Some(now + t1),
+            // RFC 3261 §17.1.1.2: Timer A is only used on unreliable transports (UDP).
+            timer_a: if reliable { None } else { Some(now + t1) },
             timer_a_interval: t1,
             timer_b: Some(now + timers.timer_b()),
             timer_d: None,
@@ -300,7 +310,8 @@ impl ClientInviteTransaction {
                         tx_id: tx_id.clone(),
                         response: resp,
                     });
-                    if timers.timer_d.is_zero() {
+                    // RFC 3261 §17.1.1.2: Timer D = 0 s for reliable transports.
+                    if self.reliable || timers.timer_d.is_zero() {
                         self.state = IctState::Terminated;
                         events.push(TransactionEvent::TransactionTerminated(tx_id.clone()));
                     } else {
@@ -366,14 +377,16 @@ enum NistState {
 #[derive(Debug, Clone)]
 struct ServerNonInviteTransaction {
     state: NistState,
+    reliable: bool,
     last_response: Option<Vec<u8>>,
     timer_j: Option<Instant>,
 }
 
 impl ServerNonInviteTransaction {
-    fn new() -> Self {
+    fn new(reliable: bool) -> Self {
         Self {
             state: NistState::Trying,
+            reliable,
             last_response: None,
             timer_j: None,
         }
@@ -414,7 +427,8 @@ impl ServerNonInviteTransaction {
                 } else if (200..700).contains(&code) {
                     self.state = NistState::Completed;
                     let j = timers.timer_j();
-                    if j.is_zero() {
+                    // RFC 3261 §17.2.2: Timer J = 0 s for reliable transports.
+                    if self.reliable || j.is_zero() {
                         self.state = NistState::Terminated;
                         events.push(TransactionEvent::TransactionTerminated(tx_id.clone()));
                     } else {
@@ -454,6 +468,7 @@ enum IstState {
 #[derive(Debug, Clone)]
 struct ServerInviteTransaction {
     state: IstState,
+    reliable: bool,
     last_provisional: Option<Vec<u8>>,
     final_response: Option<Vec<u8>>,
     timer_g: Option<Instant>,
@@ -463,9 +478,10 @@ struct ServerInviteTransaction {
 }
 
 impl ServerInviteTransaction {
-    fn new() -> Self {
+    fn new(reliable: bool) -> Self {
         Self {
             state: IstState::Proceeding,
+            reliable,
             last_provisional: None,
             final_response: None,
             timer_g: None,
@@ -506,7 +522,8 @@ impl ServerInviteTransaction {
             self.timer_g = None;
             self.timer_h = None;
             events.push(TransactionEvent::ServerAckReceived(tx_id.clone()));
-            if timers.t4.is_zero() {
+            // RFC 3261 §17.2.1: Timer I = 0 s for reliable transports.
+            if self.reliable || timers.t4.is_zero() {
                 self.state = IstState::Terminated;
                 events.push(TransactionEvent::TransactionTerminated(tx_id.clone()));
             } else {
@@ -545,7 +562,8 @@ impl ServerInviteTransaction {
             self.state = IstState::Completed;
             let t1 = timers.safe_t1();
             self.timer_g_interval = t1;
-            self.timer_g = Some(now + t1);
+            // RFC 3261 §17.2.1: Timer G is only used on unreliable transports (UDP).
+            self.timer_g = if self.reliable { None } else { Some(now + t1) };
             self.timer_h = Some(now + timers.timer_h());
         }
         Ok(())
@@ -672,6 +690,7 @@ impl TransactionManager {
         }
 
         let via = request.top_via()?;
+        let reliable = is_reliable_via_transport(&via.transport);
         let branch = via
             .branch
             .filter(|b| !b.is_empty())
@@ -705,11 +724,17 @@ impl TransactionManager {
             ClientTx::Invite(Box::new(ClientInviteTransaction::new(
                 request,
                 bytes,
+                reliable,
                 now,
                 self.timers,
             )))
         } else {
-            ClientTx::NonInvite(ClientNonInviteTransaction::new(bytes, now, self.timers))
+            ClientTx::NonInvite(ClientNonInviteTransaction::new(
+                bytes,
+                reliable,
+                now,
+                self.timers,
+            ))
         };
 
         self.client_txs.insert(tx_id.clone(), tx);
@@ -782,12 +807,15 @@ impl TransactionManager {
                 }
             }
             SipMessage::Request(req) => {
-                let branch = match req.top_via().and_then(|v| {
-                    v.branch
+                let (branch, reliable) = match req.top_via().and_then(|v| {
+                    let rel = is_reliable_via_transport(&v.transport);
+                    let b = v
+                        .branch
                         .filter(|b| !b.is_empty())
-                        .ok_or(SipError::MissingHeader("Via branch"))
+                        .ok_or(SipError::MissingHeader("Via branch"))?;
+                    Ok((b, rel))
                 }) {
-                    Ok(b) => b,
+                    Ok(pair) => pair,
                     Err(err) => {
                         events.push(TransactionEvent::ProtocolWarning(err.to_string()));
                         return events;
@@ -823,9 +851,9 @@ impl TransactionManager {
                 }
 
                 let tx = if req.method == Method::Invite {
-                    ServerTx::Invite(ServerInviteTransaction::new())
+                    ServerTx::Invite(ServerInviteTransaction::new(reliable))
                 } else {
-                    ServerTx::NonInvite(ServerNonInviteTransaction::new())
+                    ServerTx::NonInvite(ServerNonInviteTransaction::new(reliable))
                 };
                 self.server_txs.insert(tx_id.clone(), tx);
                 events.push(TransactionEvent::ServerRequest {
@@ -958,6 +986,10 @@ fn earliest_instant<const N: usize>(candidates: [Option<Instant>; N]) -> Option<
     candidates.into_iter().flatten().min()
 }
 
+fn is_reliable_via_transport(proto: &str) -> bool {
+    proto.eq_ignore_ascii_case("TCP") || proto.eq_ignore_ascii_case("TLS")
+}
+
 /// Builds a hop-by-hop `ACK` request for a `300..=699` `INVITE` response (RFC 3261 Section 17.1.1.3).
 fn build_non2xx_ack(invite: &SipRequest, response: &SipResponse) -> Vec<u8> {
     let mut ack = SipRequest::new(Method::Ack, invite.uri.clone());
@@ -986,4 +1018,51 @@ fn build_non2xx_ack(invite: &SipRequest, response: &SipResponse) -> Vec<u8> {
     ack.headers.set("Content-Length", "0");
 
     ack.to_bytes()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::sip::SipUri;
+
+    #[test]
+    fn reliable_tcp_tls_transactions_disable_retransmits_and_terminate_immediately() {
+        let t0 = Instant::now();
+        let mut client = TransactionManager::default();
+        let mut server = TransactionManager::default();
+
+        let mut req = SipRequest::new(Method::Options, SipUri::parse("sip:bob@10.0.0.2").unwrap());
+        req.headers
+            .add("Via", "SIP/2.0/TLS 10.0.0.1:5061;branch=z9hG4bK-tls-1");
+        req.headers.set("From", "<sip:alice@pbx.local>;tag=a1");
+        req.headers.set("To", "<sip:bob@pbx.local>");
+        req.headers.set("Call-ID", "tls-tx-1");
+        req.headers.set("CSeq", "1 OPTIONS");
+
+        let _ = client.start_client_transaction(req, t0).unwrap();
+        let out = client.poll_transmit();
+        assert_eq!(out.len(), 1);
+
+        // Advance past T1 (500ms) and T2 (4s) — reliable NICT must NOT retransmit (Timer E = None).
+        let _ = client.handle_timeout(t0 + Duration::from_secs(10));
+        assert!(client.poll_transmit().is_empty());
+        assert_eq!(client.active_client_count(), 1);
+
+        // Server receives request and replies 200 OK -> NIST terminates immediately (Timer J = 0).
+        let srv_evs = server.receive_message(SipMessage::parse(&out[0]).unwrap(), t0);
+        let TransactionEvent::ServerRequest { tx_id, request } = &srv_evs[0] else {
+            panic!("expected ServerRequest");
+        };
+        let r200 = request.create_response(200, "OK").unwrap();
+        let _ = server.send_server_response(tx_id, r200, t0).unwrap();
+        assert_eq!(server.active_server_count(), 0);
+
+        // Client receives 200 OK -> NICT terminates immediately (Timer K = 0).
+        let resp_wire = server.poll_transmit();
+        let cli_evs = client.receive_message(SipMessage::parse(&resp_wire[0]).unwrap(), t0);
+        assert!(cli_evs
+            .iter()
+            .any(|e| matches!(e, TransactionEvent::ClientFinal { .. })));
+        assert_eq!(client.active_client_count(), 0);
+    }
 }

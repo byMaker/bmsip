@@ -5,6 +5,19 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.12.0] - 2026-11-21
+
+### Added
+- **SIP over TCP & TLS 1.2–1.3 (`rustls`) Transport (`bmsip-core`, `bmsip-engine`, `bmsip-ffi`, `bmsip-cli`):**
+  - Added Sans-I/O `SipTransport` (`Udp`, `Tcp`, `Tls`), `SipStreamFramer` (RFC 3261 §18.3 mandatory `Content-Length` byte-stream framing with 64 KiB Slowloris/OOM guard), `StreamWriteQueue`, and RFC 5626 §4.4.1 `\r\n\r\n` / `\r\n` keep-alive frame handling in `bmsip-core::sip::framer`.
+  - Updated `TransactionManager` (RFC 3261 §17) to automatically disable unreliable retransmission timers (`Timer A`, `Timer E`, `Timer G`) and collapse absorb timers (`Timer D`, `Timer I`, `Timer K`, `Timer J` = `0`) whenever the top `Via` transport is `TCP` or `TLS`.
+  - Added `UaConfig::transport` / `UaConfig::with_transport` and `UserAgent::transport()` emitting matching `Via` protocol (`UDP`/`TCP`/`TLS`) and `Contact` `;transport=` parameters across all SIP requests.
+  - Added pure-Rust `rustls` 0.23 (`ring`, zero OpenSSL C dependency) TLS configuration (`TlsConfig`: WebPKI roots, custom `ca_cert_pem`, `server_name` SNI override, mTLS `client_cert_pem`/`client_key_pem`, inbound direct-peer `server_cert_pem`/`server_key_pem`, and lab-only `accept_invalid_certs`) plus `EngineConfig::with_tls_config`.
+  - Implemented non-blocking `SipTransportDriver` in `bmsip-engine` supporting UDP, TCP, and TLS 1.2–1.3 without stalling the 20 ms RTP loop, with RFC 5923 in-dialog connection reuse (NAT-safe & pure-client friendly), periodic RFC 5626 CRLF keep-alive pings/pongs, and immediate stale socket teardown on `EngineCommand::NetworkChanged`.
+  - Exposed `FfiTransport` (`Udp`, `Tcp`, `Tls`) and `BmsipClient::new_with_transport` (`[Name=with_transport]` in `bmsip.udl`), plus C99 `bmsip_client_new_transport` in `include/bmsip.h`.
+  - Added `--transport udp|tcp|tls`, `--tls-ca <path>`, `--tls-server-name <name>`, and `--tls-insecure` flags to `bmsip-cli call` and `bmsip-cli listen`.
+  - Enabled `transport-tcp` (`5060/tcp`) and `transport-tls` (`5061/tls` with generated SAN cert) on the Docker Compose `asterisk` lab container and added live Asterisk TCP/TLS, FreeSWITCH TCP, and `rcgen` P2P verified-CA + mTLS + untrusted-CA rejection integration tests.
+
 ## [0.11.0] - 2026-11-21
 
 ### Added

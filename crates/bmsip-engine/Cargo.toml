@@ -8,4 +8,10 @@ description = "Lock-safe SIP runtime connecting bmsip-core and bmsip-media with 
 [dependencies]
 bmsip-core = { path = "../bmsip-core" }
 bmsip-media = { path = "../bmsip-media" }
+rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12"] }
+rustls-pemfile = "2"
+webpki-roots = "0.26"
+
+[dev-dependencies]
+rcgen = "0.13"
 

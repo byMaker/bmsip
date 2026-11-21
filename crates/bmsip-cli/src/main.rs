@@ -14,12 +14,44 @@ use std::time::{Duration, Instant};
 
 use bmsip_engine::bmsip_core::dialog::{RegistrationState, UaConfig};
 use bmsip_engine::bmsip_core::sdp::RtpCodec;
-use bmsip_engine::bmsip_core::sip::SipUri;
+use bmsip_engine::bmsip_core::sip::{SipTransport, SipUri};
 use bmsip_engine::bmsip_media::{DtmfDigit, WavPcm16};
 use bmsip_engine::{
-    AudioPort, EngineCommand, EngineConfig, EngineEvent, SipEngine, WavAudioHandle, WavAudioPort,
+    AudioPort, EngineCommand, EngineConfig, EngineEvent, SipEngine, TlsConfig, WavAudioHandle,
+    WavAudioPort,
 };
 use live_audio::{LiveAudioHandle, LiveLinuxAudioPort};
+
+fn parse_transport_arg(raw: &str) -> Result<SipTransport, String> {
+    match raw.to_ascii_lowercase().as_str() {
+        "udp" => Ok(SipTransport::Udp),
+        "tcp" => Ok(SipTransport::Tcp),
+        "tls" => Ok(SipTransport::Tls),
+        _ => Err(format!(
+            "unsupported --transport '{raw}' (expected udp, tcp, or tls)"
+        )),
+    }
+}
+
+fn build_tls_config(
+    tls_ca: Option<&str>,
+    tls_server_name: Option<&str>,
+    tls_insecure: bool,
+) -> Result<TlsConfig, String> {
+    let ca_cert_pem = match tls_ca {
+        Some(path) => Some(
+            std::fs::read_to_string(path)
+                .map_err(|e| format!("failed to read --tls-ca '{path}': {e}"))?,
+        ),
+        None => None,
+    };
+    Ok(TlsConfig {
+        ca_cert_pem,
+        server_name: tls_server_name.map(str::to_string),
+        accept_invalid_certs: tls_insecure,
+        ..TlsConfig::default()
+    })
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum DtmfMode {
@@ -108,6 +140,10 @@ struct CallCliArgs {
     user: String,
     password: String,
     target: String,
+    transport: SipTransport,
+    tls_ca: Option<String>,
+    tls_server_name: Option<String>,
+    tls_insecure: bool,
     duration_ms: u64,
     tone_hz: u32,
     codec: CodecChoice,
@@ -127,6 +163,10 @@ struct ListenCliArgs {
     server: String,
     user: String,
     password: String,
+    transport: SipTransport,
+    tls_ca: Option<String>,
+    tls_server_name: Option<String>,
+    tls_insecure: bool,
     duration_ms: u64,
     codec: CodecChoice,
     mic_gain: f32,
@@ -183,6 +223,10 @@ fn print_usage() {
            bmsip-cli selftest --server <host:port> --user <user> --password <pass> [--duration-ms <ms>]\n  \
            bmsip-cli interop [--asterisk <host:port>] [--freeswitch <host:port>] [--kamailio <host:port>] [--duration-ms <ms>]\n\n\
          OPTIONS:\n  \
+           --transport <proto>    SIP signaling transport: udp (default), tcp, or tls\n  \
+           --tls-ca <path>        PEM CA certificate bundle for TLS server verification\n  \
+           --tls-server-name <hn> Explicit TLS SNI / certificate hostname override\n  \
+           --tls-insecure         Disable TLS certificate verification (lab/self-signed servers only)\n  \
            --duration-ms <ms>     Active call duration in milliseconds (default: 1000 / 10000 listen / 800 selftest / 500 interop)\n  \
            --tone-hz <hz>         Generated sine tone frequency or expected tone for analyze/call (default: 440)\n  \
            --codec <name>         Preferred audio codec: opus (default, 48 kHz), g722 (16 kHz HD), pcmu, or pcma\n  \
@@ -222,6 +266,10 @@ fn parse_call_args(args: &[String]) -> Result<CallCliArgs, String> {
     let mut user: Option<String> = None;
     let mut password: Option<String> = None;
     let mut target: Option<String> = None;
+    let mut transport = SipTransport::Udp;
+    let mut tls_ca: Option<String> = None;
+    let mut tls_server_name: Option<String> = None;
+    let mut tls_insecure = false;
     let mut duration_ms: u64 = 1000;
     let mut tone_hz: u32 = 440;
     let mut codec = CodecChoice::Opus;
@@ -243,6 +291,14 @@ fn parse_call_args(args: &[String]) -> Result<CallCliArgs, String> {
             "--user" => user = Some(next_arg_value(args, &mut i, "--user")?),
             "--password" => password = Some(next_arg_value(args, &mut i, "--password")?),
             "--target" => target = Some(next_arg_value(args, &mut i, "--target")?),
+            "--transport" => {
+                transport = parse_transport_arg(&next_arg_value(args, &mut i, "--transport")?)?
+            }
+            "--tls-ca" => tls_ca = Some(next_arg_value(args, &mut i, "--tls-ca")?),
+            "--tls-server-name" => {
+                tls_server_name = Some(next_arg_value(args, &mut i, "--tls-server-name")?)
+            }
+            "--tls-insecure" => tls_insecure = true,
             "--duration-ms" => {
                 let raw = next_arg_value(args, &mut i, "--duration-ms")?;
                 duration_ms = raw
@@ -285,6 +341,10 @@ fn parse_call_args(args: &[String]) -> Result<CallCliArgs, String> {
         user: user.ok_or_else(|| "missing --user".to_string())?,
         password: password.ok_or_else(|| "missing --password".to_string())?,
         target: target.ok_or_else(|| "missing --target".to_string())?,
+        transport,
+        tls_ca,
+        tls_server_name,
+        tls_insecure,
         duration_ms,
         tone_hz,
         codec,
@@ -304,6 +364,10 @@ fn parse_listen_args(args: &[String]) -> Result<ListenCliArgs, String> {
     let mut server: Option<String> = None;
     let mut user: Option<String> = None;
     let mut password: Option<String> = None;
+    let mut transport = SipTransport::Udp;
+    let mut tls_ca: Option<String> = None;
+    let mut tls_server_name: Option<String> = None;
+    let mut tls_insecure = false;
     let mut duration_ms: u64 = 10_000;
     let mut codec = CodecChoice::Opus;
     let mut mic_gain: f32 = 4.0;
@@ -318,6 +382,14 @@ fn parse_listen_args(args: &[String]) -> Result<ListenCliArgs, String> {
             "--server" => server = Some(next_arg_value(args, &mut i, "--server")?),
             "--user" => user = Some(next_arg_value(args, &mut i, "--user")?),
             "--password" => password = Some(next_arg_value(args, &mut i, "--password")?),
+            "--transport" => {
+                transport = parse_transport_arg(&next_arg_value(args, &mut i, "--transport")?)?
+            }
+            "--tls-ca" => tls_ca = Some(next_arg_value(args, &mut i, "--tls-ca")?),
+            "--tls-server-name" => {
+                tls_server_name = Some(next_arg_value(args, &mut i, "--tls-server-name")?)
+            }
+            "--tls-insecure" => tls_insecure = true,
             "--duration-ms" => {
                 let raw = next_arg_value(args, &mut i, "--duration-ms")?;
                 duration_ms = raw
@@ -340,6 +412,10 @@ fn parse_listen_args(args: &[String]) -> Result<ListenCliArgs, String> {
         server: server.ok_or_else(|| "missing --server".to_string())?,
         user: user.ok_or_else(|| "missing --user".to_string())?,
         password: password.ok_or_else(|| "missing --password".to_string())?,
+        transport,
+        tls_ca,
+        tls_server_name,
+        tls_insecure,
         duration_ms,
         codec,
         mic_gain,
@@ -437,11 +513,11 @@ fn parse_interop_args(args: &[String]) -> Result<InteropCliArgs, String> {
     })
 }
 
-fn resolve_server_addr(server: &str) -> Result<SocketAddr, String> {
+fn resolve_server_addr(server: &str, transport: SipTransport) -> Result<SocketAddr, String> {
     let target = if server.contains(':') {
         server.to_string()
     } else {
-        format!("{server}:5060")
+        format!("{server}:{}", transport.default_port())
     };
     target
         .to_socket_addrs()
@@ -540,6 +616,8 @@ fn execute_outbound_session(
     user: &str,
     password: &str,
     target: &str,
+    transport: SipTransport,
+    tls_config: TlsConfig,
     duration_ms: u64,
     codec: CodecChoice,
     mic_gain: f32,
@@ -554,14 +632,16 @@ fn execute_outbound_session(
     target_tone_hz: Option<u32>,
     quiet: bool,
 ) -> Result<(String, WavPcm16), String> {
-    let registrar_addr = resolve_server_addr(server)?;
+    let registrar_addr = resolve_server_addr(server, transport)?;
     let server_host = server.split(':').next().unwrap_or(server);
     let registrar_uri = SipUri::parse(&format!("sip:{server}")).map_err(|e| e.to_string())?;
     let target_uri = SipUri::parse(target).map_err(|e| e.to_string())?;
 
-    let mut ua_cfg = UaConfig::new(user, password, server_host, registrar_uri, "0.0.0.0", 0);
+    let mut ua_cfg = UaConfig::new(user, password, server_host, registrar_uri, "0.0.0.0", 0)
+        .with_transport(transport);
     ua_cfg.supported_codecs = codec.supported_codecs();
-    let eng_cfg = EngineConfig::new(ua_cfg, registrar_addr, IpAddr::V4(Ipv4Addr::UNSPECIFIED), 0);
+    let eng_cfg = EngineConfig::new(ua_cfg, registrar_addr, IpAddr::V4(Ipv4Addr::UNSPECIFIED), 0)
+        .with_tls_config(tls_config);
 
     let record_rx = !live_audio || wav_out.is_some();
     let (audio_port, inspector) = build_audio_port(live_audio, mic_gain, tx_wav, record_rx);
@@ -732,11 +812,19 @@ fn run_call(cli: CallCliArgs) -> Result<(), String> {
         None => None,
     };
 
+    let tls_config = build_tls_config(
+        cli.tls_ca.as_deref(),
+        cli.tls_server_name.as_deref(),
+        cli.tls_insecure,
+    )?;
+
     execute_outbound_session(
         &cli.server,
         &cli.user,
         &cli.password,
         &cli.target,
+        cli.transport,
+        tls_config,
         cli.duration_ms,
         cli.codec,
         cli.mic_gain,
@@ -755,7 +843,12 @@ fn run_call(cli: CallCliArgs) -> Result<(), String> {
 }
 
 fn run_listen(cli: ListenCliArgs) -> Result<(), String> {
-    let registrar_addr = resolve_server_addr(&cli.server)?;
+    let tls_config = build_tls_config(
+        cli.tls_ca.as_deref(),
+        cli.tls_server_name.as_deref(),
+        cli.tls_insecure,
+    )?;
+    let registrar_addr = resolve_server_addr(&cli.server, cli.transport)?;
     let server_host = cli.server.split(':').next().unwrap_or(&cli.server);
     let registrar_uri = SipUri::parse(&format!("sip:{}", cli.server)).map_err(|e| e.to_string())?;
 
@@ -766,9 +859,11 @@ fn run_listen(cli: ListenCliArgs) -> Result<(), String> {
         registrar_uri,
         "0.0.0.0",
         0,
-    );
+    )
+    .with_transport(cli.transport);
     ua_cfg.supported_codecs = cli.codec.supported_codecs();
-    let eng_cfg = EngineConfig::new(ua_cfg, registrar_addr, IpAddr::V4(Ipv4Addr::UNSPECIFIED), 0);
+    let eng_cfg = EngineConfig::new(ua_cfg, registrar_addr, IpAddr::V4(Ipv4Addr::UNSPECIFIED), 0)
+        .with_tls_config(tls_config);
 
     let silence_rate = if cli.live_audio {
         48_000
@@ -949,6 +1044,8 @@ fn run_selftest(cli: SelftestCliArgs) -> Result<(), String> {
             &cli.user,
             &cli.password,
             &target,
+            SipTransport::Udp,
+            TlsConfig::default(),
             cli.duration_ms,
             case.codec,
             4.0,
@@ -1000,7 +1097,7 @@ fn execute_two_party_session(
     duration_ms: u64,
     tone_hz: u32,
 ) -> Result<(String, Option<DtmfDigit>, WavPcm16), String> {
-    let registrar_addr = resolve_server_addr(server)?;
+    let registrar_addr = resolve_server_addr(server, SipTransport::Udp)?;
     let server_host = server.split(':').next().unwrap_or(server);
     let registrar_uri = SipUri::parse(&format!("sip:{server}")).map_err(|e| e.to_string())?;
     let rate = codec.default_wav_sample_rate_hz();
@@ -1349,6 +1446,8 @@ fn run_interop(cli: InteropCliArgs) -> Result<(), String> {
                     "1001",
                     "secret1001",
                     &target,
+                    SipTransport::Udp,
+                    TlsConfig::default(),
                     cli.duration_ms,
                     codec,
                     4.0,
@@ -1469,10 +1568,21 @@ mod tests {
             "info",
             "--transfer",
             "sip:1002@asterisk:5060",
+            "--transport",
+            "tls",
+            "--tls-ca",
+            "/etc/ssl/ca.pem",
+            "--tls-server-name",
+            "asterisk",
+            "--tls-insecure",
         ]);
         let parsed = parse_call_args(&args).unwrap();
         assert_eq!(parsed.server, "asterisk:5060");
         assert_eq!(parsed.user, "1001");
+        assert_eq!(parsed.transport, SipTransport::Tls);
+        assert_eq!(parsed.tls_ca.as_deref(), Some("/etc/ssl/ca.pem"));
+        assert_eq!(parsed.tls_server_name.as_deref(), Some("asterisk"));
+        assert!(parsed.tls_insecure);
         assert_eq!(parsed.duration_ms, 500);
         assert_eq!(parsed.codec, CodecChoice::Pcmu);
         assert_eq!(CodecChoice::parse("g722").unwrap(), CodecChoice::G722);

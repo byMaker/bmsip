@@ -16,6 +16,10 @@ bmsip-cli call \
   --user <username> \
   --password <password> \
   --target <sip_uri> \
+  [--transport udp|tcp|tls] \
+  [--tls-ca <path>] \
+  [--tls-server-name <hostname>] \
+  [--tls-insecure] \
   [--duration-ms <ms>] \
   [--tone-hz <hz>] \
   [--codec opus|g722|pcmu|pcma] \
@@ -30,6 +34,8 @@ bmsip-cli call \
   [--json-report <path>]
 ```
 
+- `--transport udp|tcp|tls`: Selects SIP signaling transport (`udp` default, `tcp`, or `tls` via pure-Rust `rustls` 1.2–1.3).
+- `--tls-ca <path>`, `--tls-server-name <hostname>`, `--tls-insecure`: Optional TLS trust bundle, SNI/hostname override, and lab-only certificate verification bypass.
 - `--live-audio`: Captures microphone input and plays decoded RX audio at `48000 Hz` via PipeWire (`pw-cat`) / PulseAudio (`parec`/`pacat`) / ALSA (`arecord`/`aplay`).
 - `--codec <name>`: Sets preferred outbound SDP offer order (all presets also advertise static Comfort Noise `CN/8000` PT `13`):
   - `opus` (default): `[opus/48000, G722/8000, PCMU, PCMA, CN, telephone-event/48000, telephone-event/8000]`
@@ -50,6 +56,10 @@ bmsip-cli listen \
   --server <host:port> \
   --user <username> \
   --password <password> \
+  [--transport udp|tcp|tls] \
+  [--tls-ca <path>] \
+  [--tls-server-name <hostname>] \
+  [--tls-insecure] \
   [--duration-ms <ms>] \
   [--codec opus|g722|pcmu|pcma] \
   [--mic-gain <mult>] \
@@ -114,8 +124,8 @@ Runs 12 live SIP/RTP/DTMF scenarios verifying compatibility across distinct SIP 
 
 | Service | Software & SIP Engine | Port & Accounts | Enabled Codecs & Dialplan |
 |---|---|---|---|
-| `asterisk` | Asterisk 20 (`chan_pjsip` B2BUA) | `5060/udp`, users `1001`–`1003` (`secret1001`–`secret1003`) | `opus, g722, ulaw, alaw`; `600` (Wait/Hangup), `601` (`Echo()`), `1001`–`1003` (P2P bridge) |
-| `freeswitch` | FreeSWITCH 1.10 (`mod_sofia` + `mod_opus` + `mod_spandsp`) | `5060/udp`, users `1001`–`1003` (`secret1001`–`secret1003`) | `OPUS, G722, PCMU, PCMA`; `407 Proxy-Authenticate`; `600`, `601` (`echo`), `1001`–`1003` (`bridge`) |
+| `asterisk` | Asterisk 20 (`chan_pjsip` B2BUA) | `5060/udp`, `5060/tcp`, `5061/tls`, users `1001`–`1003` (`secret1001`–`secret1003`) | `opus, g722, ulaw, alaw`; `600` (Wait/Hangup), `601` (`Echo()`), `1001`–`1003` (P2P bridge) |
+| `freeswitch` | FreeSWITCH 1.10 (`mod_sofia` + `mod_opus` + `mod_spandsp`) | `5060/udp`, `5060/tcp`, users `1001`–`1003` (`secret1001`–`secret1003`) | `OPUS, G722, PCMU, PCMA`; `407 Proxy-Authenticate`; `600`, `601` (`echo`), `1001`–`1003` (`bridge`) |
 | `kamailio` | Kamailio 5.8 (`sl`/`tm`/`rr`/`registrar`/`usrloc`/`auth`) | `5060/udp`, open registrar for test subnet (`bmsip-net`) | Loose routing (`Record-Route`/`Route`), dual `Via`, direct P2P RTP/DTMF between registered endpoints |
 | `dev` | Debian Bookworm + Rust toolchain + `libopus-dev` + `gcc` | Workspace mounted at `/workspace` | Runs `cargo fmt`, `clippy`, `test`, `bmsip-cli` with optional PipeWire/ALSA host passthrough |
 
@@ -128,4 +138,4 @@ All verification commands run inside `dev`:
 - **Unit, Simulation & Mutation Fuzz Tests (`bmsip-core`):** SIP/SDP parsers, MD5/SHA-256 Digest auth, RFC 3261 transaction timers under loss/duplication (`tests/rfc_simulation.rs`), dialog/handover/call-control FSMs (`tests/dialog_simulation.rs`), and 4,000-iteration deterministic parser mutation stress testing.
 - **Media Unit & Fuzz Tests (`bmsip-media`):** G.711 zero codes, ITU-T G.722 lowband/highband unity-gain roundtrip, Opus TOC/`fmtp`/mic-conditioning, custom `CodecRegistry` resampling, RFC 4733 DTMF deduplication, RFC 3389 Comfort Noise (`CN` PT 13) SID DTX synthesis, RTCP stats, adaptive jitter PLC crossfade, and 4,000-iteration zero-copy RTP/RTCP/codec fuzzing.
 - **FFI & C ABI Tests (`bmsip-ffi`):** `bmsip.udl` API parity (`udl_schema_matches_rust_sdk_surface`), C99 compilation checks with `gcc -std=c99 -Wall -Wextra -Werror` on `include/bmsip.h` and `bindings/c/minimal_phone.c`, plus live Asterisk call & hold/resume verification over `BmsipClient` and `bmsip_*` C functions (`tests/ffi_integration.rs`).
-- **Live PBX, Routing & Custom Plugin Integration Tests (`bmsip-engine`):** 9 tests in `crates/bmsip-engine/tests/asterisk_integration.rs` covering `REGISTER`/`INVITE`/`BYE`, `PCMU` Echo, `Opus 48 kHz` Echo, `Suspend`/`Resume` + Black-Box JSON, FreeSWITCH `407`/Echo + Kamailio P2P, G.722 Echo across Asterisk/FreeSWITCH, external custom `L16/16000` codec plugin calls routed via Kamailio, direct peer symmetric SIP routing + bounded/48 kHz audio ports, live Call Hold / Resume (`re-INVITE` `a=sendonly`/`a=sendrecv`), and live early media `183 Session Progress` + SIP `INFO` DTMF.
+- **Live PBX, Transport, Routing & Custom Plugin Integration Tests (`bmsip-engine`):** 11 tests in `crates/bmsip-engine/tests/asterisk_integration.rs` covering `REGISTER`/`INVITE`/`BYE`, `PCMU` Echo, `Opus 48 kHz` Echo, `Suspend`/`Resume` + Black-Box JSON, FreeSWITCH `407`/Echo + Kamailio P2P, G.722 Echo across Asterisk/FreeSWITCH, external custom `L16/16000` codec plugin calls routed via Kamailio, direct peer symmetric SIP routing + bounded/48 kHz audio ports, live Call Hold / Resume (`re-INVITE` `a=sendonly`/`a=sendrecv`), live early media `183 Session Progress` + SIP `INFO` DTMF, live SIP over TCP (`asterisk:5060`, `freeswitch:5060`) & TLS (`asterisk:5061`) Echo calls, and P2P strict-CA + mTLS + untrusted-CA rejection verification.

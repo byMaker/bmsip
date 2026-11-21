@@ -2,7 +2,7 @@
 
 **bmsip** is a modern, embeddable, cross-platform SIP & RTP telephony library written in Rust from the ground up for **Linux**, **iOS**, and **Android**, complete with a live-audio Linux CLI softphone and an automated multi-server SIP interoperability lab.
 
-- **Current Version:** `0.9.2` ([CHANGELOG.md](./CHANGELOG.md))
+- **Current Version:** `0.12.0` ([CHANGELOG.md](./CHANGELOG.md))
 - **Architecture Specification:** [ARCHITECTURE.md](./ARCHITECTURE.md)
 - **Developer Guides:** [SDK Guide](./docs/SDK_GUIDE.md) · [Codecs & Audio Pipeline](./docs/CODECS_AND_AUDIO.md) · [CLI & Interop Lab](./docs/CLI_AND_TESTING.md)
 - **License:** `AGPL-3.0-only` ([LICENSE](./LICENSE) · [NOTICE](./NOTICE) · commercial licensing: [bymaker.com](https://bymaker.com))
@@ -14,6 +14,7 @@
 Legacy C/C++ SIP stacks often suffer from hidden global state, callback re-entrancy deadlocks, entangled socket/audio I/O, and awkward mobile OS integration. `bmsip` solves these by design:
 
 - **100% Sans-I/O Protocol Core (`bmsip-core`):** `#![forbid(unsafe_code)]`, zero external crate dependencies, zero sockets/threads/system-clock calls. All time and network I/O are injected explicitly for deterministic simulation under packet loss, reordering, and duplication.
+- **Multi-Transport SIP Signaling (UDP, TCP & TLS 1.2–1.3):** Pure-Rust `rustls` (`ring`, RFC 5922) with custom CA bundles, SNI hostname verification, mutual TLS (mTLS), Sans-I/O RFC 3261 §18.3 stream framing (`SipStreamFramer`), RFC 5626 CRLF keep-alive, and RFC 5923 connection reuse.
 - **Lock-Safe Command/Event Runtime (`bmsip-engine`):** Multiple independent `SipEngine` instances run safely in one process. Applications interact strictly via non-blocking `EngineCommand` / `EngineEvent` queues — zero callbacks under mutexes.
 - **Built-in "Golden Trio" Audio Codecs + Pluggable Registry (`bmsip-media`):**
   - **Opus (`48 kHz` Fullband HD):** Native `libopus` C FFI integration (`LibOpusCodec`) with pure-Rust RFC 6716 TOC fallback (`BuiltInOpusCodec`).
@@ -35,7 +36,7 @@ bmsip/
 ├── crates/
 │   ├── bmsip-core/     # Sans-I/O SIP/2.0, SDP (RFC 4566/3264), MD5/SHA-256 Digest Auth, RFC 3261 tx & dialog FSMs
 │   ├── bmsip-media/    # Safe-Rust RTP/RTCP, G.711/G.722/Opus, CodecRegistry plugins, DTMF (RFC 4733), jitter buffer, DSP
-│   ├── bmsip-engine/   # Lock-safe SipEngine runtime, UDP transport, monotonic timers, libopus FFI, AudioPort, FlightRecorder
+│   ├── bmsip-engine/   # Lock-safe SipEngine runtime, UDP/TCP/TLS (rustls) transport, timers, libopus FFI, AudioPort, FlightRecorder
 │   ├── bmsip-ffi/      # Cross-platform BmsipClient (UniFFI bmsip.udl) & C99 ABI (include/bmsip.h)
 │   └── bmsip-cli/      # CLI softphone (`call`, `listen`), DSP WAV `analyze`, PBX `selftest`, and 3-server `interop` suite
 ├── bindings/
@@ -110,12 +111,14 @@ docker compose exec -T dev cargo run -q -p bmsip-cli -- selftest \
 Place a live microphone/speaker SIP call (`PipeWire` / `PulseAudio` / `ALSA` at `48 kHz`) using `opus` (default), wideband `g722`, `pcmu`, or `pcma`:
 
 ```bash
-# Outbound call to extension 601 (Echo test) with live mic/headset and DSP summary
+# Outbound call to extension 601 (Echo test) with live mic/headset and DSP summary (supports --transport udp|tcp|tls)
 docker compose exec -T dev cargo run -p bmsip-cli -- call \
-  --server asterisk:5060 \
+  --server asterisk:5061 \
+  --transport tls \
+  --tls-insecure \
   --user 1001 \
   --password secret1001 \
-  --target sip:601@asterisk:5060 \
+  --target "sip:601@asterisk:5061;transport=tls" \
   --duration-ms 5000 \
   --codec opus \
   --mic-gain 4.0 \

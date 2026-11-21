@@ -7,6 +7,12 @@ enum FfiError {
     "Closed",
 };
 
+enum FfiTransport {
+    "Udp",
+    "Tcp",
+    "Tls",
+};
+
 dictionary FfiConfig {
     string username;
     string password;
@@ -52,6 +58,15 @@ interface BmsipClient {
 
     [Name=with_sample_rate, Throws=FfiError]
     constructor(FfiConfig config, u32 sample_rate_hz);
+
+    [Name=with_transport, Throws=FfiError]
+    constructor(
+        FfiConfig config,
+        u32 sample_rate_hz,
+        FfiTransport transport,
+        string? tls_ca_pem,
+        boolean tls_insecure
+    );
 
     u32 audio_sample_rate_hz();
 

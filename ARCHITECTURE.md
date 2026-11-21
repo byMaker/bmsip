@@ -16,7 +16,7 @@ bmsip-ffi  ──┘                 └─────────────�
 |---|---|---|
 | `bmsip-core` | SIP message parser/serializer, URI/header types, SDP offer/answer, Digest Auth, RFC 3261 transactions, dialogs, account registration state | `#![forbid(unsafe_code)]`; empty `[dependencies]`; zero `std::net`, `std::thread`, `std::fs`, `Instant::now()`, `SystemTime::now()`, or async runtimes |
 | `bmsip-media` | RTP/RTCP framing, DTMF (RFC 4733), adaptive jitter buffer, G.711/G.722/Opus codecs, universal `CodecRegistry` plugin API, 20 ms PCM frame pipeline | `#![forbid(unsafe_code)]`; zero direct OS audio device calls (ALSA, PipeWire, CoreAudio, Oboe) |
-| `bmsip-engine` | UDP/TCP socket loop, monotonic timer driver, `Command`/`Event` queues, `AudioPort` trait, call flight recorder | Zero global singletons (`static mut`); zero user callbacks invoked under held locks; multi-instance safe |
+| `bmsip-engine` | UDP/TCP/TLS (`rustls`) socket loop, monotonic timer driver, `Command`/`Event` queues, `AudioPort` trait, call flight recorder | Zero global singletons (`static mut`); zero user callbacks invoked under held locks; multi-instance safe |
 | `bmsip-ffi` | Public cross-platform SDK boundary (UniFFI for Swift/Kotlin + C-API header for Linux) | Thin translation layer over `bmsip-engine` `Command`/`Event` model |
 | `bmsip-cli` | Linux CLI SIP endpoint and automated integration test runner | Consumes only `bmsip-engine` public API |
 
@@ -55,6 +55,7 @@ bmsip-ffi  ──┘                 └─────────────�
 | RFC 3515 / 3891 | Blind (`REFER` + `NOTIFY message/sipfrag`) and Attended (`Replaces`) Call Transfer | Implemented (`v0.10.0`) |
 | RFC 4028 / 3326 / 3323 / 3325 | `Session-Timers` (`Session-Expires`/`Min-SE`/`422`), `Reason` header, `P-Asserted-Identity` & `Privacy` | Implemented (`v0.10.0`) |
 | RFC 3960 / 2976 / 3389 | Early media (`183`/`180` SDP), SIP `INFO` DTMF (`application/dtmf-relay`), Comfort Noise (`CN` PT 13) | Implemented (`v0.11.0`) |
+| RFC 3261 §18 / 5626 / 5922 / 5923 | SIP over TCP & TLS 1.2–1.3 (`rustls`, mTLS), `Content-Length` stream framing, CRLF keep-alive, connection reuse | Implemented (`v0.12.0`) |
 
 ---
 
@@ -93,14 +94,15 @@ All workspace crates share a synchronized **SemVer 2.0.0** version in root `Carg
 - **`0.9.1` — Stage 9 Polish:** Symmetric low-pass FIR downsamplers + stateful `StreamResampler`, zero-copy `RtpPacketRef` hot path, `Condvar` instant command wakeup & adaptive idle polling, live companion RTCP (`rtp_port + 1`) reporting, and deterministic parser mutation fuzz tests.
 - **`0.9.2` — Protocol, Media & FFI Hardening:** RFC 3261 `491` glare / `remote_cseq` / `stale=true` / multi-`Contact` / `488` fixes, restart-safe `instance_seed`, 48 kHz-scaled RFC 4733 DTMF durations, mid-call SSRC reset & RTCP interval loss tracking, symmetric/Route SIP routing, RTP rebind on `NetworkChanged`, deterministic multi-call focus, bounded WAV recording, and native `8`/`16`/`48` kHz FFI/C99 HD audio bridges.
 - **`0.10.0` — Stage 10:** Core Call Control (Hold/Resume via `a=sendonly`/`inactive`/`sendrecv`, Blind `REFER`/`NOTIFY` & Attended `Replaces` transfer, early/in-dialog `UPDATE`, `PRACK`/`100rel`, `Session-Timers` with `422` auto-retry and `UPDATE` refresh, `Reason`, and `P-Asserted-Identity`/`Privacy`) across `bmsip-core`, `bmsip-engine`, `bmsip-ffi` (UniFFI + C99), and `bmsip-cli`.
-- **`0.11.0` — Stage 11 (Current):** Early Media (`183`/`180` SDP) RTP activation before `200 OK`, Legacy SIP `INFO` DTMF (`application/dtmf-relay`, RFC 2976) with `--dtmf-mode rfc4733|info`, and RFC 3389 Comfort Noise (`CN` PT 13) SID synthesis across `bmsip-core`, `bmsip-media`, `bmsip-engine`, `bmsip-ffi`, and `bmsip-cli`.
+- **`0.11.0` — Stage 11:** Early Media (`183`/`180` SDP) RTP activation before `200 OK`, Legacy SIP `INFO` DTMF (`application/dtmf-relay`, RFC 2976) with `--dtmf-mode rfc4733|info`, and RFC 3389 Comfort Noise (`CN` PT 13) SID synthesis across `bmsip-core`, `bmsip-media`, `bmsip-engine`, `bmsip-ffi`, and `bmsip-cli`.
+- **`0.12.0` — Stage 12 (Current):** SIP over TCP and TLS 1.2–1.3 (`rustls`, mTLS, RFC 5922) with Sans-I/O `SipStreamFramer` (RFC 3261 §18.3), RFC 3261 §17 reliable-transport transaction timers, RFC 5626 CRLF keep-alive, and RFC 5923 connection reuse across all crates and the Docker Compose lab.
 
 ---
 
 ## 6. Future Roadmap / TODO
 
 - **TODO 1 — Transport Security & Media Encryption:**
-  - SIP over TCP and TLS 1.2–1.3 (`rustls`, RFC 5922) with stream framing and persistent NAT keep-alive (RFC 5626).
+  - *SIP over TCP & TLS 1.2–1.3 (`rustls`, RFC 5922, RFC 5626): Completed in `v0.12.0`.*
   - Media encryption: **SRTP** (RFC 3711) with **SDES** key exchange (RFC 4568) and **DTLS-SRTP** for public internet traversal.
 - **TODO 2 — Core Call Control (Softphone Essentials):** *Completed in `v0.10.0`.*
 - **TODO 3 — Early Media, Legacy DTMF & Comfort Noise:** *Completed in `v0.11.0`.*

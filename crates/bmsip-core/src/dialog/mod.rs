@@ -10,7 +10,7 @@ use crate::error::SipError;
 use crate::sdp::{negotiate_offer_answer, Direction, RtpCodec, SdpSession};
 use crate::sip::{
     CSeq, CallerIdentity, Method, NameAddr, RAck, ReasonHeader, ReplacesHeader, SessionExpires,
-    SessionRefresher, SipMessage, SipRequest, SipResponse, SipUri, Via,
+    SessionRefresher, SipMessage, SipRequest, SipResponse, SipTransport, SipUri, Via,
 };
 use crate::transaction::{RfcTimers, TransactionEvent, TransactionId, TransactionManager};
 
@@ -75,6 +75,8 @@ pub struct UaConfig {
     pub registrar_uri: SipUri,
     pub local_host: String,
     pub local_sip_port: u16,
+    /// Signaling transport protocol (`UDP`, `TCP`, or `TLS`; default `SipTransport::Udp`).
+    pub transport: SipTransport,
     pub expires_secs: u32,
     pub supported_codecs: Vec<RtpCodec>,
     pub timers: RfcTimers,
@@ -109,6 +111,7 @@ impl UaConfig {
             registrar_uri,
             local_host: local_host.into(),
             local_sip_port,
+            transport: SipTransport::Udp,
             expires_secs: 300,
             supported_codecs: vec![
                 RtpCodec::pcmu(),
@@ -123,6 +126,12 @@ impl UaConfig {
             asserted_identity: None,
             privacy: None,
         }
+    }
+
+    /// Sets the SIP signaling transport protocol (`Udp`, `Tcp`, or `Tls`).
+    pub fn with_transport(mut self, transport: SipTransport) -> Self {
+        self.transport = transport;
+        self
     }
 
     /// Sets an explicit instance seed for unique Call-ID, tag, branch, and Digest `cnonce` generation across restarts.
@@ -161,7 +170,7 @@ impl UaConfig {
         SipUri::new(self.local_host.clone())
             .with_user(self.username.clone())
             .with_port(self.local_sip_port)
-            .with_param("transport", Some("udp".to_string()))
+            .with_param("transport", Some(self.transport.uri_param().to_string()))
     }
 
     fn local_from_name_addr(&self) -> NameAddr {
@@ -390,6 +399,11 @@ impl UserAgent {
     /// Returns the current User Agent configuration.
     pub fn config(&self) -> &UaConfig {
         &self.config
+    }
+
+    /// Returns the configured SIP signaling transport (`Udp`, `Tcp`, or `Tls`).
+    pub fn transport(&self) -> SipTransport {
+        self.config.transport
     }
 
     /// Returns the current SIP registration state.
@@ -1295,7 +1309,7 @@ impl UserAgent {
             req.headers.add(
                 "Via",
                 Via::new(
-                    "UDP",
+                    self.config.transport.via_proto(),
                     format!("{}:{}", self.config.local_host, self.config.local_sip_port),
                     branch,
                 )
@@ -1403,7 +1417,7 @@ impl UserAgent {
             req.headers.add(
                 "Via",
                 Via::new(
-                    "UDP",
+                    self.config.transport.via_proto(),
                     format!("{}:{}", self.config.local_host, self.config.local_sip_port),
                     branch,
                 )
@@ -1502,7 +1516,7 @@ impl UserAgent {
             req.headers.add(
                 "Via",
                 Via::new(
-                    "UDP",
+                    self.config.transport.via_proto(),
                     format!("{}:{}", self.config.local_host, self.config.local_sip_port),
                     branch,
                 )
@@ -1866,7 +1880,7 @@ impl UserAgent {
         req.headers.add(
             "Via",
             Via::new(
-                "UDP",
+                self.config.transport.via_proto(),
                 format!("{}:{}", self.config.local_host, self.config.local_sip_port),
                 branch,
             )
@@ -1912,7 +1926,7 @@ impl UserAgent {
         req.headers.add(
             "Via",
             Via::new(
-                "UDP",
+                config.transport.via_proto(),
                 format!("{}:{}", config.local_host, config.local_sip_port),
                 branch,
             )
@@ -1968,7 +1982,7 @@ impl UserAgent {
         req.headers.add(
             "Via",
             Via::new(
-                "UDP",
+                config.transport.via_proto(),
                 format!("{}:{}", config.local_host, config.local_sip_port),
                 branch,
             )
@@ -2027,7 +2041,7 @@ impl UserAgent {
         req.headers.add(
             "Via",
             Via::new(
-                "UDP",
+                config.transport.via_proto(),
                 format!("{}:{}", config.local_host, config.local_sip_port),
                 branch,
             )
@@ -2077,7 +2091,7 @@ impl UserAgent {
         ack.headers.add(
             "Via",
             Via::new(
-                "UDP",
+                self.config.transport.via_proto(),
                 format!("{}:{}", self.config.local_host, self.config.local_sip_port),
                 branch,
             )
@@ -2190,7 +2204,7 @@ impl UserAgent {
             bye.headers.add(
                 "Via",
                 Via::new(
-                    "UDP",
+                    self.config.transport.via_proto(),
                     format!("{}:{}", self.config.local_host, self.config.local_sip_port),
                     branch,
                 )
@@ -3360,7 +3374,7 @@ impl UserAgent {
             req.headers.add(
                 "Via",
                 Via::new(
-                    "UDP",
+                    self.config.transport.via_proto(),
                     format!("{}:{}", self.config.local_host, self.config.local_sip_port),
                     branch,
                 )
