@@ -5,6 +5,16 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.16.2] - 2026-11-24
+
+### Added
+- **Configurable SIP `User-Agent` Header (`bmsip-core`):**
+  - Exported `DEFAULT_USER_AGENT` and added `UaConfig::user_agent`, `UaConfig::with_user_agent(...)`, and `UaConfig::effective_user_agent()` in [`dialog/mod.rs`](crates/bmsip-core/src/dialog/mod.rs), stripping CRLF characters and falling back to `bmsip/<version>` when empty.
+  - Applied `effective_user_agent()` across outbound `REGISTER`, `INVITE`, `re-INVITE`, `UPDATE`, and `INFO` requests so host softphones can identify themselves in standard `Product/<ver> (bmsip/<ver>)` format.
+
+### Documentation
+- Synchronized `Cargo.toml`, `CHANGELOG.md`, `README.md`, `ARCHITECTURE.md`, and `docs/SDK_GUIDE.md` to `0.16.2`.
+
 ## [0.16.1] - 2026-11-24
 
 ### Fixed

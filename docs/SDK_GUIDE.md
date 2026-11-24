@@ -65,6 +65,7 @@ use bmsip_engine::bmsip_core::sip::SipTransport;
 use bmsip_engine::TlsConfig;
 
 let ua_cfg = ua_cfg
+    .with_user_agent(format!("MySoftphone/1.0 ({})", bmsip_engine::bmsip_core::dialog::DEFAULT_USER_AGENT))
     .with_transport(SipTransport::Tls) // SipTransport::Udp (default), Tcp, or Tls
     .with_srtp_mode(SrtpMode::SdesRequired) // Disabled (default), SdesOptional, or SdesRequired (requires TLS)
     .with_session_timers(Some(1800), 90) // Session-Expires (s), Min-SE (s); pass None to disable

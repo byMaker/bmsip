@@ -18,7 +18,7 @@ use crate::sip::{
 };
 use crate::transaction::{RfcTimers, TransactionEvent, TransactionId, TransactionManager};
 
-const DEFAULT_USER_AGENT: &str = concat!("bmsip/", env!("CARGO_PKG_VERSION"));
+pub const DEFAULT_USER_AGENT: &str = concat!("bmsip/", env!("CARGO_PKG_VERSION"));
 const ALLOW_METHODS: &str = "INVITE, ACK, CANCEL, BYE, OPTIONS, UPDATE, PRACK, INFO, REFER, NOTIFY";
 const SUPPORTED_EXTENSIONS: &str = "timer, 100rel, replaces";
 const MAX_STALE_AUTH_RETRIES: u8 = 3;
@@ -104,6 +104,8 @@ pub struct UaConfig {
     /// Explicit opt-in allowing RFC 4568 SDES `a=crypto:` keys over unencrypted UDP/TCP signaling (default `false`;
     /// strictly for isolated lab/test environments — RFC 4568 §8 requires TLS in production).
     pub allow_insecure_cleartext_sdes: bool,
+    /// Custom SIP `User-Agent` header value attached to outbound requests (defaults to [`DEFAULT_USER_AGENT`]).
+    pub user_agent: String,
 }
 
 impl UaConfig {
@@ -141,6 +143,7 @@ impl UaConfig {
             privacy: None,
             srtp_mode: SrtpMode::Disabled,
             allow_insecure_cleartext_sdes: false,
+            user_agent: DEFAULT_USER_AGENT.to_string(),
         }
     }
 
@@ -194,6 +197,17 @@ impl UaConfig {
     pub fn with_allow_insecure_cleartext_sdes(mut self, allow: bool) -> Self {
         self.allow_insecure_cleartext_sdes = allow;
         self
+    }
+
+    /// Overrides the SIP `User-Agent` header value attached to outbound requests (defaults to [`DEFAULT_USER_AGENT`]).
+    pub fn with_user_agent(mut self, user_agent: impl Into<String>) -> Self {
+        self.user_agent = sanitize_user_agent(&user_agent.into());
+        self
+    }
+
+    /// Returns the sanitized `User-Agent` header string, falling back to [`DEFAULT_USER_AGENT`] if empty.
+    pub fn effective_user_agent(&self) -> String {
+        sanitize_user_agent(&self.user_agent)
     }
 
     /// Evaluates the effective SRTP mode enforcing RFC 4568 §8 (SDES requires TLS unless explicitly overridden).
@@ -2030,7 +2044,8 @@ impl UserAgent {
                 "Contact",
                 NameAddr::new(self.config.contact_uri()).to_string(),
             );
-            req.headers.set("User-Agent", DEFAULT_USER_AGENT);
+            req.headers
+                .set("User-Agent", self.config.effective_user_agent());
             call.info_auth.apply(&mut req.headers);
             req
         };
@@ -2597,7 +2612,8 @@ impl UserAgent {
         req.headers.set("Expires", expires.to_string());
         req.headers.set("Allow", ALLOW_METHODS);
         req.headers.set("Supported", SUPPORTED_EXTENSIONS);
-        req.headers.set("User-Agent", DEFAULT_USER_AGENT);
+        req.headers
+            .set("User-Agent", self.config.effective_user_agent());
         self.reg_session.auth.apply(&mut req.headers);
 
         let tx_id = self.transactions.start_client_transaction(req, now)?;
@@ -2639,7 +2655,7 @@ impl UserAgent {
             .set("Contact", NameAddr::new(config.contact_uri()).to_string());
         req.headers.set("Allow", ALLOW_METHODS);
         req.headers.set("Supported", SUPPORTED_EXTENSIONS);
-        req.headers.set("User-Agent", DEFAULT_USER_AGENT);
+        req.headers.set("User-Agent", config.effective_user_agent());
         if let Some(se) = call.session_expires_secs {
             req.headers.set("Session-Expires", se.to_string());
             req.headers
@@ -2695,6 +2711,7 @@ impl UserAgent {
             .set("Contact", NameAddr::new(config.contact_uri()).to_string());
         req.headers.set("Allow", ALLOW_METHODS);
         req.headers.set("Supported", SUPPORTED_EXTENSIONS);
+        req.headers.set("User-Agent", config.effective_user_agent());
         if let Some(se) = call.session_expires_secs {
             let refresher = if call.session_refresher_is_local {
                 Some(SessionRefresher::Uac)
@@ -2750,6 +2767,7 @@ impl UserAgent {
         req.headers
             .set("Contact", NameAddr::new(config.contact_uri()).to_string());
         req.headers.set("Supported", SUPPORTED_EXTENSIONS);
+        req.headers.set("User-Agent", config.effective_user_agent());
         if let Some(se) = call.session_expires_secs {
             let refresher = if call.session_refresher_is_local {
                 Some(SessionRefresher::Uac)
@@ -5932,4 +5950,79 @@ fn parse_sip_info_dtmf(body: &[u8], media_type: &str) -> Option<(char, u32)> {
         }
     }
     signal.map(|d| (d, duration_ms))
+}
+
+fn sanitize_user_agent(raw: &str) -> String {
+    let cleaned: String = raw.chars().filter(|&c| c != '\r' && c != '\n').collect();
+    let trimmed = cleaned.trim();
+    if trimmed.is_empty() {
+        DEFAULT_USER_AGENT.to_string()
+    } else {
+        trimmed.to_string()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn user_agent_defaults_and_custom_sanitization_apply_to_register_and_invite() {
+        let now = Instant::now();
+        let registrar = SipUri::parse("sip:10.0.0.1:5060").unwrap();
+
+        // Default UaConfig emits bmsip/<version>.
+        let default_cfg = UaConfig::new(
+            "1001",
+            "secret",
+            "pbx.local",
+            registrar.clone(),
+            "10.0.0.2",
+            5060,
+        );
+        assert_eq!(default_cfg.effective_user_agent(), DEFAULT_USER_AGENT);
+        let mut ua_def = UserAgent::new(default_cfg);
+        ua_def.register(now).unwrap();
+        let reg_bytes = ua_def.poll_transmit();
+        let SipMessage::Request(reg_req) = SipMessage::parse(&reg_bytes[0]).unwrap() else {
+            panic!("expected REGISTER request");
+        };
+        assert_eq!(reg_req.headers.get("User-Agent"), Some(DEFAULT_USER_AGENT));
+
+        // Custom User-Agent applies to REGISTER and INVITE, stripping CRLF injection and empty strings fall back.
+        let custom_ua = format!("bmphone/0.6.6 ({DEFAULT_USER_AGENT})");
+        let cfg = UaConfig::new(
+            "1001",
+            "secret",
+            "pbx.local",
+            registrar.clone(),
+            "10.0.0.2",
+            5060,
+        )
+        .with_user_agent(format!("  {custom_ua}\r\n"));
+        assert_eq!(cfg.effective_user_agent(), custom_ua);
+        let empty_fallback =
+            UaConfig::new("1001", "secret", "pbx.local", registrar, "10.0.0.2", 5060)
+                .with_user_agent("  \r\n ");
+        assert_eq!(empty_fallback.effective_user_agent(), DEFAULT_USER_AGENT);
+
+        let mut ua = UserAgent::new(cfg);
+        ua.register(now).unwrap();
+        let bytes = ua.poll_transmit();
+        let SipMessage::Request(custom_reg) = SipMessage::parse(&bytes[0]).unwrap() else {
+            panic!("expected custom REGISTER request");
+        };
+        assert_eq!(
+            custom_reg.headers.get("User-Agent"),
+            Some(custom_ua.as_str())
+        );
+
+        let target = SipUri::parse("sip:1002@pbx.local").unwrap();
+        ua.dial(target, 20000, now).unwrap();
+        let inv_bytes = ua.poll_transmit();
+        let SipMessage::Request(inv_req) = SipMessage::parse(&inv_bytes[0]).unwrap() else {
+            panic!("expected INVITE request");
+        };
+        assert_eq!(inv_req.headers.get("User-Agent"), Some(custom_ua.as_str()));
+    }
 }
