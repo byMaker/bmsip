@@ -48,6 +48,11 @@ impl PlayoutFrame {
     }
 }
 
+/// Hysteresis window (`250` clean 20 ms pops = `5.0 s`) before decaying an underrun-induced depth floor by 1 frame.
+const UNDERRUN_FLOOR_DECAY_POPS: u32 = 250;
+/// Low-jitter packet window (`50` packets = `1.0 s`) before shrinking `target_depth_frames` below `initial_depth_frames`.
+const SUB_INITIAL_SHRINK_PACKETS: u32 = 50;
+
 /// Reordering adaptive jitter buffer for 20 ms mono PCM frames.
 #[derive(Debug, Clone)]
 pub struct AdaptiveJitterBuffer {
@@ -56,9 +61,13 @@ pub struct AdaptiveJitterBuffer {
     skipped_seqs: BTreeSet<u32>,
     primed: bool,
     initialized: bool,
+    recovering_from_underrun: bool,
     highest_ext_seq: u32,
     next_playout_seq: u32,
     target_depth_frames: usize,
+    underrun_floor_frames: usize,
+    underrun_free_pops: u32,
+    low_jitter_packets: u32,
     excess_depth_ticks: u32,
     last_good_frame: Vec<i16>,
     last_emitted_sample: i16,
@@ -71,18 +80,23 @@ pub struct AdaptiveJitterBuffer {
 impl AdaptiveJitterBuffer {
     /// Creates an [`AdaptiveJitterBuffer`] from `config`.
     pub fn new(config: JitterBufferConfig) -> Self {
+        let max_depth = config.max_depth_frames.max(config.min_depth_frames).max(1);
         let clamped_init = config
             .initial_depth_frames
-            .clamp(config.min_depth_frames, config.max_depth_frames.max(1));
+            .clamp(config.min_depth_frames, max_depth);
         Self {
             config,
             frames: BTreeMap::new(),
             skipped_seqs: BTreeSet::new(),
             primed: false,
             initialized: false,
+            recovering_from_underrun: false,
             highest_ext_seq: 0,
             next_playout_seq: 0,
             target_depth_frames: clamped_init,
+            underrun_floor_frames: config.min_depth_frames,
+            underrun_free_pops: 0,
+            low_jitter_packets: 0,
             excess_depth_ticks: 0,
             last_good_frame: vec![0; config.frame_samples],
             last_emitted_sample: 0,
@@ -142,9 +156,10 @@ impl AdaptiveJitterBuffer {
 
     /// Inserts a decoded PCM frame and adapts target depth using `jitter_samples`.
     pub fn push(&mut self, seq: u16, pcm_frame: Vec<i16>, jitter_samples: u32) {
-        self.update_target_depth(jitter_samples);
+        let was_initialized = self.initialized;
+        self.update_target_depth(jitter_samples, was_initialized);
 
-        if !self.initialized {
+        if !was_initialized {
             self.initialized = true;
             // Anchor around 0x0001_0000 so slightly out-of-order negative offsets stay non-negative.
             let anchor = 0x0001_0000u32.saturating_add(u32::from(seq));
@@ -218,19 +233,66 @@ impl AdaptiveJitterBuffer {
         if let Some(mut pcm) = self.frames.remove(&self.next_playout_seq) {
             self.next_playout_seq = self.next_playout_seq.saturating_add(1);
             self.last_good_frame = pcm.clone();
-            if self.consecutive_concealed > 0 && self.config.frame_samples >= 16 {
+            if (self.consecutive_concealed > 0 || self.recovering_from_underrun)
+                && self.config.frame_samples >= 16
+            {
                 let fade_len = (self.config.frame_samples / 8).min(32);
                 crossfade_head(&mut pcm, self.last_emitted_sample, fade_len);
             }
             self.consecutive_concealed = 0;
+            self.recovering_from_underrun = false;
             self.last_emitted_sample = *pcm.last().unwrap_or(&0);
+            if self.underrun_floor_frames > self.config.min_depth_frames {
+                self.underrun_free_pops = self.underrun_free_pops.saturating_add(1);
+                if self.underrun_free_pops >= UNDERRUN_FLOOR_DECAY_POPS {
+                    self.underrun_floor_frames -= 1;
+                    self.underrun_free_pops = 0;
+                }
+            }
             return PlayoutFrame::Normal(pcm);
         }
 
-        if self.frames.is_empty() && self.consecutive_concealed >= 4 {
-            self.primed = false;
-            self.last_emitted_sample = 0;
-            return PlayoutFrame::Buffering(vec![0; self.config.frame_samples]);
+        // Distinguish true missing/out-of-order packets (`!self.frames.is_empty()`: newer packets are already queued)
+        // from buffer starvation / clock skew (`self.frames.is_empty()`: next packet is still in transit or DTX paused).
+        // Never advance `next_playout_seq` when `self.frames.is_empty()`, preventing late-drop death spirals!
+        if self.frames.is_empty() {
+            if self.consecutive_concealed >= 1 {
+                self.primed = false;
+                self.recovering_from_underrun = true;
+                self.last_emitted_sample = 0;
+                return PlayoutFrame::Buffering(vec![0; self.config.frame_samples]);
+            }
+
+            let max_depth = self
+                .config
+                .max_depth_frames
+                .max(self.config.min_depth_frames)
+                .max(1);
+            self.underrun_floor_frames = (self.underrun_floor_frames + 1).min(max_depth);
+            self.target_depth_frames = self.target_depth_frames.max(self.underrun_floor_frames);
+            self.underrun_free_pops = 0;
+            self.low_jitter_packets = 0;
+
+            self.consecutive_concealed = self.consecutive_concealed.saturating_add(1);
+            self.concealed_frames = self.concealed_frames.saturating_add(1);
+
+            // Smoothly taper `last_good_frame` from 3/4 amplitude linearly down to 0 across the single 20 ms
+            // slip frame so `last_emitted_sample` reaches 0 without 50 Hz frame-clone buzz or step clicks.
+            let n = self.last_good_frame.len();
+            let mut concealed = Vec::with_capacity(n);
+            let denom = n.max(1) as i32;
+            for (idx, sample) in self.last_good_frame.iter_mut().enumerate() {
+                let remain = (denom - 1 - (idx as i32)).max(0);
+                let tapered = ((*sample as i32 * 3 * remain) / (4 * denom)) as i16;
+                *sample = tapered;
+                concealed.push(tapered);
+            }
+            if self.config.frame_samples >= 16 {
+                let fade_len = (self.config.frame_samples / 8).min(32);
+                crossfade_head(&mut concealed, self.last_emitted_sample, fade_len);
+            }
+            self.last_emitted_sample = *concealed.last().unwrap_or(&0);
+            return PlayoutFrame::Concealed(concealed);
         }
 
         self.next_playout_seq = self.next_playout_seq.saturating_add(1);
@@ -263,36 +325,63 @@ impl AdaptiveJitterBuffer {
     ///
     /// Used when the remote RTP stream changes SSRC mid-call (e.g., PBX bridge or transfer).
     pub fn reset(&mut self) {
+        let max_depth = self
+            .config
+            .max_depth_frames
+            .max(self.config.min_depth_frames)
+            .max(1);
         self.frames.clear();
         self.skipped_seqs.clear();
         self.primed = false;
         self.initialized = false;
+        self.recovering_from_underrun = false;
         self.highest_ext_seq = 0;
         self.next_playout_seq = 0;
-        self.target_depth_frames = self.config.initial_depth_frames.clamp(
-            self.config.min_depth_frames,
-            self.config.max_depth_frames.max(1),
-        );
+        self.target_depth_frames = self
+            .config
+            .initial_depth_frames
+            .clamp(self.config.min_depth_frames, max_depth);
+        self.underrun_floor_frames = self.config.min_depth_frames;
+        self.underrun_free_pops = 0;
+        self.low_jitter_packets = 0;
         self.excess_depth_ticks = 0;
         self.last_good_frame.fill(0);
         self.last_emitted_sample = 0;
         self.consecutive_concealed = 0;
     }
 
-    fn update_target_depth(&mut self, jitter_samples: u32) {
+    fn update_target_depth(&mut self, jitter_samples: u32, was_initialized: bool) {
         let frame_samples = self.config.frame_samples.max(1);
+        let max_depth = self
+            .config
+            .max_depth_frames
+            .max(self.config.min_depth_frames)
+            .max(1);
         let jitter_frames = (jitter_samples as usize).div_ceil(frame_samples);
-        let desired = (jitter_frames + 1).clamp(
-            self.config.min_depth_frames,
-            self.config
-                .max_depth_frames
-                .max(self.config.min_depth_frames),
-        );
+        let floor = self
+            .config
+            .min_depth_frames
+            .max(self.underrun_floor_frames)
+            .min(max_depth);
+        let desired = (jitter_frames + 1).clamp(floor, max_depth);
 
         if desired > self.target_depth_frames {
             self.target_depth_frames = desired;
-        } else if desired < self.target_depth_frames {
-            self.target_depth_frames -= 1;
+            self.low_jitter_packets = 0;
+        } else if was_initialized && desired < self.target_depth_frames {
+            let init_clamped = self.config.initial_depth_frames.clamp(floor, max_depth);
+            if self.target_depth_frames > init_clamped {
+                self.target_depth_frames -= 1;
+                self.low_jitter_packets = 0;
+            } else {
+                self.low_jitter_packets = self.low_jitter_packets.saturating_add(1);
+                if self.low_jitter_packets >= SUB_INITIAL_SHRINK_PACKETS {
+                    self.target_depth_frames -= 1;
+                    self.low_jitter_packets = 0;
+                }
+            }
+        } else {
+            self.low_jitter_packets = 0;
         }
     }
 }
@@ -444,5 +533,80 @@ mod tests {
             "expected sustained excess depth to shrink to <= 4 frames, left {remaining}"
         );
         assert!(drained.iter().all(|f| matches!(f, PlayoutFrame::Normal(_))));
+    }
+
+    #[test]
+    fn underrun_holds_playout_seq_without_late_drop_death_spiral() {
+        let cfg = JitterBufferConfig {
+            min_depth_frames: 2,
+            max_depth_frames: 8,
+            initial_depth_frames: 2,
+            frame_samples: 160,
+        };
+        let mut jb = AdaptiveJitterBuffer::new(cfg);
+
+        // Prime with packets 100 and 101, then drain both so `frames` becomes empty.
+        jb.push(100, vec![4000; 160], 0);
+        jb.push(101, vec![4000; 160], 0);
+        assert!(matches!(jb.pop(), PlayoutFrame::Normal(_)));
+        assert!(matches!(jb.pop(), PlayoutFrame::Normal(_)));
+
+        // Packet 102 arrives 1 ms AFTER `pop()` (buffer underrun due to sender clock skew / scheduling jitter).
+        let slip = jb.pop();
+        assert!(matches!(slip, PlayoutFrame::Concealed(_)));
+        assert_eq!(
+            *slip.samples().last().unwrap(),
+            0,
+            "underrun slip frame must taper smoothly to zero"
+        );
+        assert_eq!(
+            jb.target_depth_frames(),
+            3,
+            "underrun must raise target depth floor by +1 frame"
+        );
+
+        // Packets 102..=105 arrive immediately after — ZERO packets may be discarded as `late_drops`!
+        for seq in 102u16..=105 {
+            jb.push(seq, vec![2000; 160], 0);
+            let out = jb.pop();
+            assert!(
+                matches!(out, PlayoutFrame::Normal(_)),
+                "expected packet {seq} to play normally without PLC spiral, got {out:?}"
+            );
+        }
+        assert_eq!(
+            jb.counters(),
+            (0, 0, 1),
+            "expected zero late drops and exactly one slip concealment"
+        );
+    }
+
+    #[test]
+    fn sustained_dtx_pause_tapers_once_and_reprimes_without_robotic_buzz() {
+        let cfg = JitterBufferConfig {
+            min_depth_frames: 2,
+            max_depth_frames: 8,
+            initial_depth_frames: 3,
+            frame_samples: 160,
+        };
+        let mut jb = AdaptiveJitterBuffer::new(cfg);
+
+        // Initial packet with jitter=0 must preserve `initial_depth_frames = 3` during cold start.
+        jb.push(1, vec![6000; 160], 0);
+        assert_eq!(jb.target_depth_frames(), 3);
+        jb.push(2, vec![6000; 160], 0);
+        jb.push(3, vec![6000; 160], 0);
+
+        assert!(matches!(jb.pop(), PlayoutFrame::Normal(_)));
+        assert!(matches!(jb.pop(), PlayoutFrame::Normal(_)));
+        assert!(matches!(jb.pop(), PlayoutFrame::Normal(_)));
+
+        // Sender enters silent DTX pause: first empty pop tapers smoothly, second enters Buffering immediately
+        // instead of repeating 4 robotic 50 Hz clones!
+        let f_taper = jb.pop();
+        let f_buf = jb.pop();
+        assert!(matches!(f_taper, PlayoutFrame::Concealed(_)));
+        assert!(matches!(f_buf, PlayoutFrame::Buffering(_)));
+        assert_eq!(jb.counters().2, 1);
     }
 }

@@ -5,6 +5,17 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.16.1] - 2026-11-24
+
+### Fixed
+- **Jitter Buffer Underrun Death-Spiral & `50 Hz` Robotic PLC Prevention (`bmsip-media`):**
+  - Separated true missing/reordered packets (`!frames.is_empty()`, which advances `next_playout_seq`) from empty-buffer starvation / sender clock skew (`frames.is_empty()`) in [`AdaptiveJitterBuffer::pop`](crates/bmsip-media/src/jitter.rs), holding `next_playout_seq` on empty-buffer slips so slightly late packets are accepted instead of triggering cascading `4×PLC + 2×Buffering` `late_drops` every ~1 s on hardware SIP phones.
+  - Replaced repeated 4-frame `50 Hz` waveform cloning on empty-buffer starvation with a single `20 ms` linear taper-to-zero slip frame followed by clean re-priming (`recovering_from_underrun` head crossfade), eliminating metallic/robotic voice modulation and step-to-zero clicks.
+  - Preserved `initial_depth_frames` across cold-start `jitter = 0` packets (`SUB_INITIAL_SHRINK_PACKETS = 50`) and added an adaptive `underrun_floor_frames` (`+1` frame per underrun, decaying after `250` consecutive clean pops = `5 s`).
+
+### Documentation
+- Synchronized `Cargo.toml`, `CHANGELOG.md`, `README.md`, `ARCHITECTURE.md`, and `docs/CODECS_AND_AUDIO.md` to `0.16.1`.
+
 ## [0.16.0] - 2026-11-21
 
 ### Added
