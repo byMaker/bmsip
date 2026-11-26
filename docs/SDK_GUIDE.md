@@ -77,7 +77,9 @@ let ua_cfg = ua_cfg
 let tls_cfg = TlsConfig::new()
     .with_server_name("pbx.example.com")
     .with_ca_cert_pem(custom_ca_pem); // Optional: add private CA; also supports .with_client_identity(...) for mTLS
-let engine_cfg = engine_cfg.with_tls_config(tls_cfg);
+let engine_cfg = engine_cfg
+    .with_tls_config(tls_cfg)
+    .with_udp_keepalive_secs(25); // Periodic `\r\n\r\n` UDP NAT keep-alive while registered (default 25 s; 0 = disabled)
 ```
 
 ### 2.2 Non-Blocking Commands & Events (`SipEngine`)

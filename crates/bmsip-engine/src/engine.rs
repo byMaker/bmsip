@@ -332,6 +332,8 @@ struct WorkerCtx {
     route_seq: u64,
     suspended: bool,
     was_registered_before_suspend: bool,
+    udp_keepalive_interval: Option<Duration>,
+    next_udp_keepalive_at: Option<Instant>,
     ssrc_counter: u32,
     shared: Arc<SharedState>,
 }
@@ -695,13 +697,67 @@ impl WorkerCtx {
                 );
             }
             let tls_host_hint = self.peer_tls_hosts.get(&dest).map(|(h, _)| h.clone());
-            if let Err(msg) = self
+            match self
                 .sip_transport
                 .send(dest, &pkt, tls_host_hint.as_deref(), now)
             {
-                self.recorder
-                    .record(now, TelemetryCategory::Warning, None, msg.clone());
-                self.push_event(EngineEvent::Warning(msg));
+                Ok(()) => {
+                    self.note_udp_tx_to_registrar(dest, now);
+                }
+                Err(msg) => {
+                    self.recorder
+                        .record(now, TelemetryCategory::Warning, None, msg.clone());
+                    self.push_event(EngineEvent::Warning(msg));
+                }
+            }
+        }
+    }
+
+    fn is_udp_keepalive_eligible(&self) -> bool {
+        !self.suspended
+            && matches!(
+                self.ua.registration_state(),
+                RegistrationState::Registered { expires_secs, .. } if *expires_secs > 0
+            )
+    }
+
+    fn refresh_udp_keepalive_deadline(&mut self, now: Instant) {
+        let Some(interval) = self.udp_keepalive_interval else {
+            self.next_udp_keepalive_at = None;
+            return;
+        };
+        if self.is_udp_keepalive_eligible() {
+            if self.next_udp_keepalive_at.is_none() {
+                self.next_udp_keepalive_at = Some(now + interval);
+            }
+        } else {
+            self.next_udp_keepalive_at = None;
+        }
+    }
+
+    fn note_udp_tx_to_registrar(&mut self, dest: SocketAddr, now: Instant) {
+        if dest == self.registrar_addr {
+            if let Some(interval) = self.udp_keepalive_interval {
+                if self.is_udp_keepalive_eligible() {
+                    self.next_udp_keepalive_at = Some(now + interval);
+                }
+            }
+        }
+    }
+
+    fn poll_udp_keepalive(&mut self, now: Instant) {
+        self.refresh_udp_keepalive_deadline(now);
+        if let (Some(interval), Some(dl)) =
+            (self.udp_keepalive_interval, self.next_udp_keepalive_at)
+        {
+            if now >= dl {
+                let _ = self.sip_transport.send(
+                    self.registrar_addr,
+                    bmsip_core::sip::RFC5626_KEEPALIVE_PING,
+                    None,
+                    now,
+                );
+                self.next_udp_keepalive_at = Some(now + interval);
             }
         }
     }
@@ -716,6 +772,7 @@ impl WorkerCtx {
                         None,
                         format!("registration state -> {state:?}"),
                     );
+                    self.refresh_udp_keepalive_deadline(now);
                     self.push_event(EngineEvent::RegistrationChanged(state));
                 }
                 UaEvent::IncomingCall {
@@ -1559,6 +1616,7 @@ impl WorkerCtx {
             },
             EngineCommand::Suspend => {
                 self.suspended = true;
+                self.next_udp_keepalive_at = None;
                 self.was_registered_before_suspend = matches!(
                     self.ua.registration_state(),
                     RegistrationState::Registered { .. } | RegistrationState::Registering
@@ -1574,6 +1632,7 @@ impl WorkerCtx {
                         self.emit_cmd_error("resume register", err);
                     }
                 }
+                self.refresh_udp_keepalive_deadline(now);
                 self.recorder
                     .record(now, TelemetryCategory::Lifecycle, None, "engine resumed");
                 self.push_event(EngineEvent::Resumed {
@@ -1942,6 +2001,12 @@ fn run_worker(
 ) {
     let now = Instant::now();
     let reg_host_hint = config.ua_config.registrar_uri.host.clone();
+    let udp_keepalive_interval =
+        if config.ua_config.transport == SipTransport::Udp && config.udp_keepalive_secs > 0 {
+            Some(Duration::from_secs(u64::from(config.udp_keepalive_secs)))
+        } else {
+            None
+        };
     let mut ctx = WorkerCtx {
         registrar_addr: config.registrar_addr,
         bind_ip: config.bind_ip,
@@ -1964,6 +2029,8 @@ fn run_worker(
         route_seq: 0,
         suspended: false,
         was_registered_before_suspend: false,
+        udp_keepalive_interval,
+        next_udp_keepalive_at: None,
         ssrc_counter: 0x2000_0000u32.wrapping_add(u32::from(local_sip_addr.port())),
         shared,
     };
@@ -2008,6 +2075,7 @@ fn run_worker(
                 ctx.flush_sip_outbound(now);
             }
         }
+        ctx.poll_udp_keepalive(now);
 
         let now = Instant::now();
         if now >= next_media_tick {
@@ -2037,7 +2105,11 @@ fn run_worker(
             .poll_timeout()
             .map(|dl| dl.saturating_duration_since(Instant::now()))
             .unwrap_or(sleep_cap);
-        let wait_dur = sleep_cap.min(until_media).min(until_sip);
+        let until_udp_ka = ctx
+            .next_udp_keepalive_at
+            .map(|dl| dl.saturating_duration_since(Instant::now()))
+            .unwrap_or(sleep_cap);
+        let wait_dur = sleep_cap.min(until_media).min(until_sip).min(until_udp_ka);
         if !wait_dur.is_zero() {
             if let Ok(guard) = ctx.shared.commands.lock() {
                 let _ = ctx

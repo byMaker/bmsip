@@ -3234,3 +3234,145 @@ fn p2_shutdown_flushes_bye_unregister_and_suspend_pauses_timers() {
         "expected graceful Shutdown to flush REGISTER Expires: 0"
     );
 }
+
+#[test]
+fn udp_crlf_keepalive_refreshes_nat_binding_while_registered_and_replies_pong() {
+    let mock_srv = UdpSocket::bind("127.0.0.1:0").unwrap();
+    mock_srv
+        .set_read_timeout(Some(Duration::from_millis(400)))
+        .unwrap();
+    let srv_addr = mock_srv.local_addr().unwrap();
+
+    let ua_cfg = UaConfig::new(
+        "alice",
+        "secret",
+        "127.0.0.1",
+        SipUri::parse(&format!("sip:{srv_addr}")).unwrap(),
+        "127.0.0.1",
+        0,
+    );
+    let eng_cfg = EngineConfig::new(ua_cfg, srv_addr, IpAddr::V4(Ipv4Addr::LOCALHOST), 0)
+        .with_udp_keepalive_secs(1);
+    let (audio_port, _) = WavAudioPort::new(WavPcm16::new(8_000, vec![0; 160]), false);
+    let eng = SipEngine::spawn(eng_cfg, Box::new(audio_port)).unwrap();
+    let eng_addr = eng.local_sip_addr();
+
+    let mut buf = [0u8; 4096];
+    let recv_request = |sock: &UdpSocket,
+                        buf: &mut [u8],
+                        expected: bmsip_core::sip::Method,
+                        timeout: Duration|
+     -> (bmsip_core::sip::SipRequest, SocketAddr) {
+        let dl = Instant::now() + timeout;
+        while Instant::now() < dl {
+            if let Ok((n, src)) = sock.recv_from(buf) {
+                if let Ok(bmsip_core::sip::SipMessage::Request(req)) =
+                    bmsip_core::sip::SipMessage::parse(&buf[..n])
+                {
+                    if req.method == expected {
+                        return (req, src);
+                    }
+                }
+            }
+        }
+        panic!("timed out waiting for SIP {expected}");
+    };
+
+    // 1. Register and answer 200 OK.
+    eng.send_command(EngineCommand::Register).unwrap();
+    let (reg, from_addr) = recv_request(
+        &mock_srv,
+        &mut buf,
+        bmsip_core::sip::Method::Register,
+        Duration::from_secs(2),
+    );
+    let mut r200 = reg.create_response(200, "OK").unwrap();
+    r200.headers.set("Expires", "300");
+    r200.headers.set("To", "<sip:alice@127.0.0.1>;tag=srv-ka1");
+    mock_srv.send_to(&r200.to_bytes(), from_addr).unwrap();
+    assert!(wait_for_engine_event(&eng, Duration::from_secs(2), |e| {
+        matches!(
+            e,
+            EngineEvent::RegistrationChanged(RegistrationState::Registered { .. })
+        )
+    })
+    .is_some());
+
+    // 2. Within ~1.5s of outbound inactivity, engine MUST emit a 4-byte RFC 5626 `\r\n\r\n` ping over UDP.
+    let mut saw_ping = false;
+    let dl = Instant::now() + Duration::from_millis(1600);
+    while Instant::now() < dl {
+        if let Ok((n, src)) = mock_srv.recv_from(&mut buf) {
+            if &buf[..n] == b"\r\n\r\n" {
+                assert_eq!(src, eng_addr);
+                saw_ping = true;
+                // Reply with RFC 5626 `\r\n` pong; engine must absorb it cleanly without warnings.
+                mock_srv.send_to(b"\r\n", src).unwrap();
+                break;
+            }
+        }
+    }
+    assert!(
+        saw_ping,
+        "expected outbound UDP `\\r\\n\\r\\n` keep-alive ping while registered"
+    );
+
+    // 3. Server-initiated `\r\n\r\n` ping to client MUST receive `\r\n` pong immediately.
+    mock_srv.send_to(b"\r\n\r\n", eng_addr).unwrap();
+    let mut saw_pong = false;
+    let dl = Instant::now() + Duration::from_millis(800);
+    while Instant::now() < dl {
+        if let Ok((n, src)) = mock_srv.recv_from(&mut buf) {
+            if &buf[..n] == b"\r\n" && src == eng_addr {
+                saw_pong = true;
+                break;
+            }
+        }
+    }
+    assert!(
+        saw_pong,
+        "expected `\\r\\n` pong reply to inbound UDP `\\r\\n\\r\\n` ping"
+    );
+    assert!(
+        wait_for_engine_event(&eng, Duration::from_millis(100), |e| matches!(
+            e,
+            EngineEvent::Warning(_)
+        ))
+        .is_none(),
+        "CRLF keep-alive traffic must not trigger EngineEvent::Warning"
+    );
+
+    // 4. Unregistering stops periodic UDP keep-alives.
+    eng.send_command(EngineCommand::Unregister).unwrap();
+    let (unreg, unreg_from) = recv_request(
+        &mock_srv,
+        &mut buf,
+        bmsip_core::sip::Method::Register,
+        Duration::from_secs(2),
+    );
+    let mut u200 = unreg.create_response(200, "OK").unwrap();
+    u200.headers.set("Expires", "0");
+    u200.headers.set("To", "<sip:alice@127.0.0.1>;tag=srv-ka2");
+    mock_srv.send_to(&u200.to_bytes(), unreg_from).unwrap();
+    assert!(wait_for_engine_event(&eng, Duration::from_secs(2), |e| {
+        matches!(
+            e,
+            EngineEvent::RegistrationChanged(RegistrationState::Unregistered)
+        )
+    })
+    .is_some());
+
+    while mock_srv.recv_from(&mut buf).is_ok() {}
+    let dl = Instant::now() + Duration::from_millis(1300);
+    while Instant::now() < dl {
+        if let Ok((n, _)) = mock_srv.recv_from(&mut buf) {
+            assert_ne!(
+                &buf[..n],
+                b"\r\n\r\n",
+                "unregistered engine must not emit UDP keep-alive pings"
+            );
+        }
+    }
+
+    eng.shutdown().unwrap();
+}

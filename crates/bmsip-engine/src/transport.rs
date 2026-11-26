@@ -582,7 +582,17 @@ impl SipTransportDriver {
                 loop {
                     match sock.recv_from(&mut buf) {
                         Ok((len, src_addr)) => {
-                            received.push((src_addr, buf[..len].to_vec()));
+                            let slice = &buf[..len];
+                            // RFC 5626 §3.5.1 / RFC 3261 §7.5: answer 4-byte CRLF ping with 2-byte CRLF pong
+                            // (zero amplification: 2B < 4B) and silently absorb CRLF-only keep-alive datagrams.
+                            if slice == RFC5626_KEEPALIVE_PING {
+                                let _ = sock.send_to(RFC5626_KEEPALIVE_PONG, src_addr);
+                                continue;
+                            }
+                            if slice.iter().all(|&b| b == b'\r' || b == b'\n') {
+                                continue;
+                            }
+                            received.push((src_addr, slice.to_vec()));
                         }
                         Err(e) if is_would_block(&e) => break,
                         Err(err) => {

@@ -5,6 +5,16 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.16.4] - 2026-11-26
+
+### Added
+- **Client-Side UDP NAT CRLF Keep-Alive (`bmsip-engine`):**
+  - Added [`DEFAULT_UDP_KEEPALIVE_SECS`](crates/bmsip-engine/src/command.rs) (`25 s`), `EngineConfig::udp_keepalive_secs` (`0` disables), and `EngineConfig::with_udp_keepalive_secs(...)`, sending 4-byte RFC 5626 / RFC 3261 §7.5 `\r\n\r\n` keep-alive datagrams to `registrar_addr` after `udp_keepalive_secs` seconds of outbound silence while `Registered` (automatically reset on any outbound SIP send to `registrar_addr` and paused on `Unregistered` / `Suspend`).
+  - Updated [`SipTransportDriver::poll_rx`](crates/bmsip-engine/src/transport.rs) on UDP sockets to reply `\r\n` (`RFC5626_KEEPALIVE_PONG`) to inbound `\r\n\r\n` pings and silently absorb CRLF-only keep-alive datagrams without triggering parse errors or warnings.
+
+### Documentation
+- Synchronized `Cargo.toml`, `CHANGELOG.md`, `README.md`, `ARCHITECTURE.md`, and `docs/SDK_GUIDE.md` to `0.16.4`.
+
 ## [0.16.3] - 2026-11-26
 
 ### Fixed

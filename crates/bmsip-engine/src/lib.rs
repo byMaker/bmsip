@@ -21,7 +21,7 @@ pub use audio::{
 };
 pub use bmsip_core;
 pub use bmsip_media;
-pub use command::{EngineCommand, EngineConfig, EngineEvent};
+pub use command::{EngineCommand, EngineConfig, EngineEvent, DEFAULT_UDP_KEEPALIVE_SECS};
 pub use engine::{EngineEventReceiver, SipEngine};
 pub use error::EngineError;
 pub use opus_native::{libopus_version, LibOpusCodec};

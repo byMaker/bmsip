@@ -1,6 +1,6 @@
 //! MODULE_CONTRACT: Non-blocking `EngineConfig`, `EngineCommand`, and `EngineEvent` contracts for [`crate::SipEngine`].
 //! INVARIANTS: All variants are `Send`; host communication uses asynchronous message passing without callbacks under mutexes.
-//! RFC_REFS: RFC 3261, RFC 4733.
+//! RFC_REFS: RFC 3261, RFC 4733, RFC 5626.
 
 use std::net::{IpAddr, SocketAddr};
 use std::sync::Arc;
@@ -10,6 +10,9 @@ use bmsip_core::sip::SipUri;
 use bmsip_media::{AudioCodecFactory, CodecRegistry, DtmfDigit};
 
 use crate::tls::TlsConfig;
+
+/// Default outbound UDP CRLF (`\r\n\r\n`) NAT keep-alive interval in seconds (`25 s`, matching RFC 5626 TCP/TLS keep-alive).
+pub const DEFAULT_UDP_KEEPALIVE_SECS: u32 = 25;
 
 /// Startup configuration for [`crate::SipEngine`].
 #[derive(Debug, Clone)]
@@ -21,10 +24,12 @@ pub struct EngineConfig {
     pub telemetry_capacity: usize,
     pub codec_registry: CodecRegistry,
     pub tls_config: TlsConfig,
+    /// Outbound UDP NAT keep-alive (`\r\n\r\n` to `registrar_addr`) interval in seconds while registered (`0` disables).
+    pub udp_keepalive_secs: u32,
 }
 
 impl EngineConfig {
-    /// Creates an [`EngineConfig`] with built-in codecs and a default telemetry ring capacity of 256 events.
+    /// Creates an [`EngineConfig`] with built-in codecs, `25 s` UDP NAT keep-alives, and a default telemetry ring capacity of 256 events.
     pub fn new(
         ua_config: UaConfig,
         registrar_addr: SocketAddr,
@@ -39,12 +44,19 @@ impl EngineConfig {
             telemetry_capacity: 256,
             codec_registry: CodecRegistry::with_builtin_codecs(),
             tls_config: TlsConfig::default(),
+            udp_keepalive_secs: DEFAULT_UDP_KEEPALIVE_SECS,
         }
     }
 
     /// Configures TLS 1.2–1.3 (`rustls`) certificate verification and optional client/server identities.
     pub fn with_tls_config(mut self, tls_config: TlsConfig) -> Self {
         self.tls_config = tls_config;
+        self
+    }
+
+    /// Configures the periodic outbound UDP CRLF (`\r\n\r\n`) NAT keep-alive interval in seconds (`0` disables).
+    pub fn with_udp_keepalive_secs(mut self, secs: u32) -> Self {
+        self.udp_keepalive_secs = secs;
         self
     }
 
