@@ -27,16 +27,17 @@ pub use codec::{
 pub use dtmf::{DtmfDetector, DtmfDigit, DtmfEventPayload, DtmfSender};
 pub use error::MediaError;
 pub use g722::{
-    downsample_16k_to_8k, downsample_48k_to_16k, resample_pcm_20ms, upsample_16k_to_48k,
-    upsample_8k_to_16k, G722Codec, G722Decoder, G722Encoder, StreamResampler,
+    downsample_16k_to_8k, downsample_48k_to_16k, resample_pcm_20ms, resample_pcm_by_rate,
+    upsample_16k_to_48k, upsample_8k_to_16k, G722Codec, G722Decoder, G722Encoder, StreamResampler,
     G722_FRAME_BYTES_20MS, G722_PAYLOAD_TYPE, G722_RTP_CLOCK_RATE, G722_RTP_SAMPLES_20MS,
     G722_SAMPLE_RATE_HZ, PCM_FRAME_SAMPLES_16KHZ_20MS,
 };
 pub use jitter::{AdaptiveJitterBuffer, JitterBufferConfig, PlayoutFrame};
 pub use opus::{
     condition_mic_frame, downsample_48k_to_8k, upsample_8k_to_48k, BuiltInOpusCodec, OpusBandwidth,
-    OpusCodecBackend, OpusFmtp, OpusMode, OpusToc, OPUS_RTP_CLOCK_RATE, OPUS_RTP_SAMPLES_20MS,
-    PCM_FRAME_SAMPLES_48KHZ_20MS, PCM_FRAME_SAMPLES_8KHZ_20MS,
+    OpusCodecBackend, OpusFmtp, OpusMode, OpusToc, OPUS_MAX_FRAME_SAMPLES_48KHZ,
+    OPUS_RTP_CLOCK_RATE, OPUS_RTP_SAMPLES_20MS, PCM_FRAME_SAMPLES_48KHZ_20MS,
+    PCM_FRAME_SAMPLES_8KHZ_20MS,
 };
 pub use plugin::{
     AudioCodecDescriptor, AudioCodecFactory, AudioCodecPlugin, CodecRegistry, FnCodecFactory,

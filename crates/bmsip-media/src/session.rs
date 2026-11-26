@@ -10,7 +10,7 @@ use crate::dtmf::{DtmfDetector, DtmfDigit, DtmfEventPayload, DtmfSender};
 use crate::error::MediaError;
 use crate::g722::{
     G722Codec, StreamResampler, G722_PAYLOAD_TYPE, G722_RTP_CLOCK_RATE, G722_RTP_SAMPLES_20MS,
-    PCM_FRAME_SAMPLES_16KHZ_20MS,
+    G722_SAMPLE_RATE_HZ, PCM_FRAME_SAMPLES_16KHZ_20MS,
 };
 use crate::jitter::{AdaptiveJitterBuffer, JitterBufferConfig, PlayoutFrame};
 use crate::opus::{
@@ -90,6 +90,7 @@ pub struct MediaSession {
     cn_generator: ComfortNoiseGenerator,
     remote_ssrc: Option<u32>,
     probation_ssrc: Option<(u32, u16)>,
+    last_rx_seq_pt: Option<(u16, u8)>,
     next_audio_marker: bool,
     cname: String,
     srtp_tx: Option<SrtpContext>,
@@ -159,6 +160,7 @@ impl MediaSession {
             cn_generator: ComfortNoiseGenerator::new(),
             remote_ssrc: None,
             probation_ssrc: None,
+            last_rx_seq_pt: None,
             next_audio_marker: false,
             cname: format!("bmsip-{local_ssrc:08x}@local"),
             srtp_tx: None,
@@ -332,6 +334,7 @@ impl MediaSession {
         if self.codec != codec {
             self.tx_resampler.reset();
             self.rx_resampler.reset();
+            self.last_rx_seq_pt = None;
         }
         self.codec = codec;
         self.dtmf_payload_type = dtmf_payload_type;
@@ -509,6 +512,8 @@ impl MediaSession {
                 if switch_now {
                     self.stats.reset();
                     self.jitter.reset();
+                    self.rx_resampler.reset();
+                    self.last_rx_seq_pt = None;
                     self.dtmf_detector.reset();
                     self.cn_generator.deactivate();
                     self.probation_ssrc = None;
@@ -563,49 +568,57 @@ impl MediaSession {
         }
         if seq_status == SeqStatus::Resynced {
             self.jitter.reset();
+            self.rx_resampler.reset();
+            self.last_rx_seq_pt = None;
         }
         self.cn_generator.deactivate();
 
+        let discontinuous = match self.last_rx_seq_pt {
+            Some((prev_seq, prev_pt)) => {
+                prev_pt != pkt.payload_type || pkt.sequence_number != prev_seq.wrapping_add(1)
+            }
+            None => false,
+        };
+        if discontinuous {
+            self.rx_resampler.reset();
+        }
+        self.last_rx_seq_pt = Some((pkt.sequence_number, pkt.payload_type));
+
+        let target_rate_hz = (self.frame_samples as u32).saturating_mul(50).max(8_000);
         let pcm = if let Some(plugin) = self.custom_plugin.as_mut() {
             if pkt.payload_type == self.codec.payload_type() {
-                plugin.decode_20ms(pkt.payload, self.frame_samples)?
+                plugin.decode_to_rate(pkt.payload, target_rate_hz, &mut self.rx_resampler)?
             } else {
                 decode_fallback_builtin(
                     &mut self.g722,
                     &mut self.rx_resampler,
                     pkt.payload_type,
                     pkt.payload,
-                    self.frame_samples,
+                    target_rate_hz,
                 )?
             }
         } else if matches!(self.codec, SessionCodec::Opus { payload_type } if payload_type == pkt.payload_type)
         {
-            if self.frame_samples == PCM_FRAME_SAMPLES_48KHZ_20MS {
-                self.opus.decode_20ms_48khz(pkt.payload)?
-            } else if self.frame_samples == PCM_FRAME_SAMPLES_16KHZ_20MS {
+            if self.frame_samples == PCM_FRAME_SAMPLES_8KHZ_20MS {
+                self.opus.decode_20ms_8khz(pkt.payload)?
+            } else {
                 let pcm_48k = self.opus.decode_20ms_48khz(pkt.payload)?;
                 self.rx_resampler
-                    .resample_20ms(&pcm_48k, PCM_FRAME_SAMPLES_16KHZ_20MS)?
-            } else {
-                self.opus.decode_20ms_8khz(pkt.payload)?
+                    .resample_by_rate(&pcm_48k, OPUS_RTP_CLOCK_RATE, target_rate_hz)?
             }
         } else if matches!(self.codec, SessionCodec::G722 { payload_type } if payload_type == pkt.payload_type)
             || pkt.payload_type == G722_PAYLOAD_TYPE
         {
             let pcm_16k = self.g722.decode_16khz(pkt.payload)?;
-            if self.frame_samples == PCM_FRAME_SAMPLES_16KHZ_20MS {
-                pcm_16k
-            } else {
-                self.rx_resampler
-                    .resample_20ms(&pcm_16k, self.frame_samples)?
-            }
+            self.rx_resampler
+                .resample_by_rate(&pcm_16k, G722_SAMPLE_RATE_HZ, target_rate_hz)?
         } else {
             decode_fallback_builtin(
                 &mut self.g722,
                 &mut self.rx_resampler,
                 pkt.payload_type,
                 pkt.payload,
-                self.frame_samples,
+                target_rate_hz,
             )?
         };
 
@@ -737,26 +750,21 @@ fn decode_fallback_builtin(
     resampler: &mut StreamResampler,
     payload_type: u8,
     payload: &[u8],
-    target_frame_samples: usize,
+    target_rate_hz: u32,
 ) -> Result<Vec<i16>, MediaError> {
     if payload_type == G722_PAYLOAD_TYPE {
         let pcm_16k = g722.decode_16khz(payload)?;
-        return if target_frame_samples == PCM_FRAME_SAMPLES_16KHZ_20MS {
-            Ok(pcm_16k)
-        } else {
-            resampler.resample_20ms(&pcm_16k, target_frame_samples)
-        };
+        return resampler.resample_by_rate(&pcm_16k, G722_SAMPLE_RATE_HZ, target_rate_hz);
     }
 
+    if payload.is_empty() {
+        return Err(MediaError::PacketTooShort);
+    }
     let rx_codec = G711Kind::from_payload_type(payload_type).ok_or_else(|| {
         MediaError::UnsupportedCodec(format!("unsupported RTP payload type {payload_type}"))
     })?;
     let pcm_8k = rx_codec.decode(payload);
-    if target_frame_samples == PCM_FRAME_SAMPLES_8KHZ_20MS {
-        Ok(pcm_8k)
-    } else {
-        resampler.resample_20ms(&pcm_8k, target_frame_samples)
-    }
+    resampler.resample_by_rate(&pcm_8k, 8_000, target_rate_hz)
 }
 
 #[cfg(test)]
@@ -1285,5 +1293,70 @@ mod tests {
         rx.receive_rtp(&j1, 800).unwrap();
         rx.receive_rtp(&j2, 960).unwrap();
         assert!(matches!(rx.pop_playout_frame(), PlayoutFrame::Normal(_)));
+    }
+
+    #[test]
+    fn g722_and_pcma_10ms_and_30ms_pbx_packets_play_at_exact_pitch_on_48khz_port() {
+        // Regression test for Asterisk 22 `alaw -> g722` transcoding without `use_ptime=yes`:
+        // PBX sends 10 ms G.722 packets (80 bytes = 160 samples @ 16 kHz, 80 RTP clock ticks)
+        // at 100 packets/sec into a 48 kHz (`960`-sample 20 ms) MediaSession.
+        let cfg = JitterBufferConfig {
+            min_depth_frames: 2,
+            max_depth_frames: 12,
+            initial_depth_frames: 3,
+            frame_samples: 960,
+        };
+        let mut rx =
+            MediaSession::new_with_session_codec(SessionCodec::g722(), 101, 0x7722_0048, cfg);
+        let mut pbx_enc = crate::g722::G722Encoder::new();
+        let mut pbx_pkt = RtpPacketizer::new(0x1722_0035, G722_PAYLOAD_TYPE, 1000, 0);
+
+        let tone_16k = WavPcm16::generate_sine_wave(16_000, 880, 1_000, 12_000);
+        let mut arrival_ticks = 0u32;
+        let mut played_48k: Vec<i16> = Vec::new();
+
+        // Feed 100 packets of 10 ms (1.0 s total), popping one 20 ms frame every 2 packets once primed.
+        for (pkt_idx, chunk_10ms) in tone_16k.samples.as_chunks::<160>().0.iter().enumerate() {
+            let g722_80b = pbx_enc.encode(chunk_10ms);
+            assert_eq!(g722_80b.len(), 80);
+            let rtp = pbx_pkt.next_packet_bytes(&g722_80b, 80, pkt_idx == 0);
+            rx.receive_rtp(&rtp, arrival_ticks).unwrap();
+            arrival_ticks += 80;
+
+            if pkt_idx >= 5 && pkt_idx % 2 == 1 {
+                let pf = rx.pop_playout_frame();
+                assert!(
+                    matches!(pf, PlayoutFrame::Normal(_)),
+                    "expected continuous Normal 20 ms playout at pkt {pkt_idx}, got {pf:?}"
+                );
+                assert_eq!(pf.samples().len(), 960);
+                played_48k.extend_from_slice(pf.samples());
+            }
+        }
+
+        // Measure steady-state zero-crossing frequency at 48 kHz: must be ~880 Hz (never 440 Hz half-speed!).
+        let steady = &played_48k[4_800..33_600];
+        let zc = steady
+            .windows(2)
+            .filter(|w| (w[0] < 0) != (w[1] < 0))
+            .count();
+        let est_hz = (zc as f64 * 48_000.0) / (2.0 * steady.len() as f64);
+        assert!(
+            (860.0..=900.0).contains(&est_hz),
+            "expected ~880 Hz wideband tone on 48 kHz port from 10 ms G.722 RTP, got {est_hz:.1} Hz"
+        );
+
+        // Mid-call dynamic fallback to 30 ms PCMA (240 bytes @ 8 kHz -> 1440 samples @ 48 kHz) without re-INVITE!
+        let tone_8k = WavPcm16::generate_sine_wave(8_000, 440, 300, 10_000);
+        for chunk_30ms in tone_8k.samples.as_chunks::<240>().0 {
+            let pcma_240b = crate::codec::encode_pcma(chunk_30ms);
+            let rtp = pbx_pkt.build_custom_packet_bytes(8, arrival_ticks, false, &pcma_240b);
+            pbx_pkt.advance_timestamp(240);
+            rx.receive_rtp(&rtp, arrival_ticks).unwrap();
+            arrival_ticks += 240;
+        }
+        let pf_pcma = rx.pop_playout_frame();
+        assert!(matches!(pf_pcma, PlayoutFrame::Normal(_)));
+        assert_eq!(pf_pcma.samples().len(), 960);
     }
 }

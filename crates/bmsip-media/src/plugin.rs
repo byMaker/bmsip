@@ -9,7 +9,7 @@ use bmsip_core::sdp::RtpCodec;
 
 use crate::codec::G711Kind;
 use crate::error::MediaError;
-use crate::g722::{resample_pcm_20ms, G722Codec};
+use crate::g722::{resample_pcm_20ms, resample_pcm_by_rate, G722Codec, StreamResampler};
 use crate::opus::{
     OpusCodecBackend, OPUS_RTP_CLOCK_RATE, PCM_FRAME_SAMPLES_48KHZ_20MS,
     PCM_FRAME_SAMPLES_8KHZ_20MS,
@@ -115,11 +115,30 @@ pub trait AudioCodecPlugin: Send + fmt::Debug {
         target_frame_samples: usize,
     ) -> Result<Vec<i16>, MediaError> {
         let native = self.decode_native_20ms(payload)?;
-        if native.len() == target_frame_samples {
+        let dst_rate_hz = (target_frame_samples as u32).saturating_mul(50);
+        let src_rate_hz = self.descriptor().pcm_sample_rate_hz;
+        if native.len() == target_frame_samples && src_rate_hz == dst_rate_hz {
             Ok(native)
+        } else if dst_rate_hz > 0 {
+            resample_pcm_by_rate(&native, src_rate_hz, dst_rate_hz)
         } else {
             resample_pcm_20ms(&native, target_frame_samples)
         }
+    }
+
+    /// Decodes an RTP payload of arbitrary duration (`ptime`) and resamples continuously to `target_rate_hz`.
+    fn decode_to_rate(
+        &mut self,
+        payload: &[u8],
+        target_rate_hz: u32,
+        resampler: &mut StreamResampler,
+    ) -> Result<Vec<i16>, MediaError> {
+        let native = self.decode_native_20ms(payload)?;
+        resampler.resample_by_rate(
+            &native,
+            self.descriptor().pcm_sample_rate_hz,
+            target_rate_hz,
+        )
     }
 }
 

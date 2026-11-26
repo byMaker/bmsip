@@ -8,7 +8,9 @@ use std::ffi::{c_char, c_int, CStr};
 use std::fmt;
 use std::ptr::NonNull;
 
-use bmsip_media::{MediaError, OpusCodecBackend, PCM_FRAME_SAMPLES_48KHZ_20MS};
+use bmsip_media::{
+    MediaError, OpusCodecBackend, OPUS_MAX_FRAME_SAMPLES_48KHZ, PCM_FRAME_SAMPLES_48KHZ_20MS,
+};
 
 const OPUS_OK: c_int = 0;
 const OPUS_APPLICATION_VOIP: c_int = 2048;
@@ -214,7 +216,8 @@ impl OpusCodecBackend for LibOpusCodec {
         if opus_pkt.is_empty() {
             return Err(MediaError::PacketTooShort);
         }
-        self.decoder.decode(opus_pkt, PCM_FRAME_SAMPLES_48KHZ_20MS)
+        // RFC 6716 §3.2.5: allow decoding any valid Opus packet duration from 2.5 ms up to 120 ms (5760 samples).
+        self.decoder.decode(opus_pkt, OPUS_MAX_FRAME_SAMPLES_48KHZ)
     }
 }
 
@@ -270,5 +273,26 @@ mod tests {
             decoded_all.extend_from_slice(&decoded);
         }
         assert!(WavPcm16::new(8_000, decoded_all).rms_energy() > 3000);
+    }
+
+    #[test]
+    fn libopus_decodes_10ms_40ms_and_60ms_variable_ptime_packets() {
+        let mut codec = LibOpusCodec::new().expect("create LibOpusCodec");
+        let tone_48k = WavPcm16::generate_sine_wave(48_000, 600, 200, 12_000);
+
+        for &samples_per_pkt in &[480usize, 1_920, 2_880] {
+            let encoded = codec
+                .encoder
+                .encode(&tone_48k.samples[..samples_per_pkt], samples_per_pkt)
+                .expect("encode non-20ms Opus packet");
+            let decoded_48k = codec
+                .decode_20ms_48khz(&encoded)
+                .expect("decode variable-duration Opus packet");
+            assert_eq!(decoded_48k.len(), samples_per_pkt);
+            let decoded_8k = codec
+                .decode_20ms_8khz(&encoded)
+                .expect("decode variable-duration Opus packet to 8 kHz");
+            assert_eq!(decoded_8k.len(), samples_per_pkt / 6);
+        }
     }
 }

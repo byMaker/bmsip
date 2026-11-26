@@ -19,6 +19,9 @@ pub const PCM_FRAME_SAMPLES_8KHZ_20MS: usize = 160;
 /// Mono PCM sample count for one 20 ms frame at 48000 Hz.
 pub const PCM_FRAME_SAMPLES_48KHZ_20MS: usize = 960;
 
+/// Maximum mono PCM sample count for a single RFC 6716 §3.2.5 Opus packet (`120` ms at 48000 Hz).
+pub const OPUS_MAX_FRAME_SAMPLES_48KHZ: usize = 5_760;
+
 /// Opus audio bandwidth modes (RFC 6716 Section 2).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum OpusBandwidth {
@@ -368,15 +371,13 @@ pub trait OpusCodecBackend: Send + fmt::Debug {
 
     fn decode_20ms_8khz(&mut self, opus_pkt: &[u8]) -> Result<Vec<i16>, MediaError> {
         let pcm_48k = self.decode_20ms_48khz(opus_pkt)?;
-        if pcm_48k.len() < PCM_FRAME_SAMPLES_48KHZ_20MS {
+        if pcm_48k.len() < 6 {
             return Err(MediaError::BufferError(format!(
-                "expected >= {PCM_FRAME_SAMPLES_48KHZ_20MS} decoded 48 kHz samples, got {}",
+                "expected >= 6 decoded 48 kHz samples, got {}",
                 pcm_48k.len()
             )));
         }
-        Ok(downsample_48k_to_8k(
-            &pcm_48k[..PCM_FRAME_SAMPLES_48KHZ_20MS],
-        ))
+        Ok(downsample_48k_to_8k(&pcm_48k))
     }
 }
 

@@ -2,7 +2,7 @@
 
 **bmsip** is a modern, embeddable, cross-platform SIP & RTP telephony library written in Rust from the ground up for **Linux**, **iOS**, and **Android**, complete with a live-audio Linux CLI softphone and an automated multi-server SIP interoperability lab.
 
-- **Current Version:** `0.16.2` ([CHANGELOG.md](./CHANGELOG.md))
+- **Current Version:** `0.16.3` ([CHANGELOG.md](./CHANGELOG.md))
 - **Architecture Specification:** [ARCHITECTURE.md](./ARCHITECTURE.md)
 - **Developer Guides:** [SDK Guide](./docs/SDK_GUIDE.md) · [Codecs & Audio Pipeline](./docs/CODECS_AND_AUDIO.md) · [CLI & Interop Lab](./docs/CLI_AND_TESTING.md)
 - **License:** `AGPL-3.0-only` ([LICENSE](./LICENSE) · [NOTICE](./NOTICE) · commercial licensing: [bymaker.com](https://bymaker.com))
@@ -22,7 +22,7 @@ Legacy C/C++ SIP stacks often suffer from hidden global state, callback re-entra
   - **ITU-T G.722 (`16 kHz` Wideband HD Voice):** Pure Safe Rust SB-ADPCM Mode 1 codec (payload type `9`, RFC 3551 §4.5.2) with standard QMF subband polarity & scaling for hardware IP-phone/Asterisk `spandsp` compatibility.
   - **ITU-T G.711 (`8 kHz`):** Pure Safe Rust `PCMU` (μ-law, PT `0`) and `PCMA` (A-law, PT `8`).
   - **Universal Codec Plugin System:** Register custom external codecs (`G.729`, `L16`, `AMR-WB`, `Codec2`, etc.) via `AudioCodecPlugin` + `FnCodecFactory` + `CodecRegistry` / `EngineConfig::register_custom_codec` with automatic `8`/`16`/`48` kHz PCM adaptation.
-- **Adaptive Jitter Buffer & Microphone DSP:** RFC 3550 Appendix A.1 2-packet sequence/SSRC probation, 16-bit RTP sequence rollover handling, jitter-driven buffering depth, smooth zero-click PLC crossfade on recovered frames, and frame-level microphone noise gate / gain / soft limiter (`condition_mic_frame`).
+- **Adaptive Jitter Buffer & Microphone DSP:** Automatic inbound RTP packet-duration (`ptime` `2.5`–`120` ms) and rate-explicit (`8`/`16`/`48` kHz + arbitrary rate) adaptation into fixed `20 ms` `AudioPort` frames, RFC 3550 Appendix A.1 2-packet sequence/SSRC probation, 16-bit RTP sequence rollover handling, jitter-driven buffering depth, smooth zero-click PLC crossfade on recovered frames, and frame-level microphone noise gate / gain / soft limiter (`condition_mic_frame`).
 - **First-Class Mobile Lifecycle & Black-Box Flight Recorder:** Built-in `NetworkChanged` (Wi-Fi <-> LTE handover with `REGISTER` refresh + `re-INVITE`), `Suspend` / `Resume` (zero-CPU `Condvar` worker pause on PushKit / FCM background wakeup), and a bounded per-call JSON flight recorder.
 - **Complete Softphone Call Control:** Call Hold / Resume (`re-INVITE` `a=sendonly`/`inactive`/`sendrecv`) with automatic `491` backoff retry, delayed SDP offer (`INVITE`/`re-INVITE`), Blind (`REFER` + `NOTIFY message/sipfrag`) & Attended (`Replaces`) Transfer, early/in-dialog `UPDATE`, reliable `1xx` / `PRACK` (`100rel`) with retransmits & `504` timeout, `Session-Timers` (RFC 4028 with `422` auto-retry), `Reason` (RFC 3326), `a=rtcp:`/`a=rtcp-mux` (RFC 3605 / 5761), and `P-Asserted-Identity` / `Privacy` Caller-ID (RFC 3323 / RFC 3325).
 - **Early Media, Dual-Mode DTMF & Comfort Noise:** Early-media `183`/`180` SDP RTP activation before `200 OK` (RFC 3960), paced RFC 4733 `telephone-event` + legacy SIP `INFO` (`application/dtmf-relay`, RFC 2976) DTMF, and RFC 3389 Comfort Noise (`CN` PT 13) SID DTX synthesis.

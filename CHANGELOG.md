@@ -5,6 +5,17 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.16.3] - 2026-11-26
+
+### Fixed
+- **Automatic Inbound RTP `ptime` (`2.5`–`120` ms) & Sample-Rate Adaptation (`bmsip-media`, `bmsip-engine`):**
+  - Added rate-explicit [`resample_pcm_by_rate`](crates/bmsip-media/src/g722.rs) and [`StreamResampler::resample_by_rate`](crates/bmsip-media/src/g722.rs) plus [`AudioCodecPlugin::decode_to_rate`](crates/bmsip-media/src/plugin.rs), replacing sample-count-based rate inference in [`MediaSession::receive_rtp`](crates/bmsip-media/src/session.rs) so `10 ms` `G.722` packets (`160` samples @ `16 kHz`, e.g., Asterisk 22 `alaw -> g722` transcoding with `use_ptime=no`) are upsampled `3x` to `48 kHz` (`480` samples) instead of being misidentified as `20 ms` @ `8 kHz` (`6x` `-1` octave pitch shift), and resetting `rx_resampler` across sequence gaps, SSRC switches, and mid-call dynamic payload-type changes.
+  - Upgraded [`AdaptiveJitterBuffer`](crates/bmsip-media/src/jitter.rs) to reorder arbitrary-duration RTP packets (`5`/`10`/`20`/`30`/`40`/`60`/`120` ms and mid-call `ptime` transitions) in true 16-bit RTP sequence space while assembling exact `20 ms` (`frame_samples`) playout frames via `playout_fifo` and sample-accurate priming/excess-depth thresholds (`queued_frame_samples`), eliminating `50%` excess-depth packet drops on `10 ms` (`100` pkt/s) PBX streams while preserving zero-copy `20 ms` playout.
+  - Expanded [`LibOpusCodec::decode_20ms_48khz`](crates/bmsip-engine/src/opus_native.rs) and [`OpusCodecBackend::decode_20ms_8khz`](crates/bmsip-media/src/opus.rs) to decode up to `OPUS_MAX_FRAME_SAMPLES_48KHZ` (`5760` samples = `120 ms` per RFC 6716 §3.2.5) instead of capping at `960` samples (`20 ms`).
+
+### Documentation
+- Synchronized `Cargo.toml`, `CHANGELOG.md`, `README.md`, `ARCHITECTURE.md`, and `docs/CODECS_AND_AUDIO.md` to `0.16.3`.
+
 ## [0.16.2] - 2026-11-24
 
 ### Added

@@ -190,7 +190,72 @@ pub fn resample_pcm_20ms(src: &[i16], target_samples: usize) -> Result<Vec<i16>,
     }
 }
 
-/// Stateful cross-frame 20 ms PCM resampler eliminating slope discontinuities across frame boundaries.
+/// Resamples a mono PCM frame of arbitrary packet duration (`2.5`–`120` ms) from `src_rate_hz` to `dst_rate_hz`.
+pub fn resample_pcm_by_rate(
+    src: &[i16],
+    src_rate_hz: u32,
+    dst_rate_hz: u32,
+) -> Result<Vec<i16>, MediaError> {
+    if src_rate_hz == 0 || dst_rate_hz == 0 {
+        return Err(MediaError::BufferError(format!(
+            "invalid PCM sample rate conversion {src_rate_hz} Hz -> {dst_rate_hz} Hz"
+        )));
+    }
+    if src.is_empty() || src_rate_hz == dst_rate_hz {
+        return Ok(src.to_vec());
+    }
+    match (src_rate_hz, dst_rate_hz) {
+        (8_000, 16_000) => Ok(upsample_8k_to_16k(src)),
+        (8_000, 48_000) => Ok(upsample_8k_to_48k(src)),
+        (16_000, 48_000) => Ok(upsample_16k_to_48k(src)),
+        (16_000, 8_000) => Ok(downsample_16k_to_8k(src)),
+        (48_000, 16_000) => Ok(downsample_48k_to_16k(src)),
+        (48_000, 8_000) => Ok(downsample_48k_to_8k(src)),
+        _ => Ok(resample_linear_arbitrary(
+            src,
+            src_rate_hz,
+            dst_rate_hz,
+            None,
+        )),
+    }
+}
+
+fn resample_linear_arbitrary(
+    src: &[i16],
+    src_rate_hz: u32,
+    dst_rate_hz: u32,
+    prev_last: Option<i16>,
+) -> Vec<i16> {
+    if src.is_empty() || src_rate_hz == 0 || dst_rate_hz == 0 {
+        return Vec::new();
+    }
+    let out_len = (((src.len() as u64) * u64::from(dst_rate_hz) + u64::from(src_rate_hz / 2))
+        / u64::from(src_rate_hz))
+    .max(1) as usize;
+    let mut out = Vec::with_capacity(out_len);
+    let last_idx = src.len() - 1;
+    let prev = prev_last.unwrap_or(src[0]);
+
+    for out_idx in 0..out_len {
+        // Map output sample `(out_idx + 1)` across `[-1, src.len() - 1]` so `prev` bridges `out_idx = 0`.
+        let num = (out_idx as u64 + 1) * u64::from(src_rate_hz);
+        let pos_q16 = (num << 16) / u64::from(dst_rate_hz);
+        let whole = (pos_q16 >> 16) as usize;
+        let frac = (pos_q16 & 0xffff) as i64;
+        let (s0, s1) = if whole == 0 {
+            (i64::from(prev), i64::from(src[0]))
+        } else {
+            let i0 = (whole - 1).min(last_idx);
+            let i1 = whole.min(last_idx);
+            (i64::from(src[i0]), i64::from(src[i1]))
+        };
+        let interp = ((s0 * (65_536 - frac)) + (s1 * frac)) >> 16;
+        out.push(interp.clamp(i64::from(i16::MIN), i64::from(i16::MAX)) as i16);
+    }
+    out
+}
+
+/// Stateful cross-frame PCM resampler eliminating slope discontinuities across RTP packet boundaries.
 #[derive(Debug, Clone, Default)]
 pub struct StreamResampler {
     prev_last: Option<i16>,
@@ -202,28 +267,43 @@ impl StreamResampler {
         Self::default()
     }
 
-    /// Clears cross-frame boundary state (e.g., after a mid-call codec change).
+    /// Clears cross-frame boundary state (e.g., after a mid-call codec, SSRC, or sequence jump).
     pub fn reset(&mut self) {
         self.prev_last = None;
     }
 
-    /// Resamples one 20 ms frame to `target_samples`, interpolating smoothly across the previous frame tail.
-    pub fn resample_20ms(
+    /// Resamples a mono PCM packet of arbitrary duration (`2.5`–`120` ms) from `src_rate_hz` to `dst_rate_hz`,
+    /// preserving waveform continuity across sequential packet boundaries.
+    pub fn resample_by_rate(
         &mut self,
         src: &[i16],
-        target_samples: usize,
+        src_rate_hz: u32,
+        dst_rate_hz: u32,
     ) -> Result<Vec<i16>, MediaError> {
-        let ratio = match (src.len(), target_samples) {
-            (PCM_FRAME_SAMPLES_8KHZ_20MS, PCM_FRAME_SAMPLES_16KHZ_20MS) => Some(2usize),
-            (PCM_FRAME_SAMPLES_8KHZ_20MS, PCM_FRAME_SAMPLES_48KHZ_20MS) => Some(6usize),
-            (PCM_FRAME_SAMPLES_16KHZ_20MS, PCM_FRAME_SAMPLES_48KHZ_20MS) => Some(3usize),
+        if src_rate_hz == 0 || dst_rate_hz == 0 {
+            return Err(MediaError::BufferError(format!(
+                "invalid PCM sample rate conversion {src_rate_hz} Hz -> {dst_rate_hz} Hz"
+            )));
+        }
+        if src.is_empty() {
+            return Ok(Vec::new());
+        }
+        if src_rate_hz == dst_rate_hz {
+            self.prev_last = src.last().copied();
+            return Ok(src.to_vec());
+        }
+
+        let upsample_ratio = match (src_rate_hz, dst_rate_hz) {
+            (8_000, 16_000) => Some(2usize),
+            (16_000, 48_000) => Some(3usize),
+            (8_000, 48_000) => Some(6usize),
+            _ if dst_rate_hz > src_rate_hz && dst_rate_hz.is_multiple_of(src_rate_hz) => {
+                Some((dst_rate_hz / src_rate_hz) as usize)
+            }
             _ => None,
         };
 
-        if let Some(ratio) = ratio {
-            let Some(first) = src.first().copied() else {
-                return Ok(Vec::new());
-            };
+        if let Some(ratio) = upsample_ratio {
             let out = if let Some(mut prev) = self.prev_last {
                 let ratio_i32 = ratio as i32;
                 let mut buf = Vec::with_capacity(src.len() * ratio);
@@ -237,13 +317,53 @@ impl StreamResampler {
                 }
                 buf
             } else {
-                let _ = first;
-                resample_pcm_20ms(src, target_samples)?
+                let ratio_i32 = ratio as i32;
+                let mut buf = Vec::with_capacity(src.len() * ratio);
+                for (idx, &cur) in src.iter().enumerate() {
+                    let next = src.get(idx + 1).copied().unwrap_or(cur);
+                    for step in 0..ratio_i32 {
+                        let interp = (i32::from(cur) * (ratio_i32 - step) + i32::from(next) * step)
+                            / ratio_i32;
+                        buf.push(interp as i16);
+                    }
+                }
+                buf
             };
             self.prev_last = src.last().copied();
             return Ok(out);
         }
 
+        let out = match (src_rate_hz, dst_rate_hz) {
+            (16_000, 8_000) if src.len() >= 2 => downsample_16k_to_8k(src),
+            (48_000, 16_000) if src.len() >= 3 => downsample_48k_to_16k(src),
+            (48_000, 8_000) if src.len() >= 6 => downsample_48k_to_8k(src),
+            _ => resample_linear_arbitrary(src, src_rate_hz, dst_rate_hz, self.prev_last),
+        };
+        self.prev_last = src.last().copied();
+        Ok(out)
+    }
+
+    /// Resamples one 20 ms frame to `target_samples`, interpolating smoothly across the previous frame tail.
+    pub fn resample_20ms(
+        &mut self,
+        src: &[i16],
+        target_samples: usize,
+    ) -> Result<Vec<i16>, MediaError> {
+        let rates = match (src.len(), target_samples) {
+            (PCM_FRAME_SAMPLES_8KHZ_20MS, PCM_FRAME_SAMPLES_8KHZ_20MS) => Some((8_000, 8_000)),
+            (PCM_FRAME_SAMPLES_8KHZ_20MS, PCM_FRAME_SAMPLES_16KHZ_20MS) => Some((8_000, 16_000)),
+            (PCM_FRAME_SAMPLES_8KHZ_20MS, PCM_FRAME_SAMPLES_48KHZ_20MS) => Some((8_000, 48_000)),
+            (PCM_FRAME_SAMPLES_16KHZ_20MS, PCM_FRAME_SAMPLES_8KHZ_20MS) => Some((16_000, 8_000)),
+            (PCM_FRAME_SAMPLES_16KHZ_20MS, PCM_FRAME_SAMPLES_16KHZ_20MS) => Some((16_000, 16_000)),
+            (PCM_FRAME_SAMPLES_16KHZ_20MS, PCM_FRAME_SAMPLES_48KHZ_20MS) => Some((16_000, 48_000)),
+            (PCM_FRAME_SAMPLES_48KHZ_20MS, PCM_FRAME_SAMPLES_8KHZ_20MS) => Some((48_000, 8_000)),
+            (PCM_FRAME_SAMPLES_48KHZ_20MS, PCM_FRAME_SAMPLES_16KHZ_20MS) => Some((48_000, 16_000)),
+            (PCM_FRAME_SAMPLES_48KHZ_20MS, PCM_FRAME_SAMPLES_48KHZ_20MS) => Some((48_000, 48_000)),
+            _ => None,
+        };
+        if let Some((src_rate, dst_rate)) = rates {
+            return self.resample_by_rate(src, src_rate, dst_rate);
+        }
         self.prev_last = src.last().copied();
         resample_pcm_20ms(src, target_samples)
     }
@@ -684,5 +804,53 @@ mod tests {
                 pair
             );
         }
+    }
+
+    #[test]
+    fn stream_resampler_by_rate_preserves_pitch_across_10ms_30ms_and_40ms_packets() {
+        // 10 ms at 16 kHz has 160 samples (same count as 20 ms at 8 kHz): `resample_by_rate`
+        // must upsample 3x -> 480 samples (10 ms @ 48 kHz), never 6x -> 960 samples!
+        let mut res = StreamResampler::new();
+        let wav_16k = WavPcm16::generate_sine_wave(16_000, 1_000, 200, 12_000);
+        let mut out_48k = Vec::new();
+        for pkt_10ms in wav_16k.samples.chunks(160) {
+            let chunk = res.resample_by_rate(pkt_10ms, 16_000, 48_000).unwrap();
+            assert_eq!(chunk.len(), 480);
+            out_48k.extend_from_slice(&chunk);
+        }
+        assert_eq!(out_48k.len(), 9_600);
+        // Zero-crossing frequency at 48 kHz must remain ~1000 Hz (40 crossings per 20 ms = 960 samples).
+        let zc = out_48k[960..5760]
+            .windows(2)
+            .filter(|w| (w[0] < 0) != (w[1] < 0))
+            .count();
+        let est_hz = (zc as f64 * 48_000.0) / (2.0 * 4_800.0);
+        assert!(
+            (980.0..=1_020.0).contains(&est_hz),
+            "expected ~1000 Hz after 10 ms 16->48 kHz resampling, got {est_hz:.1} Hz"
+        );
+
+        // 30 ms (240 samples) and 40 ms (320 samples) at 8 kHz -> 6x at 48 kHz (1440 / 1920 samples).
+        res.reset();
+        assert_eq!(
+            res.resample_by_rate(&vec![1000i16; 240], 8_000, 48_000)
+                .unwrap()
+                .len(),
+            1_440
+        );
+        assert_eq!(
+            res.resample_by_rate(&vec![1000i16; 320], 8_000, 48_000)
+                .unwrap()
+                .len(),
+            1_920
+        );
+        // Non-standard 24 kHz -> 48 kHz arbitrary rate fallback.
+        res.reset();
+        assert_eq!(
+            res.resample_by_rate(&vec![1000i16; 480], 24_000, 48_000)
+                .unwrap()
+                .len(),
+            960
+        );
     }
 }
