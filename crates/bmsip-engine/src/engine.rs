@@ -775,6 +775,30 @@ impl WorkerCtx {
                     self.refresh_udp_keepalive_deadline(now);
                     self.push_event(EngineEvent::RegistrationChanged(state));
                 }
+                UaEvent::MessageSummaryUpdated(summary) => {
+                    let new_messages = summary.new_voice_count();
+                    let old_messages = summary.old_voice_count();
+                    let urgent_new = summary.urgent_new_voice_count();
+                    let urgent_old = summary.urgent_old_voice_count();
+                    let message_account = summary.message_account.as_ref().map(ToString::to_string);
+                    self.recorder.record(
+                        now,
+                        TelemetryCategory::SipRx,
+                        None,
+                        format!(
+                            "voicemail summary waiting={} new={new_messages} old={old_messages}",
+                            summary.messages_waiting
+                        ),
+                    );
+                    self.push_event(EngineEvent::VoicemailUpdated {
+                        messages_waiting: summary.messages_waiting,
+                        message_account,
+                        new_messages,
+                        old_messages,
+                        urgent_new,
+                        urgent_old,
+                    });
+                }
                 UaEvent::IncomingCall {
                     call_id, from, to, ..
                 } => {
@@ -1645,6 +1669,11 @@ impl WorkerCtx {
                     None => self.recorder.to_json(),
                 };
                 self.push_event(EngineEvent::TelemetryExported { call_id, json });
+            }
+            EngineCommand::RefreshVoicemail => {
+                if let Err(err) = self.ua.refresh_mwi(now) {
+                    self.emit_cmd_error("refresh_voicemail", err);
+                }
             }
             EngineCommand::Shutdown => {
                 // Best-effort graceful BYE/CANCEL for active dialogs and de-REGISTER before closing sockets.

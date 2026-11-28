@@ -63,6 +63,7 @@ uint32_t bmsip_client_audio_sample_rate_hz(const BmsipClientHandle *client);
 
 int32_t bmsip_client_register(const BmsipClientHandle *client);
 int32_t bmsip_client_unregister(const BmsipClientHandle *client);
+int32_t bmsip_client_refresh_voicemail(const BmsipClientHandle *client);
 int32_t bmsip_client_dial(const BmsipClientHandle *client, const char *target_uri);
 int32_t bmsip_client_ring(const BmsipClientHandle *client, const char *call_id);
 int32_t bmsip_client_ring_early_media(const BmsipClientHandle *client, const char *call_id);

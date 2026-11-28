@@ -298,6 +298,24 @@ pub unsafe extern "C" fn bmsip_client_unregister(client: *const BmsipClientHandl
     })
 }
 
+/// Triggers an RFC 6665 voicemail MWI `SUBSCRIBE` refresh (`0` on success, `-1` on error).
+///
+/// # Safety
+/// `client` must be a valid handle created by `bmsip_client_new`.
+#[no_mangle]
+pub unsafe extern "C" fn bmsip_client_refresh_voicemail(client: *const BmsipClientHandle) -> i32 {
+    ffi_guard_i32(|| {
+        let Some(c) = (unsafe { client_ref(client) }) else {
+            return -1;
+        };
+        if c.refresh_voicemail().is_ok() {
+            0
+        } else {
+            -1
+        }
+    })
+}
+
 /// Dials a target SIP URI (`0` on success, `-1` on error).
 ///
 /// # Safety

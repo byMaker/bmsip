@@ -1,6 +1,6 @@
-//! MODULE_CONTRACT: Sans-I/O SIP User Agent (`UserAgent`), Account Registration FSM (RFC 3261 §10), and Invite Dialog FSM (RFC 3261 §9, §12–15).
-//! INVARIANTS: Zero I/O or system clock access; handles 401/407 Digest challenges on REGISTER/INVITE/BYE/UPDATE/REFER/INFO; enforces RFC 3261 §9.1 CANCEL ordering (defer CANCEL until 1xx arrives); supports Early Media (`183`/`180` SDP), Hold/Resume, UPDATE (RFC 3311), PRACK/100rel (RFC 3262), Session-Timers (RFC 4028), REFER/Replaces transfer (RFC 3515/3891), INFO DTMF (RFC 2976), Reason (RFC 3326), and P-Asserted-Identity/Privacy (RFC 3323/3325).
-//! RFC_REFS: RFC 2976; RFC 3261 Sections 9, 10, 12, 13, 14, 15; RFC 3262; RFC 3264; RFC 3311; RFC 3323; RFC 3325; RFC 3326; RFC 3389; RFC 3515; RFC 3891; RFC 4028; RFC 6337.
+//! MODULE_CONTRACT: Sans-I/O SIP User Agent (`UserAgent`), Account Registration FSM (RFC 3261 §10), MWI Event Subscription/Notification FSM (RFC 3842 / RFC 6665), and Invite Dialog FSM (RFC 3261 §9, §12–15).
+//! INVARIANTS: Zero I/O or system clock access; handles 401/407 Digest challenges on REGISTER/SUBSCRIBE/INVITE/BYE/UPDATE/REFER/INFO; enforces RFC 3261 §9.1 CANCEL ordering (defer CANCEL until 1xx arrives); supports Early Media (`183`/`180` SDP), Hold/Resume, UPDATE (RFC 3311), PRACK/100rel (RFC 3262), Session-Timers (RFC 4028), REFER/Replaces transfer (RFC 3515/3891), Voicemail MWI (RFC 3842/6665), INFO DTMF (RFC 2976), Reason (RFC 3326), and P-Asserted-Identity/Privacy (RFC 3323/3325).
+//! RFC_REFS: RFC 2976; RFC 3261 Sections 9, 10, 12, 13, 14, 15; RFC 3262; RFC 3264; RFC 3311; RFC 3323; RFC 3325; RFC 3326; RFC 3389; RFC 3515; RFC 3842; RFC 3891; RFC 4028; RFC 6337; RFC 6665.
 
 use std::collections::{HashMap, VecDeque};
 use std::time::{Duration, Instant};
@@ -13,17 +13,38 @@ use crate::sdp::{
     RtpCodec, SdesCryptoAttr, SdpMediaProfile, SdpSession, SrtpMode, SrtpSuite,
 };
 use crate::sip::{
-    CSeq, CallerIdentity, Method, NameAddr, RAck, ReasonHeader, ReplacesHeader, SessionExpires,
-    SessionRefresher, SipMessage, SipRequest, SipResponse, SipTransport, SipUri, Via,
+    CSeq, CallerIdentity, MessageSummary, Method, NameAddr, RAck, ReasonHeader, ReplacesHeader,
+    SessionExpires, SessionRefresher, SipMessage, SipRequest, SipResponse, SipTransport, SipUri,
+    Via, MWI_CONTENT_TYPE, MWI_EVENT_PACKAGE,
 };
 use crate::transaction::{RfcTimers, TransactionEvent, TransactionId, TransactionManager};
 
 pub const DEFAULT_USER_AGENT: &str = concat!("bmsip/", env!("CARGO_PKG_VERSION"));
-const ALLOW_METHODS: &str = "INVITE, ACK, CANCEL, BYE, OPTIONS, UPDATE, PRACK, INFO, REFER, NOTIFY";
+const ALLOW_METHODS: &str =
+    "INVITE, ACK, CANCEL, BYE, OPTIONS, UPDATE, PRACK, INFO, REFER, NOTIFY, SUBSCRIBE";
+const ALLOW_EVENTS: &str = "message-summary, refer";
 const SUPPORTED_EXTENSIONS: &str = "timer, 100rel, replaces";
+const MWI_AUTO_SUBSCRIBE_DELAY: Duration = Duration::from_millis(1500);
+const DEFAULT_MWI_EXPIRES_SECS: u32 = 3600;
+const MIN_MWI_EXPIRES_SECS: u32 = 60;
 const MAX_STALE_AUTH_RETRIES: u8 = 3;
 const MAX_SESSION_TIMER_RETRIES: u8 = 3;
 const MAX_GLARE_RETRIES: u8 = 3;
+
+/// RFC 3842 / RFC 6665 Message Waiting Indication (Voicemail) operating mode.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum MwiMode {
+    /// Rejects `Event: message-summary` with `489 Bad Event` and never sends `SUBSCRIBE`.
+    #[default]
+    Disabled,
+    /// Accepts unsolicited out-of-dialog `NOTIFY (Event: message-summary)` without sending `SUBSCRIBE`.
+    UnsolicitedOnly,
+    /// Explicitly subscribes via `SUBSCRIBE (Event: message-summary)` while registered.
+    Solicited,
+    /// Hybrid mode: accepts unsolicited `NOTIFY` immediately; if none arrives within `1.5 s` of
+    /// `REGISTER`, sends `SUBSCRIBE` and falls back to `UnsolicitedOnly` on `404`/`405`/`489`/`501`.
+    Auto,
+}
 
 /// SIP account registration lifecycle state (RFC 3261 Section 10).
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -106,6 +127,12 @@ pub struct UaConfig {
     pub allow_insecure_cleartext_sdes: bool,
     /// Custom SIP `User-Agent` header value attached to outbound requests (defaults to [`DEFAULT_USER_AGENT`]).
     pub user_agent: String,
+    /// RFC 3842 / RFC 6665 voicemail MWI subscription/notification policy (default [`MwiMode::Disabled`]).
+    pub mwi_mode: MwiMode,
+    /// Optional explicit SIP URI subscribed to for `Event: message-summary` (defaults to the account AOR).
+    pub mwi_target_uri: Option<SipUri>,
+    /// Requested expiry interval in seconds for outbound MWI `SUBSCRIBE` dialogs (default `3600`, minimum `60`).
+    pub mwi_expires_secs: u32,
 }
 
 impl UaConfig {
@@ -144,6 +171,9 @@ impl UaConfig {
             srtp_mode: SrtpMode::Disabled,
             allow_insecure_cleartext_sdes: false,
             user_agent: DEFAULT_USER_AGENT.to_string(),
+            mwi_mode: MwiMode::Disabled,
+            mwi_target_uri: None,
+            mwi_expires_secs: DEFAULT_MWI_EXPIRES_SECS,
         }
     }
 
@@ -210,6 +240,24 @@ impl UaConfig {
         sanitize_user_agent(&self.user_agent)
     }
 
+    /// Configures the RFC 3842 / RFC 6665 voicemail MWI operating mode.
+    pub fn with_mwi_mode(mut self, mode: MwiMode) -> Self {
+        self.mwi_mode = mode;
+        self
+    }
+
+    /// Overrides the target SIP URI used for outbound `SUBSCRIBE (Event: message-summary)`.
+    pub fn with_mwi_target_uri(mut self, target: Option<SipUri>) -> Self {
+        self.mwi_target_uri = target;
+        self
+    }
+
+    /// Sets the requested expiry interval (in seconds, minimum `60`) for outbound MWI subscriptions.
+    pub fn with_mwi_expires_secs(mut self, expires_secs: u32) -> Self {
+        self.mwi_expires_secs = expires_secs.max(MIN_MWI_EXPIRES_SECS);
+        self
+    }
+
     /// Evaluates the effective SRTP mode enforcing RFC 4568 §8 (SDES requires TLS unless explicitly overridden).
     pub fn effective_srtp_mode(&self) -> Result<SrtpMode, SipError> {
         let sdes_transport_allowed =
@@ -260,6 +308,7 @@ impl UaConfig {
 #[allow(clippy::large_enum_variant)]
 pub enum UaEvent {
     RegistrationChanged(RegistrationState),
+    MessageSummaryUpdated(MessageSummary),
     IncomingCall {
         call_id: String,
         from: NameAddr,
@@ -389,6 +438,42 @@ struct RegisterSession {
     auth: AuthRetryState,
     interval_too_brief_retried: bool,
     pending_expires: u32,
+}
+
+#[derive(Debug, Clone)]
+struct MwiSession {
+    call_id: String,
+    local_tag: String,
+    remote_tag: Option<String>,
+    remote_target: Option<SipUri>,
+    route_set: Vec<SipUri>,
+    cseq: u32,
+    remote_cseq: Option<u32>,
+    active_tx: Option<TransactionId>,
+    pending_expires: u32,
+    auth: AuthRetryState,
+    interval_too_brief_retried: bool,
+    subscribe_due_at: Option<Instant>,
+    passive_unsolicited_latched: bool,
+    last_summary: Option<MessageSummary>,
+}
+
+impl MwiSession {
+    fn reset_dialog(&mut self, call_id: String, local_tag: String) {
+        self.call_id = call_id;
+        self.local_tag = local_tag;
+        self.remote_tag = None;
+        self.remote_target = None;
+        self.route_set.clear();
+        self.cseq = 0;
+        self.remote_cseq = None;
+        self.active_tx = None;
+        self.pending_expires = 0;
+        self.auth.reset();
+        self.interval_too_brief_retried = false;
+        self.subscribe_due_at = None;
+        self.passive_unsolicited_latched = false;
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -530,6 +615,7 @@ pub struct UserAgent {
     transactions: TransactionManager,
     reg_state: RegistrationState,
     reg_session: RegisterSession,
+    mwi_session: MwiSession,
     calls: HashMap<String, CallSession>,
     tx_to_call: HashMap<TransactionId, (String, CallTxKind)>,
     pending_events: VecDeque<UaEvent>,
@@ -552,6 +638,11 @@ impl UserAgent {
             config.local_sip_port, config.local_host
         );
         let reg_tag = format!("bm-rtag-{}{seed_part}", config.local_sip_port);
+        let mwi_call_id = format!(
+            "bm-mwi-{}{seed_part}@{}",
+            config.local_sip_port, config.local_host
+        );
+        let mwi_tag = format!("bm-mtag-{}{seed_part}", config.local_sip_port);
         let timers = config.timers;
         Self {
             config,
@@ -566,6 +657,22 @@ impl UserAgent {
                 interval_too_brief_retried: false,
                 pending_expires: 0,
             },
+            mwi_session: MwiSession {
+                call_id: mwi_call_id,
+                local_tag: mwi_tag,
+                remote_tag: None,
+                remote_target: None,
+                route_set: Vec::new(),
+                cseq: 0,
+                remote_cseq: None,
+                active_tx: None,
+                pending_expires: 0,
+                auth: AuthRetryState::default(),
+                interval_too_brief_retried: false,
+                subscribe_due_at: None,
+                passive_unsolicited_latched: false,
+                last_summary: None,
+            },
             calls: HashMap::new(),
             tx_to_call: HashMap::new(),
             pending_events: VecDeque::new(),
@@ -576,6 +683,11 @@ impl UserAgent {
     /// Returns the current User Agent configuration.
     pub fn config(&self) -> &UaConfig {
         &self.config
+    }
+
+    /// Returns the latest parsed RFC 3842 Message Waiting Indication summary, if any arrived.
+    pub fn message_summary(&self) -> Option<&MessageSummary> {
+        self.mwi_session.last_summary.as_ref()
     }
 
     /// Returns the configured SIP signaling transport (`Udp`, `Tcp`, or `Tls`).
@@ -714,12 +826,35 @@ impl UserAgent {
         Ok(())
     }
 
-    /// Initiates SIP de-registration (`REGISTER` with `Expires: 0`).
+    /// Initiates SIP de-registration (`REGISTER` with `Expires: 0`) and terminates any active MWI subscription.
     pub fn unregister(&mut self, now: Instant) -> Result<(), SipError> {
+        self.mwi_session.subscribe_due_at = None;
+        self.mwi_session.passive_unsolicited_latched = false;
+        if self.mwi_session.remote_tag.is_some() && self.config.mwi_mode != MwiMode::Disabled {
+            let _ = self.start_mwi_subscribe(0, AuthAction::Keep, now);
+        }
         self.reg_session.interval_too_brief_retried = false;
         self.start_register_with_expires(0, AuthAction::Reset, now)?;
         self.set_registration_state(RegistrationState::Unregistering);
         Ok(())
+    }
+
+    /// Triggers an immediate RFC 6665 `SUBSCRIBE (Event: message-summary)` when registered and MWI is active.
+    pub fn refresh_mwi(&mut self, now: Instant) -> Result<(), SipError> {
+        if !matches!(self.config.mwi_mode, MwiMode::Solicited | MwiMode::Auto) {
+            return Ok(());
+        }
+        if !matches!(self.reg_state, RegistrationState::Registered { .. }) {
+            return Ok(());
+        }
+        self.mwi_session.subscribe_due_at = None;
+        self.mwi_session.passive_unsolicited_latched = false;
+        self.mwi_session.interval_too_brief_retried = false;
+        self.start_mwi_subscribe(
+            self.config.mwi_expires_secs.max(MIN_MWI_EXPIRES_SECS),
+            AuthAction::Reset,
+            now,
+        )
     }
 
     /// Starts an outbound `INVITE` call with an SDP audio offer and returns its `Call-ID`.
@@ -2083,6 +2218,10 @@ impl UserAgent {
         self.config.local_host = new_ip.clone();
         self.config.local_sip_port = new_local_sip_port;
 
+        let mwi_cid = self.next_call_id();
+        let mwi_tag = self.next_tag();
+        self.mwi_session.reset_dialog(mwi_cid, mwi_tag);
+
         if matches!(
             self.reg_state,
             RegistrationState::Registered { .. } | RegistrationState::Registering
@@ -2156,6 +2295,15 @@ impl UserAgent {
             RegistrationState::Registered { refresh_at, .. } => Some(*refresh_at),
             _ => None,
         };
+        let mwi_dl = if matches!(self.reg_state, RegistrationState::Registered { .. })
+            && self.mwi_session.active_tx.is_none()
+            && !self.mwi_session.passive_unsolicited_latched
+            && matches!(self.config.mwi_mode, MwiMode::Solicited | MwiMode::Auto)
+        {
+            self.mwi_session.subscribe_due_at
+        } else {
+            None
+        };
         let ack_dl = self
             .calls
             .values()
@@ -2191,6 +2339,7 @@ impl UserAgent {
         [
             tx_dl,
             reg_dl,
+            mwi_dl,
             ack_dl,
             rel1xx_dl,
             glare_dl,
@@ -2203,7 +2352,7 @@ impl UserAgent {
         .min()
     }
 
-    /// Advances transaction, registration refresh, UAS 2xx retransmission, and Session-Timer deadlines up to `now`.
+    /// Advances transaction, registration, MWI subscription, UAS 2xx retransmission, and Session-Timer deadlines up to `now`.
     pub fn handle_timeout(&mut self, now: Instant) -> Vec<UaEvent> {
         let tx_events = self.transactions.handle_timeout(now);
         self.process_transaction_events(tx_events, now);
@@ -2215,6 +2364,24 @@ impl UserAgent {
                         status_code: None,
                         reason: err.to_string(),
                     });
+                }
+            }
+        }
+
+        if matches!(self.reg_state, RegistrationState::Registered { .. })
+            && self.mwi_session.active_tx.is_none()
+            && !self.mwi_session.passive_unsolicited_latched
+            && matches!(self.config.mwi_mode, MwiMode::Solicited | MwiMode::Auto)
+        {
+            if let Some(mwi_due) = self.mwi_session.subscribe_due_at {
+                if now >= mwi_due {
+                    self.mwi_session.subscribe_due_at = None;
+                    self.mwi_session.interval_too_brief_retried = false;
+                    let exp = self.config.mwi_expires_secs.max(MIN_MWI_EXPIRES_SECS);
+                    if let Err(err) = self.start_mwi_subscribe(exp, AuthAction::Reset, now) {
+                        self.pending_events
+                            .push_back(UaEvent::ProtocolWarning(err.to_string()));
+                    }
                 }
             }
         }
@@ -2611,6 +2778,9 @@ impl UserAgent {
         req.headers.set("Contact", contact);
         req.headers.set("Expires", expires.to_string());
         req.headers.set("Allow", ALLOW_METHODS);
+        if self.config.mwi_mode != MwiMode::Disabled {
+            req.headers.set("Allow-Events", ALLOW_EVENTS);
+        }
         req.headers.set("Supported", SUPPORTED_EXTENSIONS);
         req.headers
             .set("User-Agent", self.config.effective_user_agent());
@@ -2618,6 +2788,92 @@ impl UserAgent {
 
         let tx_id = self.transactions.start_client_transaction(req, now)?;
         self.reg_session.active_tx = Some(tx_id);
+        Ok(())
+    }
+
+    fn mwi_target_uri(&self) -> SipUri {
+        self.config
+            .mwi_target_uri
+            .clone()
+            .unwrap_or_else(|| self.config.aor_uri())
+    }
+
+    fn start_mwi_subscribe(
+        &mut self,
+        expires: u32,
+        auth_action: AuthAction,
+        now: Instant,
+    ) -> Result<(), SipError> {
+        self.mwi_session.cseq = self.mwi_session.cseq.saturating_add(1);
+        match auth_action {
+            AuthAction::Reset => self.mwi_session.auth.reset(),
+            AuthAction::Keep => {}
+            AuthAction::Retry(status_code, hdr_val) => {
+                self.mwi_session.auth.record_retry(status_code, hdr_val);
+            }
+        }
+        self.mwi_session.pending_expires = expires;
+        let _ = self.mwi_session.active_tx.take();
+
+        let branch = self.next_branch();
+        let target_aor = self.mwi_target_uri();
+        let request_uri = if self.mwi_session.remote_tag.is_some() {
+            self.mwi_session
+                .remote_target
+                .clone()
+                .unwrap_or_else(|| target_aor.clone())
+        } else {
+            target_aor.clone()
+        };
+        let contact = NameAddr::new(self.config.contact_uri()).to_string();
+
+        let mut req = SipRequest::new(Method::Subscribe, request_uri);
+        req.headers.add(
+            "Via",
+            Via::new(
+                self.config.transport.via_proto(),
+                format!("{}:{}", self.config.local_host, self.config.local_sip_port),
+                branch,
+            )
+            .to_string(),
+        );
+        if self.mwi_session.remote_tag.is_some() {
+            for route in &self.mwi_session.route_set {
+                req.headers
+                    .add("Route", NameAddr::new(route.clone()).to_string());
+            }
+        }
+        req.headers.set(
+            "From",
+            self.config
+                .local_from_name_addr()
+                .with_tag(self.mwi_session.local_tag.clone())
+                .to_string(),
+        );
+        let mut to_addr = NameAddr::new(target_aor);
+        if let Some(tag) = &self.mwi_session.remote_tag {
+            to_addr = to_addr.with_tag(tag.clone());
+        }
+        req.headers.set("To", to_addr.to_string());
+        req.headers.set("Call-ID", self.mwi_session.call_id.clone());
+        req.headers.set(
+            "CSeq",
+            CSeq::new(self.mwi_session.cseq, Method::Subscribe).to_string(),
+        );
+        req.headers.set("Max-Forwards", "70");
+        req.headers.set("Contact", contact);
+        req.headers.set("Event", MWI_EVENT_PACKAGE);
+        req.headers.set("Accept", MWI_CONTENT_TYPE);
+        req.headers.set("Expires", expires.to_string());
+        req.headers.set("Allow", ALLOW_METHODS);
+        req.headers.set("Allow-Events", ALLOW_EVENTS);
+        req.headers.set("Supported", SUPPORTED_EXTENSIONS);
+        req.headers
+            .set("User-Agent", self.config.effective_user_agent());
+        self.mwi_session.auth.apply(&mut req.headers);
+
+        let tx_id = self.transactions.start_client_transaction(req, now)?;
+        self.mwi_session.active_tx = Some(tx_id);
         Ok(())
     }
 
@@ -2969,7 +3225,7 @@ impl UserAgent {
                     self.on_unmatched_2xx(response, now);
                 }
                 TransactionEvent::TransactionTimeout(tx_id) => {
-                    self.on_transaction_timeout(tx_id);
+                    self.on_transaction_timeout(tx_id, now);
                 }
                 TransactionEvent::TransactionTerminated(tx_id) => {
                     self.tx_to_call.remove(&tx_id);
@@ -3015,6 +3271,9 @@ impl UserAgent {
             Method::Options => {
                 if let Ok(mut resp) = request.create_response(200, "OK") {
                     resp.headers.set("Allow", ALLOW_METHODS);
+                    if self.config.mwi_mode != MwiMode::Disabled {
+                        resp.headers.set("Allow-Events", ALLOW_EVENTS);
+                    }
                     resp.headers.set("Supported", SUPPORTED_EXTENSIONS);
                     self.send_uas_response(&tx_id, resp, None, now);
                 }
@@ -4086,6 +4345,37 @@ impl UserAgent {
     }
 
     fn on_inbound_notify(&mut self, tx_id: TransactionId, request: SipRequest, now: Instant) {
+        let event_pkg = request
+            .headers
+            .get("Event")
+            .and_then(|v| v.split(';').next())
+            .map(|v| v.trim().to_ascii_lowercase())
+            .unwrap_or_default();
+
+        if event_pkg == MWI_EVENT_PACKAGE {
+            self.handle_inbound_mwi_notify(&tx_id, &request, now);
+            return;
+        }
+
+        let is_refer = event_pkg.starts_with("refer")
+            || (event_pkg.is_empty()
+                && request
+                    .headers
+                    .get("Content-Type")
+                    .is_some_and(|ct| ct.to_ascii_lowercase().contains("sipfrag")));
+
+        if !is_refer {
+            if let Ok(mut resp) = request.create_response(489, "Bad Event") {
+                if self.config.mwi_mode != MwiMode::Disabled {
+                    resp.headers.set("Allow-Events", ALLOW_EVENTS);
+                } else {
+                    resp.headers.set("Allow-Events", "refer");
+                }
+                self.send_uas_response(&tx_id, resp, None, now);
+            }
+            return;
+        }
+
         let call_id = match self.check_in_dialog_request(&request) {
             InDialogCheck::Valid(cid) => cid,
             InDialogCheck::OutOfOrder500 => {
@@ -4112,27 +4402,174 @@ impl UserAgent {
 
         self.send_simple_server_response(&tx_id, &request, 200, "OK", now);
 
-        let is_refer = request
+        let (status_code, reason) = parse_sipfrag_status(&request.body);
+        let terminated = request
             .headers
-            .get("Event")
-            .is_some_and(|e| e.trim().to_ascii_lowercase().starts_with("refer"))
-            || request
-                .headers
-                .get("Content-Type")
-                .is_some_and(|ct| ct.to_ascii_lowercase().contains("sipfrag"));
+            .get("Subscription-State")
+            .is_some_and(|s| s.to_ascii_lowercase().contains("terminated"));
+        self.pending_events.push_back(UaEvent::TransferNotify {
+            call_id,
+            status_code,
+            reason,
+            terminated,
+        });
+    }
 
-        if is_refer {
-            let (status_code, reason) = parse_sipfrag_status(&request.body);
-            let terminated = request
-                .headers
-                .get("Subscription-State")
-                .is_some_and(|s| s.to_ascii_lowercase().contains("terminated"));
-            self.pending_events.push_back(UaEvent::TransferNotify {
-                call_id,
-                status_code,
-                reason,
-                terminated,
-            });
+    fn handle_inbound_mwi_notify(
+        &mut self,
+        tx_id: &TransactionId,
+        request: &SipRequest,
+        now: Instant,
+    ) {
+        if self.config.mwi_mode == MwiMode::Disabled {
+            if let Ok(mut resp) = request.create_response(489, "Bad Event") {
+                resp.headers.set("Allow-Events", "refer");
+                self.send_uas_response(tx_id, resp, None, now);
+            }
+            return;
+        }
+
+        let (Ok(call_id), Ok(to), Ok(cseq)) = (
+            request.call_id().map(str::to_string),
+            request.to(),
+            request.cseq(),
+        ) else {
+            self.send_simple_server_response(tx_id, request, 400, "Bad Request", now);
+            return;
+        };
+        let from_tag = request.from().ok().and_then(|f| f.tag);
+
+        let is_solicited_mwi = match to.tag.as_deref() {
+            Some(tt) => {
+                let remote_matches = match (&self.mwi_session.remote_tag, &from_tag) {
+                    (Some(expected), Some(actual)) => expected == actual,
+                    (None, _) => true,
+                    (Some(_), None) => false,
+                };
+                if call_id == self.mwi_session.call_id
+                    && tt == self.mwi_session.local_tag
+                    && remote_matches
+                {
+                    if let Some(prev) = self.mwi_session.remote_cseq {
+                        if cseq.seq <= prev {
+                            self.send_simple_server_response(
+                                tx_id,
+                                request,
+                                500,
+                                "Server Internal Error",
+                                now,
+                            );
+                            return;
+                        }
+                    }
+                    self.mwi_session.remote_cseq = Some(cseq.seq);
+                    if self.mwi_session.remote_tag.is_none() {
+                        self.mwi_session.remote_tag = from_tag;
+                    }
+                    if let Ok(Some(contact)) = request.contact() {
+                        self.mwi_session.remote_target = Some(contact.uri);
+                    }
+                    true
+                } else {
+                    self.send_simple_server_response(
+                        tx_id,
+                        request,
+                        481,
+                        "Call/Transaction Does Not Exist",
+                        now,
+                    );
+                    return;
+                }
+            }
+            None => {
+                // RFC 3842 unsolicited out-of-dialog NOTIFY from PBX/registrar.
+                if self.config.mwi_mode == MwiMode::Auto
+                    && self.mwi_session.remote_tag.is_none()
+                    && self.mwi_session.active_tx.is_none()
+                {
+                    self.mwi_session.passive_unsolicited_latched = true;
+                    self.mwi_session.subscribe_due_at = None;
+                }
+                false
+            }
+        };
+
+        let media_type = request
+            .headers
+            .get("Content-Type")
+            .and_then(|v| v.split(';').next())
+            .map(|v| v.trim().to_ascii_lowercase())
+            .unwrap_or_default();
+
+        let summary_opt = if request.body.is_empty() {
+            None
+        } else {
+            if !media_type.is_empty() && media_type != MWI_CONTENT_TYPE {
+                self.send_simple_server_response(
+                    tx_id,
+                    request,
+                    415,
+                    "Unsupported Media Type",
+                    now,
+                );
+                return;
+            }
+            match MessageSummary::parse(&request.body) {
+                Ok(parsed) => Some(parsed),
+                Err(_) => {
+                    self.send_simple_server_response(tx_id, request, 400, "Bad MWI Body", now);
+                    return;
+                }
+            }
+        };
+
+        if let Ok(mut resp) = request.create_response(200, "OK") {
+            resp.headers.set("Allow-Events", ALLOW_EVENTS);
+            let dialog_tag = is_solicited_mwi.then(|| self.mwi_session.local_tag.clone());
+            self.send_uas_response(tx_id, resp, dialog_tag.as_deref(), now);
+        }
+
+        if is_solicited_mwi {
+            if let Some(sub_state) = request.headers.get("Subscription-State") {
+                let (state_tok, expires_opt, reason_opt) = parse_subscription_state(sub_state);
+                match state_tok.as_str() {
+                    "active" | "pending" => {
+                        if let Some(exp) = expires_opt.filter(|&e| e > 0) {
+                            if matches!(self.config.mwi_mode, MwiMode::Solicited | MwiMode::Auto)
+                                && !self.mwi_session.passive_unsolicited_latched
+                            {
+                                let refresh_secs = ((u64::from(exp)) * 4 / 5).max(1);
+                                self.mwi_session.subscribe_due_at =
+                                    Some(now + Duration::from_secs(refresh_secs));
+                            }
+                        }
+                    }
+                    "terminated" => {
+                        let cid = self.next_call_id();
+                        let tag = self.next_tag();
+                        let rejected_or_missing =
+                            matches!(reason_opt.as_deref(), Some("rejected") | Some("noresource"));
+                        self.mwi_session.reset_dialog(cid, tag);
+                        if rejected_or_missing && self.config.mwi_mode == MwiMode::Auto {
+                            self.mwi_session.passive_unsolicited_latched = true;
+                        } else if !rejected_or_missing
+                            && matches!(self.config.mwi_mode, MwiMode::Solicited | MwiMode::Auto)
+                            && matches!(self.reg_state, RegistrationState::Registered { .. })
+                        {
+                            self.mwi_session.subscribe_due_at = Some(now + Duration::from_secs(5));
+                        }
+                    }
+                    _ => {}
+                }
+            }
+        }
+
+        if let Some(summary) = summary_opt {
+            if self.mwi_session.last_summary.as_ref() != Some(&summary) {
+                self.mwi_session.last_summary = Some(summary.clone());
+                self.pending_events
+                    .push_back(UaEvent::MessageSummaryUpdated(summary));
+            }
         }
     }
 
@@ -4517,6 +4954,10 @@ impl UserAgent {
             self.handle_register_final(response, now);
             return;
         }
+        if self.mwi_session.active_tx.as_ref() == Some(&tx_id) {
+            self.handle_mwi_subscribe_final(response, now);
+            return;
+        }
 
         let Some((call_id, kind)) = self.tx_to_call.remove(&tx_id) else {
             return;
@@ -4556,6 +4997,9 @@ impl UserAgent {
             if self.reg_session.pending_expires == 0 {
                 self.reg_session.auth.reset();
                 self.reg_session.interval_too_brief_retried = false;
+                let mwi_cid = self.next_call_id();
+                let mwi_tag = self.next_tag();
+                self.mwi_session.reset_dialog(mwi_cid, mwi_tag);
                 self.set_registration_state(RegistrationState::Unregistered);
                 return;
             }
@@ -4565,6 +5009,9 @@ impl UserAgent {
             if expires == 0 {
                 self.reg_session.auth.reset();
                 self.reg_session.interval_too_brief_retried = false;
+                let mwi_cid = self.next_call_id();
+                let mwi_tag = self.next_tag();
+                self.mwi_session.reset_dialog(mwi_cid, mwi_tag);
                 self.set_registration_state(RegistrationState::Unregistered);
                 return;
             }
@@ -4578,6 +5025,22 @@ impl UserAgent {
                 refresh_at,
                 expires_at,
             });
+            if self.mwi_session.remote_tag.is_none()
+                && self.mwi_session.active_tx.is_none()
+                && !self.mwi_session.passive_unsolicited_latched
+                && self.mwi_session.subscribe_due_at.is_none()
+            {
+                match self.config.mwi_mode {
+                    MwiMode::Solicited => {
+                        let exp = self.config.mwi_expires_secs.max(MIN_MWI_EXPIRES_SECS);
+                        let _ = self.start_mwi_subscribe(exp, AuthAction::Reset, now);
+                    }
+                    MwiMode::Auto => {
+                        self.mwi_session.subscribe_due_at = Some(now + MWI_AUTO_SUBSCRIBE_DELAY);
+                    }
+                    MwiMode::Disabled | MwiMode::UnsolicitedOnly => {}
+                }
+            }
             return;
         }
 
@@ -4633,6 +5096,124 @@ impl UserAgent {
             status_code: Some(code),
             reason: response.reason_phrase,
         });
+    }
+
+    fn handle_mwi_subscribe_final(&mut self, response: SipResponse, now: Instant) {
+        self.mwi_session.active_tx = None;
+        let code = response.status_code;
+
+        if (200..300).contains(&code) {
+            self.mwi_session.auth.reset();
+            self.mwi_session.interval_too_brief_retried = false;
+
+            let expires = response
+                .headers
+                .get("Expires")
+                .and_then(|v| v.split(';').next()?.trim().parse::<u32>().ok())
+                .unwrap_or(self.mwi_session.pending_expires);
+            if self.mwi_session.pending_expires == 0 || expires == 0 {
+                let mwi_cid = self.next_call_id();
+                let mwi_tag = self.next_tag();
+                self.mwi_session.reset_dialog(mwi_cid, mwi_tag);
+                return;
+            }
+
+            if self.mwi_session.remote_tag.is_none() {
+                if let Ok(to) = response.to() {
+                    if let Some(tag) = to.tag {
+                        self.mwi_session.remote_tag = Some(tag);
+                    }
+                }
+                let routes = extract_record_routes(&response.headers, true);
+                if !routes.is_empty() {
+                    self.mwi_session.route_set = routes;
+                }
+            }
+            if let Ok(Some(contact)) = response.contact() {
+                self.mwi_session.remote_target = Some(contact.uri);
+            }
+            if matches!(self.config.mwi_mode, MwiMode::Solicited | MwiMode::Auto)
+                && !self.mwi_session.passive_unsolicited_latched
+            {
+                let refresh_secs = ((u64::from(expires)) * 4 / 5).max(1);
+                self.mwi_session.subscribe_due_at = Some(now + Duration::from_secs(refresh_secs));
+            }
+            return;
+        }
+
+        if code == 423
+            && self.mwi_session.pending_expires > 0
+            && !self.mwi_session.interval_too_brief_retried
+        {
+            if let Some(min_exp) = response
+                .headers
+                .get("Min-Expires")
+                .and_then(|v| v.split(';').next()?.trim().parse::<u32>().ok())
+                .filter(|v| *v > 0)
+            {
+                self.mwi_session.interval_too_brief_retried = true;
+                self.mwi_session.auth.reset_attempts();
+                let clamped_exp = min_exp.min(86_400);
+                if self
+                    .start_mwi_subscribe(clamped_exp, AuthAction::Keep, now)
+                    .is_ok()
+                {
+                    return;
+                }
+            }
+        }
+
+        if (code == 401 || code == 407) && self.mwi_session.pending_expires > 0 {
+            let attempts = self.mwi_session.auth.attempts_for(code);
+            let digest_uri = if self.mwi_session.remote_tag.is_some() {
+                self.mwi_session
+                    .remote_target
+                    .clone()
+                    .unwrap_or_else(|| self.mwi_target_uri())
+            } else {
+                self.mwi_target_uri()
+            };
+            if let Ok((_hdr_name, hdr_val, stale)) =
+                self.compute_auth_header(&response, &Method::Subscribe, &digest_uri.to_string())
+            {
+                let can_retry = attempts == 0 || (stale && attempts < MAX_STALE_AUTH_RETRIES);
+                if can_retry {
+                    let exp = self.mwi_session.pending_expires;
+                    if self
+                        .start_mwi_subscribe(exp, AuthAction::Retry(code, hdr_val), now)
+                        .is_ok()
+                    {
+                        return;
+                    }
+                }
+            }
+        }
+
+        // In hybrid Auto mode, silently fall back to passive unsolicited NOTIFY if PBX does not support MWI SUBSCRIBE.
+        if self.config.mwi_mode == MwiMode::Auto && matches!(code, 404 | 405 | 489 | 501) {
+            let mwi_cid = self.next_call_id();
+            let mwi_tag = self.next_tag();
+            self.mwi_session.reset_dialog(mwi_cid, mwi_tag);
+            self.mwi_session.passive_unsolicited_latched = true;
+            return;
+        }
+
+        if self.mwi_session.pending_expires == 0 {
+            let mwi_cid = self.next_call_id();
+            let mwi_tag = self.next_tag();
+            self.mwi_session.reset_dialog(mwi_cid, mwi_tag);
+            return;
+        }
+
+        // Refresh failure (e.g., 481 Subscription Does Not Exist after server restart): rebuild dialog cleanly.
+        let mwi_cid = self.next_call_id();
+        let mwi_tag = self.next_tag();
+        self.mwi_session.reset_dialog(mwi_cid, mwi_tag);
+        if matches!(self.config.mwi_mode, MwiMode::Solicited | MwiMode::Auto)
+            && matches!(self.reg_state, RegistrationState::Registered { .. })
+        {
+            self.mwi_session.subscribe_due_at = Some(now + Duration::from_secs(10));
+        }
     }
 
     fn handle_invite_final(
@@ -5505,13 +6086,30 @@ impl UserAgent {
         }
     }
 
-    fn on_transaction_timeout(&mut self, tx_id: TransactionId) {
+    fn on_transaction_timeout(&mut self, tx_id: TransactionId, now: Instant) {
         if self.reg_session.active_tx.as_ref() == Some(&tx_id) {
             self.reg_session.active_tx = None;
             self.set_registration_state(RegistrationState::Failed {
                 status_code: None,
                 reason: "REGISTER transaction timed out".to_string(),
             });
+            return;
+        }
+        if self.mwi_session.active_tx.as_ref() == Some(&tx_id) {
+            self.mwi_session.active_tx = None;
+            if self.mwi_session.pending_expires == 0 {
+                let cid = self.next_call_id();
+                let tag = self.next_tag();
+                self.mwi_session.reset_dialog(cid, tag);
+            } else if matches!(self.config.mwi_mode, MwiMode::Solicited | MwiMode::Auto)
+                && !self.mwi_session.passive_unsolicited_latched
+                && matches!(self.reg_state, RegistrationState::Registered { .. })
+            {
+                let cid = self.next_call_id();
+                let tag = self.next_tag();
+                self.mwi_session.reset_dialog(cid, tag);
+                self.mwi_session.subscribe_due_at = Some(now + Duration::from_secs(10));
+            }
             return;
         }
 
@@ -5962,6 +6560,28 @@ fn sanitize_user_agent(raw: &str) -> String {
     }
 }
 
+fn parse_subscription_state(raw: &str) -> (String, Option<u32>, Option<String>) {
+    let mut parts = raw.split(';');
+    let state = parts
+        .next()
+        .map(|s| s.trim().to_ascii_lowercase())
+        .unwrap_or_default();
+    let mut expires = None;
+    let mut reason = None;
+    for param in parts {
+        if let Some((k, v)) = param.split_once('=') {
+            let key = k.trim().to_ascii_lowercase();
+            let val = v.trim().trim_matches('"');
+            if key == "expires" {
+                expires = val.parse::<u32>().ok();
+            } else if key == "reason" && !val.is_empty() {
+                reason = Some(val.to_ascii_lowercase());
+            }
+        }
+    }
+    (state, expires, reason)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -6024,5 +6644,299 @@ mod tests {
             panic!("expected INVITE request");
         };
         assert_eq!(inv_req.headers.get("User-Agent"), Some(custom_ua.as_str()));
+    }
+
+    #[test]
+    fn mwi_auto_accepts_unsolicited_notify_and_cancels_subscribe() {
+        let now = Instant::now();
+        let registrar = SipUri::parse("sip:10.0.0.1:5060").unwrap();
+        let cfg = UaConfig::new(
+            "1001",
+            "secret1001",
+            "pbx.local",
+            registrar,
+            "10.0.0.2",
+            5060,
+        )
+        .with_mwi_mode(MwiMode::Auto);
+        let mut ua = UserAgent::new(cfg);
+
+        ua.register(now).unwrap();
+        let reg_bytes = ua.poll_transmit();
+        let SipMessage::Request(reg_req) = SipMessage::parse(&reg_bytes[0]).unwrap() else {
+            panic!("expected REGISTER");
+        };
+        assert_eq!(reg_req.headers.get("Allow-Events"), Some(ALLOW_EVENTS));
+        let mut reg_ok = reg_req.create_response(200, "OK").unwrap();
+        reg_ok.headers.set("Expires", "300");
+        reg_ok
+            .headers
+            .set("To", "<sip:1001@pbx.local>;tag=srv-reg-1");
+        let events = ua.receive_message(SipMessage::Response(reg_ok), now);
+        assert!(events.iter().any(|e| matches!(
+            e,
+            UaEvent::RegistrationChanged(RegistrationState::Registered { .. })
+        )));
+        assert!(ua.poll_transmit().is_empty());
+
+        // PBX sends unsolicited out-of-dialog NOTIFY immediately after REGISTER.
+        let mut notify = SipRequest::new(
+            Method::Notify,
+            SipUri::parse("sip:1001@10.0.0.2:5060;transport=udp").unwrap(),
+        )
+        .with_body(
+            MWI_CONTENT_TYPE,
+            b"Messages-Waiting: yes\r\nMessage-Account: sip:*97@10.0.0.1\r\nVoice-Message: 2/1 (1/0)\r\n"
+                .to_vec(),
+        );
+        notify.headers.add(
+            "Via",
+            Via::new("UDP", "10.0.0.1:5060", "z9hG4bK-mwi-unsol-1").to_string(),
+        );
+        notify
+            .headers
+            .set("From", "<sip:1001@10.0.0.1>;tag=ast-mwi-1");
+        notify.headers.set("To", "<sip:1001@10.0.0.2>");
+        notify.headers.set("Call-ID", "ast-unsol-mwi-1@10.0.0.1");
+        notify
+            .headers
+            .set("CSeq", CSeq::new(1, Method::Notify).to_string());
+        notify.headers.set("Event", "message-summary");
+        notify.headers.set("Subscription-State", "active");
+
+        let events = ua.receive_message(SipMessage::Request(notify), now);
+        let tx_pkts = ua.poll_transmit();
+        assert_eq!(tx_pkts.len(), 1);
+        let SipMessage::Response(notify_resp) = SipMessage::parse(&tx_pkts[0]).unwrap() else {
+            panic!("expected 200 OK response to unsolicited NOTIFY");
+        };
+        assert_eq!(notify_resp.status_code, 200);
+        assert!(events.iter().any(|e| matches!(
+            e,
+            UaEvent::MessageSummaryUpdated(s)
+                if s.messages_waiting
+                    && s.new_voice_count() == 2
+                    && s.old_voice_count() == 1
+                    && s.urgent_new_voice_count() == 1
+        )));
+
+        // Advancing past the 1.5 s Auto SUBSCRIBE delay must NOT transmit SUBSCRIBE because unsolicited MWI latched.
+        let _ = ua.handle_timeout(now + Duration::from_secs(2));
+        assert!(ua.poll_transmit().is_empty());
+    }
+
+    #[test]
+    fn mwi_solicited_subscribe_handles_digest_auth_notify_and_unsubscribe() {
+        let now = Instant::now();
+        let registrar = SipUri::parse("sip:10.0.0.1:5060").unwrap();
+        let cfg = UaConfig::new(
+            "1002",
+            "secret1002",
+            "pbx.local",
+            registrar,
+            "10.0.0.2",
+            5060,
+        )
+        .with_mwi_mode(MwiMode::Solicited)
+        .with_mwi_expires_secs(600);
+        let mut ua = UserAgent::new(cfg);
+
+        ua.register(now).unwrap();
+        let reg_bytes = ua.poll_transmit();
+        let SipMessage::Request(reg_req) = SipMessage::parse(&reg_bytes[0]).unwrap() else {
+            panic!("expected REGISTER");
+        };
+        let mut reg_ok = reg_req.create_response(200, "OK").unwrap();
+        reg_ok.headers.set("Expires", "300");
+        reg_ok
+            .headers
+            .set("To", "<sip:1002@pbx.local>;tag=srv-reg-2");
+        ua.receive_message(SipMessage::Response(reg_ok), now);
+
+        // Solicited mode emits initial SUBSCRIBE immediately on 200 OK REGISTER.
+        let sub_bytes = ua.poll_transmit();
+        assert_eq!(sub_bytes.len(), 1);
+        let SipMessage::Request(sub_req) = SipMessage::parse(&sub_bytes[0]).unwrap() else {
+            panic!("expected SUBSCRIBE");
+        };
+        assert_eq!(sub_req.method, Method::Subscribe);
+        assert_eq!(sub_req.headers.get("Event"), Some("message-summary"));
+        assert_eq!(sub_req.headers.get("Expires"), Some("600"));
+
+        // 401 Digest challenge triggers authenticated SUBSCRIBE retry.
+        let mut unauth = sub_req.create_response(401, "Unauthorized").unwrap();
+        unauth.headers.set(
+            "WWW-Authenticate",
+            "Digest realm=\"pbx.local\", nonce=\"mwi-nonce-1\", algorithm=MD5, qop=\"auth\"",
+        );
+        unauth.headers.set("To", "<sip:1002@pbx.local>;tag=srv-401");
+        ua.receive_message(SipMessage::Response(unauth), now);
+
+        let auth_sub_bytes = ua.poll_transmit();
+        assert_eq!(auth_sub_bytes.len(), 1);
+        let SipMessage::Request(auth_sub) = SipMessage::parse(&auth_sub_bytes[0]).unwrap() else {
+            panic!("expected authenticated SUBSCRIBE");
+        };
+        assert_eq!(auth_sub.method, Method::Subscribe);
+        assert!(auth_sub.headers.get("Authorization").is_some());
+
+        // 202 Accepted establishes the MWI dialog.
+        let mut acc = auth_sub.create_response(202, "Accepted").unwrap();
+        acc.headers.set("To", "<sip:1002@pbx.local>;tag=srv-sub-1");
+        acc.headers.set("Expires", "600");
+        acc.headers.set("Contact", "<sip:1002@10.0.0.1:5060>");
+        ua.receive_message(SipMessage::Response(acc), now);
+
+        // In-dialog NOTIFY updates state and replies 200 OK with matching To tag.
+        let mut in_notify = SipRequest::new(
+            Method::Notify,
+            SipUri::parse("sip:1002@10.0.0.2:5060;transport=udp").unwrap(),
+        )
+        .with_body(
+            MWI_CONTENT_TYPE,
+            b"Messages-Waiting: yes\r\nMessage-Account: sip:*97@pbx.local\r\nVoice-Message: 1/0\r\n"
+                .to_vec(),
+        );
+        in_notify.headers.add(
+            "Via",
+            Via::new("UDP", "10.0.0.1:5060", "z9hG4bK-mwi-in-1").to_string(),
+        );
+        in_notify
+            .headers
+            .set("From", "<sip:1002@pbx.local>;tag=srv-sub-1");
+        in_notify
+            .headers
+            .set("To", auth_sub.headers.get("From").unwrap());
+        in_notify
+            .headers
+            .set("Call-ID", auth_sub.call_id().unwrap());
+        in_notify
+            .headers
+            .set("CSeq", CSeq::new(1, Method::Notify).to_string());
+        in_notify.headers.set("Event", "message-summary");
+        in_notify
+            .headers
+            .set("Subscription-State", "active;expires=600");
+
+        let events = ua.receive_message(SipMessage::Request(in_notify), now);
+        assert!(events.iter().any(|e| matches!(
+            e,
+            UaEvent::MessageSummaryUpdated(s) if s.messages_waiting && s.new_voice_count() == 1
+        )));
+        let notify_ok_bytes = ua.poll_transmit();
+        let SipMessage::Response(notify_ok) = SipMessage::parse(&notify_ok_bytes[0]).unwrap()
+        else {
+            panic!("expected 200 OK to in-dialog NOTIFY");
+        };
+        assert_eq!(notify_ok.status_code, 200);
+
+        // Unregistering sends Expires: 0 SUBSCRIBE alongside REGISTER Expires: 0.
+        ua.unregister(now + Duration::from_secs(1)).unwrap();
+        let unreg_pkts = ua.poll_transmit();
+        assert_eq!(unreg_pkts.len(), 2);
+        let SipMessage::Request(unsub_req) = SipMessage::parse(&unreg_pkts[0]).unwrap() else {
+            panic!("expected SUBSCRIBE Expires: 0");
+        };
+        assert_eq!(unsub_req.method, Method::Subscribe);
+        assert_eq!(unsub_req.headers.get("Expires"), Some("0"));
+        assert!(unsub_req.to().unwrap().tag.as_deref() == Some("srv-sub-1"));
+    }
+
+    #[test]
+    fn mwi_auto_falls_back_on_489_and_disabled_rejects_mwi() {
+        let now = Instant::now();
+        let registrar = SipUri::parse("sip:10.0.0.1:5060").unwrap();
+        let cfg = UaConfig::new(
+            "1003",
+            "secret1003",
+            "pbx.local",
+            registrar.clone(),
+            "10.0.0.2",
+            5060,
+        )
+        .with_mwi_mode(MwiMode::Auto);
+        let mut ua = UserAgent::new(cfg);
+
+        ua.register(now).unwrap();
+        let reg_bytes = ua.poll_transmit();
+        let SipMessage::Request(reg_req) = SipMessage::parse(&reg_bytes[0]).unwrap() else {
+            panic!("expected REGISTER");
+        };
+        let mut reg_ok = reg_req.create_response(200, "OK").unwrap();
+        reg_ok.headers.set("Expires", "300");
+        reg_ok.headers.set("To", "<sip:1003@pbx.local>;tag=srv-3");
+        ua.receive_message(SipMessage::Response(reg_ok), now);
+
+        // Wait 1.6s so Auto sends SUBSCRIBE.
+        let _ = ua.handle_timeout(now + Duration::from_millis(1600));
+        let sub_bytes = ua.poll_transmit();
+        assert_eq!(sub_bytes.len(), 1);
+        let SipMessage::Request(sub_req) = SipMessage::parse(&sub_bytes[0]).unwrap() else {
+            panic!("expected Auto SUBSCRIBE");
+        };
+        assert_eq!(sub_req.method, Method::Subscribe);
+
+        // Server rejects SUBSCRIBE with 489 Bad Event -> Auto silently latches passive mode without warning.
+        let mut bad_ev = sub_req.create_response(489, "Bad Event").unwrap();
+        bad_ev.headers.set("To", "<sip:1003@pbx.local>;tag=srv-489");
+        let evs = ua.receive_message(SipMessage::Response(bad_ev), now);
+        assert!(
+            !evs.iter().any(|e| matches!(e, UaEvent::ProtocolWarning(_))),
+            "489 Bad Event in Auto mode must not emit ProtocolWarning"
+        );
+        // Subsequent unsolicited NOTIFY still succeeds.
+        let mut notify = SipRequest::new(
+            Method::Notify,
+            SipUri::parse("sip:1003@10.0.0.2:5060;transport=udp").unwrap(),
+        )
+        .with_body(
+            MWI_CONTENT_TYPE,
+            b"Messages-Waiting: no\r\nVoice-Message: 0/0\r\n".to_vec(),
+        );
+        notify.headers.add(
+            "Via",
+            Via::new("UDP", "10.0.0.1:5060", "z9hG4bK-mwi-3").to_string(),
+        );
+        notify.headers.set("From", "<sip:1003@10.0.0.1>;tag=ast-3");
+        notify.headers.set("To", "<sip:1003@10.0.0.2>");
+        notify.headers.set("Call-ID", "ast-unsol-3@10.0.0.1");
+        notify
+            .headers
+            .set("CSeq", CSeq::new(1, Method::Notify).to_string());
+        notify.headers.set("Event", "message-summary");
+        let evs = ua.receive_message(SipMessage::Request(notify), now);
+        assert!(evs
+            .iter()
+            .any(|e| matches!(e, UaEvent::MessageSummaryUpdated(s) if !s.messages_waiting)));
+
+        // MwiMode::Disabled rejects Event: message-summary with 489 Bad Event.
+        let disabled_cfg = UaConfig::new("1004", "pw", "pbx.local", registrar, "10.0.0.2", 5060);
+        let mut disabled_ua = UserAgent::new(disabled_cfg);
+        let mut disabled_notify = SipRequest::new(
+            Method::Notify,
+            SipUri::parse("sip:1004@10.0.0.2:5060;transport=udp").unwrap(),
+        )
+        .with_body(MWI_CONTENT_TYPE, b"Messages-Waiting: yes\r\n".to_vec());
+        disabled_notify.headers.add(
+            "Via",
+            Via::new("UDP", "10.0.0.1:5060", "z9hG4bK-mwi-4").to_string(),
+        );
+        disabled_notify
+            .headers
+            .set("From", "<sip:1004@10.0.0.1>;tag=ast-4");
+        disabled_notify.headers.set("To", "<sip:1004@10.0.0.2>");
+        disabled_notify
+            .headers
+            .set("Call-ID", "ast-unsol-4@10.0.0.1");
+        disabled_notify
+            .headers
+            .set("CSeq", CSeq::new(1, Method::Notify).to_string());
+        disabled_notify.headers.set("Event", "message-summary");
+        disabled_ua.receive_message(SipMessage::Request(disabled_notify), now);
+        let tx = disabled_ua.poll_transmit();
+        let SipMessage::Response(r489) = SipMessage::parse(&tx[0]).unwrap() else {
+            panic!("expected 489 response when MwiMode::Disabled");
+        };
+        assert_eq!(r489.status_code, 489);
     }
 }

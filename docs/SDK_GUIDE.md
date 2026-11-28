@@ -106,12 +106,14 @@ let engine_cfg = engine_cfg
 | `Suspend` / `Resume` | Puts the worker loop to sleep on its `Condvar` (halting timers, socket polling, and RTP ticks) until `Resume` / `Shutdown`; re-registers on foreground wakeup if previously registered |
 | `ExportTelemetry { call_id }` | Emits `EngineEvent::TelemetryExported` with global or per-call JSON trace |
 | `Shutdown` | Performs a best-effort graceful `BYE`/`CANCEL` (for active calls) and `REGISTER` (`Expires: 0`, if registered) flush, then terminates the worker thread and emits `EngineEvent::Stopped` |
+| `RefreshVoicemail` | Forces an immediate RFC 6665 `SUBSCRIBE` (`Event: message-summary`) refresh when MWI subscription mode is `Solicited` or `Auto` |
 
 #### Inbound `EngineEvent` Variants
 
 Drain events with `engine.try_recv_event()`, `engine.recv_event_timeout(timeout)`, or a cloneable `engine.event_receiver()` (`EngineEventReceiver` for lock-free concurrent command/event threads):
 
 - `RegistrationChanged(RegistrationState)`
+- `VoicemailUpdated { messages_waiting, message_account, new_messages, old_messages, urgent_new, urgent_old }`
 - `OutboundCallStarted { call_id }`
 - `IncomingCall { call_id, from, to }`
 - `CallRinging { call_id, status_code }`
@@ -155,7 +157,7 @@ Defined in [`crates/bmsip-ffi/src/bmsip.udl`](../crates/bmsip-ffi/src/bmsip.udl)
   - `push_captured_pcm(samples)` — pushes one 20 ms (`160` @ 8 kHz, `320` @ 16 kHz, or `960` @ 48 kHz) mono PCM frame captured from OS audio.
   - `pop_playout_pcm() -> sequence<i16>?` — pops the next decoded 20 ms frame sized for `audio_sample_rate_hz()`.
 - **Event Polling:** `poll_event(timeout_ms) -> FfiEvent?` polls via `EngineEventReceiver` without locking concurrent `dial`/`hangup`/`shutdown` calls, returning structured `FfiEventKind`, `call_id`, `detail`, `status_code`, and `black_box_json`.
-- **Call Control Methods:** `ring_early_media(call_id)`, `hold(call_id)`, `resume_call(call_id)`, `transfer(call_id, target_uri)`, `attended_transfer(call_id, target_call_id)`, `set_active_call(call_id)`, and `send_info_dtmf(call_id, digit, duration_ms)` map directly to `EngineCommand` and report state updates via `FfiEventKind::{EarlyMediaStarted, CallHoldChanged, CallTransferRequested, TransferStatus, DtmfReceived}`.
+- **Call Control & Voicemail Methods:** `ring_early_media(call_id)`, `hold(call_id)`, `resume_call(call_id)`, `transfer(call_id, target_uri)`, `attended_transfer(call_id, target_call_id)`, `set_active_call(call_id)`, `send_info_dtmf(call_id, digit, duration_ms)`, and `refresh_voicemail()` map directly to `EngineCommand` and report state updates via `FfiEventKind::{EarlyMediaStarted, CallHoldChanged, CallTransferRequested, TransferStatus, DtmfReceived, VoicemailUpdated}`.
 - **Errors (`FfiError`):** `"InvalidArgument"`, `"RuntimeError"`, `"Closed"`.
 
 ### 3.2 iOS Swift Reference (`BmsipIosAudioBridge.swift`)
@@ -179,7 +181,7 @@ Defined in [`crates/bmsip-ffi/src/bmsip.udl`](../crates/bmsip-ffi/src/bmsip.udl)
 [`crates/bmsip-ffi/include/bmsip.h`](../crates/bmsip-ffi/include/bmsip.h) provides an opaque pointer ABI (`BmsipClientHandle *`):
 
 - **Constructors:** `bmsip_client_new(...)` creates an 8 kHz UDP client (G.722/PCMU/PCMA); `bmsip_client_new_ex(..., enable_opus, sample_rate_hz)` enables Opus (`enable_opus != 0`) and selects `8000`, `16000`, or `48000` Hz PCM framing (queryable via `bmsip_client_audio_sample_rate_hz`); `bmsip_client_new_transport(..., transport, tls_ca_pem, tls_insecure)` selects `"udp"`, `"tcp"`, or `"tls"`; `bmsip_client_new_secure(..., transport, srtp_mode, tls_ca_pem, tls_insecure)` additionally configures SRTP (`"off"`, `"optional"`, or `"sdes"` — `"sdes"` requires `"tls"`).
-- **Return Convention:** Action functions (`bmsip_client_register`, `bmsip_client_dial`, `bmsip_client_ring_early_media`, `bmsip_client_answer`, `bmsip_client_hangup`, `bmsip_client_hold`, `bmsip_client_resume_call`, `bmsip_client_transfer`, `bmsip_client_attended_transfer`, `bmsip_client_set_active_call`, `bmsip_client_send_dtmf`, `bmsip_client_send_info_dtmf`, etc.) return `0` on success or `-1` on error.
+- **Return Convention:** Action functions (`bmsip_client_register`, `bmsip_client_dial`, `bmsip_client_ring_early_media`, `bmsip_client_answer`, `bmsip_client_hangup`, `bmsip_client_hold`, `bmsip_client_resume_call`, `bmsip_client_transfer`, `bmsip_client_attended_transfer`, `bmsip_client_set_active_call`, `bmsip_client_send_dtmf`, `bmsip_client_send_info_dtmf`, `bmsip_client_refresh_voicemail`, etc.) return `0` on success or `-1` on error.
 - **PCM Functions:**
   - `bmsip_client_push_pcm(client, samples, len)` validates `len == bmsip_client_audio_sample_rate_hz(client) / 50` (`160`, `320`, or `960`) before dereferencing `samples` and returns `0` on success (`-1` on null/length mismatch).
   - `bmsip_client_pop_pcm(client, out_samples, capacity)` validates `capacity` against the configured frame length before popping the playout queue and returns the number of copied samples (`160`/`320`/`960`), `0` if empty, or `-1` on error.

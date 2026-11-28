@@ -938,6 +938,18 @@ fn run_listen(cli: ListenCliArgs) -> Result<(), String> {
                 EngineEvent::DtmfReceived { digit, .. } => {
                     println!("DTMF received: '{}'", digit.to_char());
                 }
+                EngineEvent::VoicemailUpdated {
+                    messages_waiting,
+                    new_messages,
+                    old_messages,
+                    message_account,
+                    ..
+                } => {
+                    println!(
+                        "Voicemail MWI: waiting={messages_waiting} new={new_messages} old={old_messages} account={}",
+                        message_account.as_deref().unwrap_or("-")
+                    );
+                }
                 EngineEvent::CallTerminated {
                     reason,
                     black_box_json: json,

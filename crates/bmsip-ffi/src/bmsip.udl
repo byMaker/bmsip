@@ -31,6 +31,7 @@ dictionary FfiConfig {
 
 enum FfiEventKind {
     "RegistrationChanged",
+    "VoicemailUpdated",
     "OutboundCallStarted",
     "IncomingCall",
     "CallRinging",
@@ -91,6 +92,9 @@ interface BmsipClient {
 
     [Throws=FfiError]
     void unregister_account();
+
+    [Throws=FfiError]
+    void refresh_voicemail();
 
     [Throws=FfiError]
     void dial(string target_uri);

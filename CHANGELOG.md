@@ -5,6 +5,15 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.17.0] - 2026-11-28
+
+### Added
+- **Voicemail / MWI (RFC 3842 & RFC 6665):**
+  - Added `bmsip_core::sip::mwi` (`MessageSummary`, `MessageCounts`, `MWI_EVENT_PACKAGE`, `MWI_CONTENT_TYPE`, `MAX_MESSAGE_SUMMARY_BYTES`) to parse and format `application/simple-message-summary` payloads (`Messages-Waiting`, `Message-Account`, `Voice-Message`, and secondary media types with `new/old (urgent_new/urgent_old)` counts).
+  - Added `MwiMode` (`Disabled`, `UnsolicitedOnly`, `Solicited`, `Auto`), `UaConfig` builders (`with_mwi_mode`, `with_mwi_target_uri`, `with_mwi_expires_secs`), `UaEvent::MessageSummaryUpdated(MessageSummary)`, `UserAgent::message_summary()`, and `UserAgent::refresh_mwi(now)` with RFC 6665 `SUBSCRIBE`/`NOTIFY` state management, Digest auth challenge handling, automatic `Allow-Events: message-summary` advertising, `501`/`489` unsolicited fallback in `MwiMode::Auto`, and automatic `Expires: 0` unsubscribe on unregister.
+  - Added `EngineCommand::RefreshVoicemail` and `EngineEvent::VoicemailUpdated { messages_waiting, message_account, new_messages, old_messages, urgent_new, urgent_old }` with flight recorder telemetry.
+  - Exposed `refresh_voicemail()` / `bmsip_client_refresh_voicemail` and `"VoicemailUpdated"` (`FfiEventKind`) across `bmsip-ffi` (UniFFI + C99 `include/bmsip.h`) and logged `VoicemailUpdated` events in `bmsip-cli listen`.
+
 ## [0.16.4] - 2026-11-26
 
 ### Added

@@ -109,6 +109,7 @@ pub struct FfiConfig {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum FfiEventKind {
     RegistrationChanged,
+    VoicemailUpdated,
     OutboundCallStarted,
     IncomingCall,
     CallRinging,
@@ -133,6 +134,7 @@ impl FfiEventKind {
     pub fn as_str(self) -> &'static str {
         match self {
             Self::RegistrationChanged => "RegistrationChanged",
+            Self::VoicemailUpdated => "VoicemailUpdated",
             Self::OutboundCallStarted => "OutboundCallStarted",
             Self::IncomingCall => "IncomingCall",
             Self::CallRinging => "CallRinging",
@@ -348,6 +350,10 @@ impl BmsipClient {
         self.send(EngineCommand::Unregister)
     }
 
+    pub fn refresh_voicemail(&self) -> Result<(), FfiError> {
+        self.send(EngineCommand::RefreshVoicemail)
+    }
+
     pub fn dial(&self, target_uri: String) -> Result<(), FfiError> {
         let uri =
             SipUri::parse(&target_uri).map_err(|e| FfiError::InvalidArgument(e.to_string()))?;
@@ -539,6 +545,28 @@ fn map_engine_event(ev: EngineEvent) -> FfiEvent {
                 call_id: None,
                 detail: Some(label),
                 status_code: None,
+                black_box_json: None,
+            }
+        }
+        EngineEvent::VoicemailUpdated {
+            messages_waiting,
+            message_account,
+            new_messages,
+            old_messages,
+            urgent_new,
+            urgent_old,
+        } => {
+            let mut detail = format!(
+                "waiting={messages_waiting}, new={new_messages}, old={old_messages}, urgent_new={urgent_new}, urgent_old={urgent_old}"
+            );
+            if let Some(acc) = message_account {
+                let _ = write!(detail, ", account={acc}");
+            }
+            FfiEvent {
+                kind: FfiEventKind::VoicemailUpdated,
+                call_id: None,
+                detail: Some(detail),
+                status_code: Some(new_messages.min(u16::MAX as u32) as u16),
                 black_box_json: None,
             }
         }

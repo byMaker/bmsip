@@ -134,6 +134,8 @@ pub enum EngineCommand {
     ExportTelemetry {
         call_id: Option<String>,
     },
+    /// Triggers an immediate RFC 6665 `SUBSCRIBE` refresh for `Event: message-summary` when enabled.
+    RefreshVoicemail,
     Shutdown,
 }
 
@@ -141,6 +143,14 @@ pub enum EngineCommand {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum EngineEvent {
     RegistrationChanged(RegistrationState),
+    VoicemailUpdated {
+        messages_waiting: bool,
+        message_account: Option<String>,
+        new_messages: u32,
+        old_messages: u32,
+        urgent_new: u32,
+        urgent_old: u32,
+    },
     OutboundCallStarted {
         call_id: String,
     },

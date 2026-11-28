@@ -3376,3 +3376,183 @@ fn udp_crlf_keepalive_refreshes_nat_binding_while_registered_and_replies_pong() 
 
     eng.shutdown().unwrap();
 }
+
+fn find_sip_header(msg: &str, name: &str) -> Option<String> {
+    let target = name.to_ascii_lowercase();
+    for line in msg.lines() {
+        let trimmed = line.trim_end_matches('\r');
+        if trimmed.is_empty() {
+            break;
+        }
+        if let Some((k, v)) = trimmed.split_once(':') {
+            if k.trim().eq_ignore_ascii_case(&target) {
+                return Some(v.trim().to_string());
+            }
+        }
+    }
+    None
+}
+
+#[test]
+fn udp_engine_mwi_subscribe_and_notify_emits_voicemail_updated() {
+    let mock_srv = UdpSocket::bind("127.0.0.1:0").expect("bind mock mwi server");
+    let srv_addr = mock_srv.local_addr().expect("srv addr");
+    mock_srv
+        .set_read_timeout(Some(Duration::from_millis(50)))
+        .expect("set timeout");
+
+    let ua_cfg = UaConfig::new(
+        "1001",
+        "pw",
+        "127.0.0.1",
+        SipUri::parse(&format!("sip:{srv_addr}")).unwrap(),
+        "127.0.0.1",
+        0,
+    )
+    .with_mwi_mode(bmsip_core::dialog::MwiMode::Auto);
+
+    let eng_cfg = EngineConfig::new(ua_cfg, srv_addr, IpAddr::V4(Ipv4Addr::LOCALHOST), 0)
+        .with_udp_keepalive_secs(0);
+
+    let (port, _) = WavAudioPort::new(WavPcm16::new(8_000, vec![0i16; 1_600]), true);
+    let eng = SipEngine::spawn(eng_cfg, Box::new(port)).expect("spawn engine");
+    eng.send_command(EngineCommand::Register).unwrap();
+
+    let mut buf = [0u8; 4096];
+    let dl = Instant::now() + Duration::from_secs(3);
+    let mut registered = false;
+    while Instant::now() < dl {
+        if let Ok((n, src)) = mock_srv.recv_from(&mut buf) {
+            let text = String::from_utf8_lossy(&buf[..n]).to_string();
+            if text.starts_with("REGISTER ") {
+                let via = find_sip_header(&text, "Via").expect("Via");
+                let from = find_sip_header(&text, "From").expect("From");
+                let to = find_sip_header(&text, "To").expect("To");
+                let call_id = find_sip_header(&text, "Call-ID").expect("Call-ID");
+                let cseq = find_sip_header(&text, "CSeq").expect("CSeq");
+                let contact = find_sip_header(&text, "Contact").expect("Contact");
+                let rsp = format!(
+                    "SIP/2.0 200 OK\r\n\
+                     Via: {via}\r\n\
+                     From: {from}\r\n\
+                     To: {to};tag=mwi-reg-1\r\n\
+                     Call-ID: {call_id}\r\n\
+                     CSeq: {cseq}\r\n\
+                     Contact: {contact}\r\n\
+                     Expires: 120\r\n\
+                     Content-Length: 0\r\n\r\n"
+                );
+                mock_srv.send_to(rsp.as_bytes(), src).unwrap();
+                registered = true;
+                break;
+            }
+        }
+    }
+    assert!(registered, "engine must send REGISTER");
+
+    wait_for_engine_event(&eng, Duration::from_secs(2), |ev| {
+        matches!(
+            ev,
+            EngineEvent::RegistrationChanged(RegistrationState::Registered { .. })
+        )
+    })
+    .expect("must reach Registered state");
+
+    eng.send_command(EngineCommand::RefreshVoicemail).unwrap();
+
+    let sub_dl = Instant::now() + Duration::from_secs(3);
+    let mut sub_handled = false;
+    while Instant::now() < sub_dl {
+        if let Ok((n, src)) = mock_srv.recv_from(&mut buf) {
+            let text = String::from_utf8_lossy(&buf[..n]).to_string();
+            if text.starts_with("SUBSCRIBE ") {
+                assert_eq!(
+                    find_sip_header(&text, "Event").as_deref(),
+                    Some("message-summary")
+                );
+                let via = find_sip_header(&text, "Via").expect("Via");
+                let from = find_sip_header(&text, "From").expect("From");
+                let to = find_sip_header(&text, "To").expect("To");
+                let call_id = find_sip_header(&text, "Call-ID").expect("Call-ID");
+                let cseq = find_sip_header(&text, "CSeq").expect("CSeq");
+                let contact = find_sip_header(&text, "Contact").expect("Contact");
+                let accept = format!(
+                    "SIP/2.0 202 Accepted\r\n\
+                     Via: {via}\r\n\
+                     From: {from}\r\n\
+                     To: {to};tag=mwi-sub-1\r\n\
+                     Call-ID: {call_id}\r\n\
+                     CSeq: {cseq}\r\n\
+                     Contact: <sip:1001@{srv_addr}>\r\n\
+                     Expires: 3600\r\n\
+                     Content-Length: 0\r\n\r\n"
+                );
+                mock_srv.send_to(accept.as_bytes(), src).unwrap();
+
+                let body = "Messages-Waiting: yes\r\n\
+                            Message-Account: sip:vm@127.0.0.1\r\n\
+                            Voice-Message: 2/4 (1/0)\r\n";
+                let req_uri = contact
+                    .split('>')
+                    .next()
+                    .unwrap_or(&contact)
+                    .trim_start_matches('<')
+                    .trim();
+                let notify = format!(
+                    "NOTIFY {req_uri} SIP/2.0\r\n\
+                     Via: SIP/2.0/UDP {srv_addr};branch=z9hG4bKmwi01\r\n\
+                     From: {to};tag=mwi-sub-1\r\n\
+                     To: {from}\r\n\
+                     Call-ID: {call_id}\r\n\
+                     CSeq: 1 NOTIFY\r\n\
+                     Event: message-summary\r\n\
+                     Subscription-State: active;expires=3600\r\n\
+                     Content-Type: application/simple-message-summary\r\n\
+                     Content-Length: {}\r\n\r\n\
+                     {body}",
+                    body.len()
+                );
+                mock_srv.send_to(notify.as_bytes(), src).unwrap();
+                sub_handled = true;
+                break;
+            }
+        }
+    }
+    assert!(
+        sub_handled,
+        "engine must send SUBSCRIBE for message-summary"
+    );
+
+    let ev = wait_for_engine_event(&eng, Duration::from_secs(2), |ev| {
+        matches!(ev, EngineEvent::VoicemailUpdated { .. })
+    })
+    .expect("must emit EngineEvent::VoicemailUpdated");
+    assert_eq!(
+        ev,
+        EngineEvent::VoicemailUpdated {
+            messages_waiting: true,
+            message_account: Some("sip:vm@127.0.0.1".to_string()),
+            new_messages: 2,
+            old_messages: 4,
+            urgent_new: 1,
+            urgent_old: 0,
+        }
+    );
+
+    let notify_ok_dl = Instant::now() + Duration::from_secs(2);
+    let mut got_200 = false;
+    while Instant::now() < notify_ok_dl {
+        if let Ok((n, _)) = mock_srv.recv_from(&mut buf) {
+            let text = String::from_utf8_lossy(&buf[..n]);
+            if text.starts_with("SIP/2.0 200 OK")
+                && find_sip_header(&text, "CSeq").as_deref() == Some("1 NOTIFY")
+            {
+                got_200 = true;
+                break;
+            }
+        }
+    }
+    assert!(got_200, "engine must reply 200 OK to MWI NOTIFY");
+
+    eng.shutdown().unwrap();
+}
